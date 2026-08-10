@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CALLSHIELD installer (Termux / Linux) — Phase 2.
+# CALLSHIELD installer (Termux / Linux) — Phase 3.
 #
 # - Verifies Python 3.8+
 # - Creates state directories under ~/.callshield (override with CALLSHIELD_HOME)
@@ -39,8 +39,10 @@ info "Python: ${PYTHON_BIN} (${PY_VER})"
 STATE_DIR="${CALLSHIELD_HOME:-${HOME}/.callshield}"
 DATA_DIR="${STATE_DIR}/data"
 LOG_DIR="${STATE_DIR}/logs"
-mkdir -p "${DATA_DIR}" "${LOG_DIR}"
-chmod 700 "${STATE_DIR}" "${DATA_DIR}" "${LOG_DIR}" 2>/dev/null || true
+RUN_DIR="${STATE_DIR}/run"
+STATE_SUBDIR="${STATE_DIR}/state"
+mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${RUN_DIR}" "${STATE_SUBDIR}"
+chmod 700 "${STATE_DIR}" "${DATA_DIR}" "${LOG_DIR}" "${RUN_DIR}" "${STATE_SUBDIR}" 2>/dev/null || true
 ok "State directory: ${STATE_DIR}"
 
 # ---- Bin dir ----
@@ -113,7 +115,10 @@ echo
 echo "  callshield --help"
 echo "  callshield status"
 echo "  callshield scan +919876543210"
+echo "  callshield metrics"
+echo "  callshield event test +919876543210"
 echo
 echo "Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls."
 echo "Phase 2 runs locally and offline. It does NOT intercept or reject"
 echo "live phone calls."
+echo "Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls."

@@ -18,6 +18,9 @@ data/config.json
 data/*.pid
 data/*.bak
 data/*.log
+run/
+*.sock
+state/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

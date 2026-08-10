@@ -9,6 +9,7 @@ remaining fully backward-compatible with Phase 1 configuration files.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict
@@ -54,6 +55,18 @@ class Config:
     recent_window_seconds: int = 600  # 10 minutes for "rapid repeat" detection
     output_json: bool = False
     quiet: bool = False
+    # Phase 3 additions — daemon / IPC / resource control
+    daemon_enabled: bool = True
+    heartbeat_interval: int = 30
+    event_queue_size: int = 256
+    shutdown_timeout: int = 10
+    status_refresh_interval: int = 2
+    max_log_size: int = 2 * 1024 * 1024  # 2MB
+    max_log_files: int = 3
+    ipc_enabled: bool = True
+    run_dir: str = field(default_factory=lambda: str(Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))).parent / "run" if Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))).name == "data" else str(Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))) / "run")))
+    daemon_log_file: str = field(default_factory=lambda: str(Path(os.environ.get("CALLSHIELD_LOG_DIR", str(DATA_DIR.parent / "logs"))) / "daemon.log"))
+    socket_path: str = field(default_factory=lambda: str(Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))).parent / "run" / "callshield.sock" if Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))).name == "data" else str(Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))) / "run" / "callshield.sock")))
 
     # ----- serialisation -----
     def to_dict(self) -> Dict[str, Any]:
@@ -133,6 +146,26 @@ class Config:
                 raise ConfigError(
                     f"Invalid signal weight for '{k}': must be an integer between -100 and 100."
                 )
+        # Phase 3 validations
+        for bname in ("daemon_enabled", "ipc_enabled"):
+            if not isinstance(getattr(self, bname), bool):
+                raise ConfigError(f"{bname} must be true or false.")
+        if not isinstance(self.heartbeat_interval, int) or not (5 <= self.heartbeat_interval <= 600):
+            raise ConfigError("heartbeat_interval must be an integer between 5 and 600.")
+        if not isinstance(self.event_queue_size, int) or not (16 <= self.event_queue_size <= 2048):
+            raise ConfigError("event_queue_size must be an integer between 16 and 2048.")
+        if not isinstance(self.shutdown_timeout, int) or not (1 <= self.shutdown_timeout <= 60):
+            raise ConfigError("shutdown_timeout must be an integer between 1 and 60.")
+        if not isinstance(self.status_refresh_interval, int) or not (1 <= self.status_refresh_interval <= 10):
+            raise ConfigError("status_refresh_interval must be an integer between 1 and 10.")
+        if not isinstance(self.max_log_size, int) or not (64*1024 <= self.max_log_size <= 100*1024*1024):
+            raise ConfigError("max_log_size must be an integer between 64KB and 100MB.")
+        if not isinstance(self.max_log_files, int) or not (1 <= self.max_log_files <= 10):
+            raise ConfigError("max_log_files must be an integer between 1 and 10.")
+        for pname in ("run_dir", "daemon_log_file", "socket_path", "pid_file", "database_path", "log_file"):
+            v = getattr(self, pname)
+            if not isinstance(v, str) or not v.strip():
+                raise ConfigError(f"{pname} must be a non-empty string path.")
 
 
 def load_config(path: Path = CONFIG_PATH) -> Config:
@@ -186,15 +219,21 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         return set_profile(cfg, value)
     if not hasattr(cfg, key):
         raise ConfigError(f"Unknown configuration key: {key}")
-    if key in {"default_country", "color_enabled", "database_path", "pid_file", "log_file"}:
+    if key in {"default_country", "color_enabled", "database_path", "pid_file", "log_file", "run_dir", "daemon_log_file", "socket_path"}:
         setattr(cfg, key, value)
-    elif key in {"risk_threshold", "high_risk_threshold", "recent_window_seconds"}:
+    elif key in {"risk_threshold", "high_risk_threshold", "recent_window_seconds", "heartbeat_interval", "event_queue_size", "shutdown_timeout", "status_refresh_interval", "max_log_size", "max_log_files"}:
         try:
-            iv = int(value)
+            # Support suffix for max_log_size like 2MB
+            if key == "max_log_size" and isinstance(value, str) and value.strip().upper().endswith("MB"):
+                iv = int(float(value.strip()[:-2].strip()) * 1024 * 1024)
+            elif key == "max_log_size" and isinstance(value, str) and value.strip().upper().endswith("KB"):
+                iv = int(float(value.strip()[:-2].strip()) * 1024)
+            else:
+                iv = int(value)
         except ValueError as exc:
             raise ConfigError(f"{key} must be an integer.") from exc
         setattr(cfg, key, iv)
-    elif key in {"logging_enabled", "output_json", "quiet"}:
+    elif key in {"logging_enabled", "output_json", "quiet", "daemon_enabled", "ipc_enabled"}:
         v = value.lower()
         if v in bool_true:
             setattr(cfg, key, True)

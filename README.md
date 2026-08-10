@@ -1,10 +1,12 @@
 # CALLSHIELD
 
-> **Local fraud-number analysis and protection foundation.**
+> **Local fraud-number analysis and protection foundation — now with persistent background engine.**
 >
 > Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls.
 >
 > Phase 2 — Advanced Intelligence builds on Phase 1.
+>
+> Phase 3 — Background Engine adds a real Termux daemon, event queue, and IPC. **It does not yet receive or reject real Android phone calls.**
 >
 > **CALLSHIELD does NOT yet intercept or reject live phone calls.**
 > It runs locally on Android/Termux (or any Linux system), keeps its database
@@ -29,38 +31,31 @@ Use `callshield --help` for commands.
 ## Features
 
 - **Professional CLI** — clean, minimal, scriptable, no gimmicks.
-- **SQLite database** — local, persistent, parameterized queries only.
-- **Number normalization** — spaces, punctuation, `+`, `00` prefixes, default
-  country handling, strict validation.
-- **Blacklist / Whitelist** — explicit user control with clear precedence:
-  **WHITELIST > BLACKLIST > REPUTATION**. Conflicts are detected and reported.
-- **Advanced reputation engine** — six tiers (TRUSTED / SAFE / UNKNOWN /
-  SUSPICIOUS / HIGH_RISK / MALICIOUS) derived purely from local signals.
-- **Modular signal system** — every positive/negative signal is:
-  - independently testable,
-  - deterministic,
-  - explicitly weighted,
-  - visible in the output.
-- **Deterministic, explainable risk scoring (0–100)** — no fake ML.
-- **Confidence score (0–100)** — how strong the evidence is, separate from
-  how risky the number looks.
-- **Historical behavior analysis** — uses prior scans, blocks, and reports
-  for the same number.
-- **Number intelligence** — safe local pattern checks (length,
-  repeated-digit runs, unexpected characters).
-- **Local user reports** — `callshield report <number>` records a local
-  note; reports contribute to score but never auto-confirm fraud.
-- **Protection profiles** — RELAXED / BALANCED / STRICT.
-- **Event logging** — every analysis is recorded; numbers are masked in
-  listings by default (`--full` reveals).
-- **JSON output** — `callshield scan <number> --json` for scripting and
-  future integration.
-- **Background engine (STANDBY)** — start/stop/status with PID management,
-  stale-PID cleanup, heartbeat, graceful shutdown.
-- **Offline-first, privacy-preserving** — zero network calls, zero
-  analytics, zero telemetry.
-- **Termux-friendly** — pure Python 3 standard library, no root required.
-- **Well tested** — 77 unit tests covering every subsystem.
+- **SQLite database** — local, persistent, parameterized queries only, WAL, 0600 perms.
+- **Number normalization** — spaces, punctuation, `+`, `00` prefixes, default country handling, strict validation.
+- **Blacklist / Whitelist** — explicit user control with clear precedence: **WHITELIST > BLACKLIST > REPUTATION**. Conflicts are detected and reported.
+- **Advanced reputation engine** — six tiers (TRUSTED / SAFE / UNKNOWN / SUSPICIOUS / HIGH_RISK / MALICIOUS) derived purely from local signals.
+- **Modular signal system** — every signal is independently testable, deterministic, explicitly weighted, visible.
+- **Deterministic, explainable risk scoring (0–100)** — no ML; confidence (0–100) separate.
+- **Historical behavior analysis** — prior scans/blocks/reports per number.
+- **Number intelligence** — safe local pattern checks (repeated digits, length, invalid chars) as weak signals.
+- **Local user reports** — `callshield report <number>` contributes capped signal.
+- **Protection profiles** — RELAXED / BALANCED / STRICT (tune thresholds/weights only).
+- **Event logging** — every analysis recorded; masked by default (`--full` reveals).
+- **JSON output** — `callshield scan <number> --json`; `QUIET` mode.
+- **Persistent background daemon (Phase 3)** — real Linux process, PID + socket, `start`/`stop`/`status`, graceful shutdown, stale-PID recovery, never kills unrelated PIDs.
+- **Event pipeline** — bounded thread-safe queue (default 256), `NUMBER_SCAN`/`USER_REPORT`/`BLOCK_ACTION`/`ALLOW_ACTION`/`SYSTEM`/`HEARTBEAT` (extensible, no fake `INCOMING_CALL`).
+- **Event processor** — validates, normalizes, calls `analyze_number()`, persists, logs, updates metrics; per-event exception isolated.
+- **Local IPC** — Unix domain socket `~/.callshield/run/callshield.sock` (700), JSON, size-limited (16KB req/64KB resp), timeout, no `eval`/`exec`, no TCP/network listener.
+- **Health monitoring** — uptime, PID, queue size/peak, processed/failed/received/dropped, last event/heartbeat, DB status, memory.
+- **Heartbeat** — configurable (default 30s), lightweight state file + DB `heartbeat`.
+- **Metrics** — `callshield metrics` (uptime, events, high-risk, blocked, queue peak).
+- **Daemon logging + rotation** — `~/.callshield/logs/daemon.log` (2MB ×3, size-based, no leak).
+- **Resource control** — bounded queue, sleeps when idle, no busy loops, transactions, timeouts.
+- **Crash recovery** — single malformed event never kills daemon; fatal init exits cleanly.
+- **Offline-first, privacy-preserving** — zero network, no analytics, masked logs.
+- **Termux-friendly** — pure stdlib, no root, no GUI/APK, PID/socket in `~/.callshield/run`.
+- **Well tested** — 128 unit tests covering every subsystem.
 
 ---
 
@@ -71,49 +66,87 @@ callshield/
 ├── callshield/
 │   ├── __init__.py
 │   ├── __main__.py           # python -m callshield
-│   ├── cli.py                # argparse CLI (thin layer)
-│   ├── config.py             # JSON config + profiles
-│   ├── database.py           # SQLite layer + schema migrations
-│   ├── detector.py           # analyze_number() core API
-│   ├── normalizer.py         # Phone number normalization
-│   ├── logger.py             # Event + file logging
-│   ├── daemon.py             # Background engine (STANDBY)
-│   ├── utils.py              # Exit codes, masking, helpers
+│   ├── cli.py                # argparse CLI (thin, --watch, metrics, daemon, event)
+│   ├── config.py             # JSON config + profiles + daemon/IPC settings
+│   ├── database.py           # SQLite + migrations + indexes
+│   ├── detector.py           # analyze_number() core API (detector never depends on daemon)
+│   ├── normalizer.py
+│   ├── logger.py             # file + DB events, rotation via daemon
+│   ├── utils.py
+│   ├── models.py
+│   ├── reputation.py         # Phase1 compat
+│   ├── scoring.py
+│   ├── daemon/               # Phase 3 — persistent engine
+│   │   ├── __init__.py       # re-exports legacy daemon API (status/start/stop)
+│   │   ├── service.py        # DaemonService (queue, processor, heartbeat, health, IPC, signals)
+│   │   ├── process.py        # PID/socket/run-dir management, stale detection, verify callshield
+│   │   ├── heartbeat.py      # Heartbeat thread (configurable interval)
+│   │   ├── health.py         # HealthMonitor (uptime, queue, processed/failed, DB, memory)
+│   │   ├── signals.py        # SIGTERM/SIGINT/SIGHUP handling
+│   │   └── recovery.py       # validate_startup, per-event recovery
+│   ├── events/               # Phase 3 — event pipeline
+│   │   ├── __init__.py
+│   │   ├── types.py          # VALID_EVENT_TYPES, sources
+│   │   ├── models.py         # Event(event_id, event_type, timestamp, source, number, payload)
+│   │   ├── queue.py          # EventQueue (bounded, thread-safe, metrics)
+│   │   └── processor.py      # EventProcessor (calls analyze_number)
 │   ├── intelligence/         # Phase 2
-│   │   ├── signals.py        # Modular signal engine
-│   │   ├── behavior.py       # Historical behavior + number intelligence
-│   │   ├── confidence.py     # Confidence scoring
-│   │   └── profiles.py       # RELAXED / BALANCED / STRICT
-│   └── rules/                # Phase 2 rule engine
-│       ├── engine.py         # evaluate() pipeline
-│       └── defaults.py       # Threshold constants
-├── data/                     # Runtime state (db, config, pid)
-├── logs/                     # Text logs
-├── tests/                    # unittest suite
+│   │   ├── __init__.py
+│   │   ├── signals.py        # modular signals
+│   │   ├── reputation.py     # 6-tier classifier
+│   │   ├── behavior.py       # history + number_intelligence
+│   │   ├── confidence.py
+│   │   └── profiles.py
+│   └── rules/                # Phase 2
+│       ├── __init__.py
+│       ├── engine.py
+│       └── defaults.py
+├── data/                     # Git-kept seed only; runtime is ~/.callshield/data
+├── logs/                     # Git-kept .gitkeep; runtime is ~/.callshield/logs
+├── tests/                    # 128 tests (Phase1/2/3)
 ├── scripts/
-│   ├── install.sh            # Termux/Linux installer
+│   ├── install.sh
 │   └── uninstall.sh
 ├── pyproject.toml
-├── requirements.txt
-├── CHANGELOG.md
-├── VERSION
-├── LICENSE
+├── VERSION (0.3.0)
 └── README.md
 ```
 
-The core API for future phases (including a live Android call-screening
-service) is:
+Filesystem layout (Termux-safe, outside repo unless `CALLSHIELD_DATA_DIR` set):
+
+```
+~/.callshield/
+├── config/config.json  (also ~/.callshield/data/config.json for compat)
+├── data/callshield.db
+├── logs/callshield.log
+├── logs/daemon.log (rotated: daemon.log.1, .2)
+├── run/callshield.pid
+├── run/callshield.sock  (700, Unix socket, local-only)
+├── run/heartbeat.json
+└── state/
+```
+
+Event flow:
+
+```
+Event Source (CLI test, future call-screening)
+     ↓
+EventQueue (bounded 256, thread-safe)
+     ↓
+EventProcessor → analyze_number() → DetectionResult
+     ↓
+Database + Logs + Health Metrics
+     ↑
+Heartbeat / HealthMonitor / IPC (Unix socket)
+```
+
+Core API remains:
 
 ```python
 from callshield.detector import analyze_number
 result = analyze_number("+919876543210")
-# result.verdict, result.risk_score, result.confidence,
-# result.recommended_action, result.signals, ...
+# result.verdict, risk_score, confidence, recommended_action, signals, ...
 ```
-
-It returns a structured dataclass — no stdout, no prompts, no global state
-— so the same engine can drive both the CLI and (later) an Android
-call-screening service.
 
 ---
 
@@ -121,9 +154,7 @@ call-screening service.
 
 ### Requirements
 
-- Python 3.8+
-- A POSIX shell (Linux / Termux)
-- No root required
+- Python 3.8+, POSIX shell, no root
 
 ### Termux
 
@@ -135,7 +166,7 @@ cd Callshield
 bash scripts/install.sh
 ```
 
-The installer is idempotent — running it twice will not wipe your database.
+Idempotent — re-running never wipes `~/.callshield/data/callshield.db`.
 
 ### Linux (desktop)
 
@@ -145,20 +176,20 @@ cd Callshield
 bash scripts/install.sh
 ```
 
-The installer:
-
-1. Verifies Python 3.8+.
-2. Creates `~/.callshield/` (override with `CALLSHIELD_HOME`).
-3. Installs the `callshield` wrapper on PATH (`$PREFIX/bin` on Termux,
-   `~/.local/bin` on Linux).
-4. Initializes the SQLite database.
-5. Runs the unit-test suite as a self-test.
+Installer: verifies Python, creates `~/.callshield/{data,logs,run,state}` (700), installs wrapper to `$PREFIX/bin` (Termux) or `~/.local/bin` (+ symlink to `/usr/local/bin` if writable), initializes DB, runs 128 tests.
 
 ### Uninstall
 
 ```bash
-bash scripts/uninstall.sh           # keeps user data
-bash scripts/uninstall.sh --purge   # removes database, logs, config
+bash scripts/uninstall.sh           # keeps ~/.callshield
+bash scripts/uninstall.sh --purge   # removes DB, logs, config, run
+```
+
+### Termux:Boot concept (future, not installed automatically)
+
+```
+Termux:Boot → callshield daemon start → CALLSHIELD (STANDBY, IPC ready)
+Documented only; Phase 3 is compatible but does not auto-install.
 ```
 
 ---
@@ -166,198 +197,108 @@ bash scripts/uninstall.sh --purge   # removes database, logs, config
 ## Quick Start
 
 ```bash
-callshield status                       # check engine/db state
-callshield scan +919876543210           # analyze a number
-callshield block +919876543210          # add to blacklist
-callshield allow +919876543210          # add to whitelist
+callshield status                       # daemon + DB status
+callshield scan +919876543210           # analyze (explainable)
+callshield scan +919876543210 --json    # machine-readable
+callshield scan +919876543210 --quiet   # only ALLOW/MONITOR/BLOCK
+callshield block +919876543210          # blacklist
+callshield allow +919876543210          # whitelist (wins over blacklist)
 callshield report +919876543210 --reason "suspected scam"
-callshield reputation +919876543210     # show local reputation
-callshield history +919876543210        # show event history
-callshield signals +919876543210        # show signal breakdown
-callshield logs --limit 20             # recent events (masked)
-callshield logs --full                 # recent events (unmasked)
-callshield config profile strict       # switch profile
-callshield start                       # start STANDBY engine
-callshield stop                        # stop engine
-```
-
-JSON output (scripting / future integrations):
-
-```bash
-callshield scan +919876543210 --json
-```
-
-Quiet mode (exit-code friendly):
-
-```bash
-callshield scan +919876543210 --quiet   # prints only ALLOW / MONITOR / BLOCK
+callshield reputation +919876543210     # 6-tier + history
+callshield history +919876543210        # masked, --full to reveal
+callshield signals +919876543210        # breakdown
+callshield logs --limit 20 --full
+callshield config show                  # includes daemon section
+callshield config profile strict        # relaxed/balanced/strict
+callshield start                        # daemon STANDBY (PID + Queue READY)
+callshield status                       # Daemon RUNNING, Uptime, Queue 0/256, Events, Last Heartbeat, NOT CONNECTED
+callshield status --watch               # live refresh (Ctrl+C to exit watch, daemon stays)
+callshield metrics                      # uptime, received/processed/failed/dropped, high-risk, queue peak
+callshield event test +919876543210     # TEST NUMBER_SCAN via daemon queue (not a phone call)
+callshield daemon info                  # daemon info via IPC
+callshield daemon health                # health check
+callshield daemon restart               # stop + start
+callshield stop                         # graceful shutdown (drains queue, flushes logs, removes PID/socket)
 ```
 
 ---
 
 ## Commands
 
-| Command                                  | Description                                      |
-|------------------------------------------|--------------------------------------------------|
-| `callshield`                             | Banner + status summary                          |
-| `callshield --help`                      | Full CLI help                                    |
-| `callshield --version`                   | Version banner                                   |
-| `callshield version`                     | Version information                              |
-| `callshield status`                      | Engine / database / PID status                   |
-| `callshield scan <number>`               | Analyze a phone number                           |
-| `callshield scan <number> --json`        | Analyze and emit JSON                            |
-| `callshield scan <number> --quiet`       | Only print recommended action                    |
-| `callshield scan <number> --no-log`      | Analyze without writing an event                 |
-| `callshield block <number> [--reason]`   | Add a number to the blacklist                    |
-| `callshield unblock <number>`            | Remove from the blacklist                        |
-| `callshield allow <number> [--reason]`   | Add a number to the whitelist                    |
-| `callshield unallow <number>`            | Remove from the whitelist                        |
-| `callshield report <number> [--reason]`  | File a local user report                         |
-| `callshield blacklist list`              | List blacklisted numbers                         |
-| `callshield whitelist list`              | List whitelisted numbers                         |
-| `callshield reputation <number>`         | Show detailed local reputation                   |
-| `callshield history <number>`            | Show event history for a number                  |
-| `callshield signals <number>`            | Show signal breakdown for a number               |
-| `callshield logs [--limit N] [--full]`   | Show recent analysis events                      |
-| `callshield config [show]`               | Show current configuration                       |
-| `callshield config profile <mode>`       | Set protection profile (relaxed/balanced/strict) |
-| `callshield config set <key> <value>`    | Set a single configuration value                 |
-| `callshield start`                       | Start background engine in STANDBY mode          |
-| `callshield stop`                        | Stop background engine                           |
+| Command | Description |
+|---|---|
+| `callshield` | Banner (READY/LOCAL/ONLINE/STANDBY) + disclaimer |
+| `callshield --help`, `--version`, `version` | Help / `0.3.0 Phase 3 — Background Engine` |
+| `callshield status` | Full daemon status (IPC when running, PID fallback otherwise) |
+| `callshield status --watch [--interval N]` | Live watch (default 2s, Ctrl+C exits watch only) |
+| `callshield scan <number> [--json] [--quiet] [--no-log]` | Analyze |
+| `callshield block/unblock`, `allow/unallow` | List management (conflict reported, whitelist wins) |
+| `callshield report <number> [--reason]` | Local report (capped) |
+| `callshield blacklist/whitelist list` | Tables |
+| `callshield reputation/history/signals <number>` | Intelligence |
+| `callshield logs [--limit N] [--full]` | Events (masked) |
+| `callshield config [show]` / `config profile <mode>` / `config set <k> <v>` | Config (validates) |
+| `callshield start` / `stop` | Daemon (backward compat, maps to `daemon start/stop`) |
+| `callshield daemon start/stop/restart/status/info/health` | Explicit daemon management |
+| `callshield metrics` | Real daemon metrics (IPC, fallback to DB when stopped) |
+| `callshield event test <number> [--reason]` | TEST event via daemon pipeline (labels TEST, not a call) |
+
+All Phase 1/2 commands preserved.
 
 ---
 
 ## Risk Scoring
 
-Risk scores are **deterministic** and **explainable**. Every score is the sum
-of contributions from fired signals, clamped to 0–100.
+Deterministic sum of signal deltas, clamp 0–100, tiers `0 UNKNOWN / 1–29 LOW / 30–59 MEDIUM / 60–84 HIGH / 85–100 CRITICAL`. Confidence separate (signal confidences + agreement + history - conflict). `WHITELIST > BLACKLIST > REPUTATION`. Weak `number_format_anomaly` (+5 max) never alone causes BLOCK.
 
-| Score  | Tier     | Meaning                              |
-|-------:|----------|--------------------------------------|
-|  0     | UNKNOWN  | No signals — number is unknown       |
-|  1–29  | LOW      | Minor/weak signals only              |
-| 30–59  | MEDIUM   | Some suspicious indicators           |
-| 60–79  | HIGH     | Elevated risk — review recommended   |
-| 80–100 | CRITICAL | Strong local evidence — block        |
+Signals: `blacklist_match +80`, `previous_block_events +20`, `previous_suspicious_events +15`, `rapid_repeat_events +10`, `manual_user_report +25`, `reputation_history +10`, `number_format_anomaly +5`, `whitelist_match -100`.
 
-Confidence is computed independently: it reflects how many independent
-signals agree and how strong the evidence is. A number can be high-risk
-with low confidence ("we don't know much") or low-risk with high confidence
-("we have good evidence it's safe").
-
-### Precedence rule
-
-```
-WHITELIST  >  BLACKLIST  >  REPUTATION
-```
-
-If a number exists in both lists, CALLSHIELD reports the conflict and
-applies the whitelist. No data is silently deleted.
-
-### Built-in signals
-
-| Signal                    | Default weight | Notes                                         |
-|---------------------------|---------------:|-----------------------------------------------|
-| `whitelist_match`         |           −100 | Forces score 0 and verdict SAFE               |
-| `blacklist_match`         |            +80 | Explicit user block                           |
-| `previous_block_events`   |       up to +20 | Past BLOCK verdicts for this number           |
-| `repeated_suspicious_events` | up to +15   | Multiple prior suspicious verdicts            |
-| `rapid_repeat_events`     |       up to +10 | Many scans in a short window                  |
-| `manual_user_report`      |        up to +25 | Local user reports (capped)                   |
-| `reputation_history`      |            +10 | Previously stored HIGH_RISK/MALICIOUS label   |
-| `number_format_anomaly`   |         up to +5 | Weak pattern signals (repeated digits, etc.)  |
-
-Whitelist match overrides everything. Weak pattern signals alone can never
-push a number above LOW.
-
----
-
-## Profiles
-
-| Profile   | Block threshold | Description                                            |
-|-----------|----------------:|--------------------------------------------------------|
-| RELAXED   |              80 | Prefer fewer false positives; only strong evidence blocks. |
-| BALANCED  |              60 | Default.                                               |
-| STRICT    |              50 | Stronger blocking recommendations when evidence is solid. |
-
-Switch with:
-
-```
-callshield config profile relaxed
-callshield config profile balanced
-callshield config profile strict
-```
-
-Profiles only tune thresholds and weight multipliers — they never grant
-new capabilities.
+Profiles tune thresholds/weights: RELAXED 80, BALANCED 60, STRICT 50.
 
 ---
 
 ## Database
 
-SQLite, fully local. Default location: `~/.callshield/data/callshield.db`.
-Tables:
-
-- `schema_version` — current schema revision (used for safe migrations).
-- `numbers` — blacklist/whitelist entries (number, list_type, reputation,
-  risk_score, reason, first_seen, created_at, updated_at).
-- `events` — analysis history (timestamp, number, risk_score, confidence,
-  reputation, risk_level, verdict, action, reason).
-- `reports` — user-submitted reports (number, reason, created_at).
-- `settings` — key/value metadata used by the daemon.
-
-All queries use parameterized statements — no string concatenation.
-Database files are created with `0600` permissions where possible.
-
-Migrations from Phase 1 databases are applied automatically and preserve
-all user data.
+`~/.callshield/data/callshield.db` (WAL, 0600, parameterized). Tables: `schema_version`, `numbers`, `events` (+`confidence`/`reputation`/`risk_level`), `reports`, `settings`. Indexes `idx_numbers_number`, `idx_events_number_ts`, etc. Migration v1→v2→v3 preserves data, backs up.
 
 ---
 
 ## Configuration
 
-Stored at `~/.callshield/data/config.json`.
+`~/.callshield/data/config.json` (600). Includes Phase 3:
 
-| Key                  | Default  | Description                                         |
-|----------------------|----------|-----------------------------------------------------|
-| `protection_mode`    | BALANCED | Active profile                                      |
-| `risk_threshold`     | 60       | Score at/above which BLOCK is recommended (profile-managed) |
-| `high_risk_threshold`| 60       | Score at/above which verdict becomes HIGH_RISK      |
-| `history_weight`     | 1.0      | Multiplier for history-based signals                |
-| `report_weight`      | 1.0      | Multiplier for user-report signals                  |
-| `pattern_weight`     | 0.5      | Multiplier for weak pattern signals                 |
-| `logging_enabled`    | true     | Record scan events in the database                  |
-| `color_enabled`      | AUTO     | AUTO / ON / OFF                                    |
-| `default_country`    | IN       | ISO country code for numbers without a `+` prefix   |
-| `database_path`      | …        | Path to SQLite file                                 |
-| `pid_file`           | …        | PID file for the background engine                  |
-| `log_file`           | …        | Text log file path                                  |
+| Key | Default | Description |
+|---|---|---|
+| `daemon_enabled` | true | Enable daemon |
+| `heartbeat_interval` | 30 | Heartbeat seconds (5–600) |
+| `event_queue_size` | 256 | Bounded queue (16–2048) |
+| `shutdown_timeout` | 10 | Graceful shutdown seconds (1–60) |
+| `status_refresh_interval` | 2 | Watch refresh (1–10) |
+| `max_log_size` | 2097152 | Daemon log 2MB (64KB–100MB) |
+| `max_log_files` | 3 | Rotated files (1–10) |
+| `ipc_enabled` | true | Unix socket IPC |
+| `run_dir` | `~/.callshield/run` | PID + socket + heartbeat |
+| `socket_path` | `~/.callshield/run/callshield.sock` | 700 socket |
+| `daemon_log_file` | `~/.callshield/logs/daemon.log` | Rotated daemon log |
+
+Plus Phase 1/2 keys (profile, thresholds, weights, `database_path`, `pid_file`, `log_file`, etc.). Validated, `config set` coerces types, `config profile` resets thresholds/weights.
 
 ---
 
 ## Security
 
-- **No network calls** in Phase 1 or Phase 2.
-- **Parameterized SQL** everywhere.
-- All CLI inputs are validated and normalized before touching the DB.
-- Malformed numbers and malformed config files produce clean errors.
-- No shell execution of user input; no `eval`, no `exec`.
-- No hardcoded API keys or credentials.
-- Database/PID files created with restricted permissions where possible.
-- Numbers are masked by default in event listings; `--full` is required to
-  see full numbers.
-- No analytics, telemetry, or device identifiers.
+- No network listener; IPC is local Unix socket only (700, size-limited 16KB req, timeout, no `eval`/`exec`/shell, validates `command` whitelist).
+- Parameterized SQL, validated CLI/config, sanitized report reasons (500 char), safe JSON, PID verified via `/proc/<pid>/cmdline` contains `callshield`/`python`, never kills unrelated PID, stale-PID age check.
+- Masked numbers by default; `0600`/`0700` perms; no analytics/IDs/telemetry; offline.
+- Per-event exception isolated, daemon continues; fatal init (DB/config/IPC) exits cleanly.
 
 ---
 
 ## Termux Compatibility
 
-- Pure Python 3 standard library — no native modules required.
-- Installer detects Termux's `$PREFIX` and installs the `callshield`
-  wrapper to `$PREFIX/bin` (already on PATH).
-- Works without root, without Android Studio, without a display.
-- PID-file based daemon works in Termux's Linux environment; stale PIDs
-  are detected and cleaned automatically.
+- Pure stdlib, `python3`, no root, no GUI/APK.
+- Installer creates `~/.callshield/{data,logs,run,state}` 700, handles `$PREFIX/bin` vs `~/.local/bin` + `/usr/local/bin` symlink, adds to PATH if needed, documents `Termux:Boot` concept without installing outside repo.
+- Daemon sleeps when idle (`queue.get(timeout=0.5)`, `heartbeat wait 1s`, `status wait 1s`), bounded queue prevents memory growth, no busy loops, low idle CPU.
 
 ---
 
@@ -367,89 +308,53 @@ Stored at `~/.callshield/data/config.json`.
 git clone <repo-url> Callshield
 cd Callshield
 python3 -m callshield --help
+python3 -m unittest discover -s tests  # 128 tests
 ```
 
-The package follows PEP 8, uses type hints on key interfaces, and keeps
-CLI-specific code in `cli.py`. The core engine (`detector.py`,
-`intelligence/`, `rules/`) has no CLI imports so it can be embedded
-elsewhere.
+Core engine has no CLI imports; `analyze_number()` stable for future `CallScreeningService`.
 
 ---
 
 ## Testing
 
 ```bash
-python3 -m unittest discover
+python3 -m unittest discover -s tests
+# 128 tests: normalizer, database, scoring, detector, config, signals, reputation, behavior, confidence, profiles, reports, rules, daemon, process, events, queue, health, ipc, metrics, recovery
 ```
 
-The suite covers:
+Spec-required suites: `test_daemon` (start/duplicate/stop/stale/cleanup), `test_process` (pid alive/write/read/clear/stale), `test_events` (create/valid/invalid/payload limit, processor number/system/missing/malformed), `test_queue` (bounded, full→dropped, thread-safe, close), `test_health` (snapshot/heartbeat fresh/stale/DB/queue/metrics), `test_ipc` (valid status/metrics/invalid/oversized/socket perms/cleanup), `test_metrics` (CLI + HealthMonitor), `test_recovery` (event exception isolated, malformed, DB failure, SIGTERM graceful).
 
-- Normalizer (spaces, `+`, invalid input, `00` prefixes, malformed input).
-- Database (init, insert, update, delete, lookup, duplicates, coexistence,
-  parameterization, migrations).
-- Blacklist / whitelist (add, remove, lookup, duplicates, precedence,
-  conflicts).
-- Signals (blacklist, whitelist, history, reports, weak pattern signals).
-- Scoring (clamping, whitelist override, combined signals).
-- Confidence (strong/weak/conflicting evidence, history depth).
-- Behavior (no history, one event, repeated events, repeated blocks,
-  recent-window counting).
-- Reports (create, duplicate, multiple reports, invalid input).
-- Profiles (defaults, relaxed/balanced/strict thresholds, legacy
-  "PERMISSIVE" alias).
-- Detector (safe, unknown, blocked, whitelisted, conflicting, event
-  logging).
-- Configuration (defaults, persistence, invalid values, corrupt files,
-  type coercion).
-- CLI JSON output (`--json`) and quiet mode (`--quiet`).
+All Phase 1+2 still pass.
 
 ---
 
 ## Roadmap
 
-Future phases will add, in order:
+- **Phase 1** — Foundation ✅
+- **Phase 2** — Advanced Intelligence ✅
+- **Phase 3** — Background Engine ✅ (this release)
+- **Phase 4** — Optional crowd-sourced (opt-in, privacy-preserving)
+- **Phase 5** — Contact integration
+- **Phase 6** — Notifications
+- **Phase 7** — Hardened daemon
+- **Future** — `CallScreeningService` (calls `analyze_number()`)
 
-1. **Phase 3** — On-device heuristic pattern detection (refined).
-2. **Phase 4** — Optional, privacy-preserving opt-in crowd-sourced reports.
-3. **Phase 5** — Contact-list integration and per-contact rules.
-4. **Phase 6** — Status notifications and summaries.
-5. **Phase 7** — Optional hardened daemon with privilege separation.
-6. **Future** — Android call-screening integration via the privileged
-   CallScreeningService API, calling straight into
-   `detector.analyze_number()`.
-
-Nothing beyond this repository is promised by Phase 2.
+Nothing beyond promised.
 
 ---
 
 ## Limitations
 
-- **Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls.**
-- **Phase 2 cannot intercept or block live phone calls.** It is an
-  analysis and listing foundation. The `start` command launches a
-  STANDBY engine for future integration work.
-- The normalizer is intentionally conservative. It does not embed a full
-  libphonenumber country database; it supports a small curated list of
-  common country codes and leaves everything else in the form it was
-  given.
-- There is no network lookup, no ML, no cloud backend, and no account
-  system — by design.
-- Weak pattern signals (format anomalies) are weighted very low and will
-  never, on their own, cause a BLOCK recommendation.
+- **Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls.** `start` is `STANDBY`, `Call Screening: NOT CONNECTED`, `event test` is labeled `TEST EVENT` not a call.
+- Normalizer curated country table; weak pattern signals never alone cause BLOCK.
+- No network/ML/cloud/GUI/APK; offline; `INCOMING_CALL` not implemented (extensible types only).
+- Daemon is not auto-restarted internally; watchdog foundation only (alive/heartbeat/queue/DB checks).
 
 ---
 
 ## Exit Codes
 
-| Code | Meaning                    |
-|-----:|----------------------------|
-|    0 | Success                    |
-|    1 | General error              |
-|    2 | Invalid CLI usage          |
-|    3 | Invalid phone number       |
-|    4 | Database error             |
-|    5 | Configuration error        |
-|    6 | Daemon error               |
+0 success / 1 general / 2 usage / 3 invalid number / 4 DB / 5 config / 6 daemon
 
 ---
 
@@ -459,8 +364,4 @@ MIT — see `LICENSE`.
 
 ---
 
-**Remember:** CALLSHIELD Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls.
-CALLSHIELD Phase 2 analyzes phone-number risk locally. It
-does not yet intercept or automatically reject live phone calls. That
-capability is reserved for a future phase that will require privileged
-Android integration.
+**Remember:** CALLSHIELD Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls. Future phases will connect the daemon to Android’s privileged call-screening layer.

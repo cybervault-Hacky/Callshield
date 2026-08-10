@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "callshield"
-version = "0.2.0"
-description = "CALLSHIELD — local fraud-number analysis and protection foundation (Phase 2: Advanced Intelligence)"
+version = "0.3.0"
+description = "CALLSHIELD — local fraud-number analysis and protection foundation (Phase 3: Background Engine)"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.8"

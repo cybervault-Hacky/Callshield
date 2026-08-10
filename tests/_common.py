@@ -59,10 +59,16 @@ class IsolatedEnv:
         self._td.cleanup()
 
     def make_config(self, **overrides: Any) -> Config:
+        # Ensure run dir exists inside temp for isolation
+        run_dir = self.data.parent / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
         cfg = Config(
             database_path=str(self.data / "test.db"),
-            pid_file=str(self.data / "test.pid"),
+            pid_file=str(run_dir / "test.pid"),
             log_file=str(self.logs / "test.log"),
+            run_dir=str(run_dir),
+            socket_path=str(run_dir / "test.sock"),
+            daemon_log_file=str(self.logs / "daemon.log"),
             **overrides,
         )
         save_config(cfg, config_mod.CONFIG_PATH)

@@ -58,7 +58,7 @@ from .utils import (
 
 _BANNER = "CALLSHIELD"
 _TAGLINE = "Fraud Protection Engine"
-_PHASE = "Phase 2 — Advanced Intelligence"
+_PHASE = "Phase 3 — Background Engine"
 _PHASE_COMPAT = "Phase 1 — Foundation"
 
 
@@ -132,6 +132,64 @@ def _level_from_score(score: int) -> str:
     return "LOW"
 
 
+def _ipc_request(cfg: Config, payload: Dict[str, Any], timeout: float = 2.0) -> Optional[Dict[str, Any]]:
+    """Send JSON payload to daemon via Unix socket, return response dict or None if not reachable."""
+    import socket as _socket
+    import json as _json
+    from pathlib import Path as _Path
+    if not getattr(cfg, "ipc_enabled", True):
+        return None
+    sp = _Path(getattr(cfg, "socket_path", _Path(cfg.run_dir) / "callshield.sock") if hasattr(cfg, "socket_path") else _Path(cfg.run_dir) / "callshield.sock")
+    # Also try legacy run path if configured differently
+    try:
+        sp = Path(cfg.socket_path)
+    except Exception:
+        sp = Path(cfg.run_dir) / "callshield.sock"
+    if not sp.exists():
+        return None
+    try:
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(str(sp))
+        data = (_json.dumps(payload) + "\n").encode()
+        if len(data) > 16 * 1024:
+            sock.close()
+            return {"status": "error", "error": "Request too large"}
+        sock.sendall(data)
+        # Receive response (up to 64KB)
+        resp = b""
+        sock.settimeout(timeout)
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+            if b"\n" in resp or len(resp) > 64 * 1024:
+                break
+            if len(chunk) < 4096:
+                break
+        sock.close()
+        if not resp:
+            return None
+        txt = resp.decode(errors="ignore").strip()
+        if not txt:
+            return None
+        return _json.loads(txt)
+    except Exception:
+        try:
+            sock.close()  # type: ignore
+        except Exception:
+            pass
+        return None
+
+
+def _format_uptime(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 # --------------------------------------------------------------------- parser
 
 
@@ -147,6 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
             Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls.
             Phase 2 analyzes phone-number risk locally. It does NOT yet
             intercept or reject live phone calls.
+            Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls.
             """
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -163,7 +222,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", metavar="<command>")
 
     sub.add_parser("version", help="Show version information.")
-    sub.add_parser("status", help="Show engine status.")
+    s_status = sub.add_parser("status", help="Show engine status.")
+    s_status.add_argument("--watch", action="store_true", help="Continuously display status (Ctrl+C to exit).")
+    s_status.add_argument("--interval", type=int, default=None, help="Refresh interval for --watch (seconds).")
 
     s_scan = sub.add_parser("scan", help="Analyze a phone number.")
     s_scan.add_argument("number", help="Phone number to analyze.")
@@ -251,8 +312,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("start", help="Start the background engine (STANDBY).")
     sub.add_parser("stop", help="Stop the background engine.")
-
+    sub.add_parser("metrics", help="Show daemon metrics.")
     sub.add_parser("_run-fg", help=argparse.SUPPRESS)
+
+    # Phase 3 daemon commands (with backward compat: start/stop/status map to daemon/*)
+    s_daemon = sub.add_parser("daemon", help="Daemon management.")
+    s_daemon_sub = s_daemon.add_subparsers(dest="daemon_cmd")
+    s_daemon_sub.add_parser("start", help="Start daemon.")
+    s_daemon_sub.add_parser("stop", help="Stop daemon.")
+    s_daemon_sub.add_parser("restart", help="Restart daemon.")
+    s_daemon_sub.add_parser("status", help="Show daemon status.")
+    s_daemon_sub.add_parser("info", help="Show daemon info.")
+    s_daemon_sub.add_parser("health", help="Show daemon health.")
+
+    # Event pipeline testing (Phase 3)
+    s_event = sub.add_parser("event", help="Event pipeline.")
+    s_event_sub = s_event.add_subparsers(dest="event_cmd")
+    s_evt_test = s_event_sub.add_parser("test", help="Send a TEST NUMBER_SCAN event through daemon.")
+    s_evt_test.add_argument("number", help="Phone number for test event.")
+    s_evt_test.add_argument("--reason", default=None, help="Optional reason payload.")
 
     return p
 
@@ -270,6 +348,24 @@ def _cmd_version(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
 
 
 def _cmd_status(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    # Watch mode
+    if getattr(args, "watch", False):
+        interval = getattr(args, "interval", None) or int(getattr(cfg, "status_refresh_interval", 2))
+        try:
+            import time as _time
+            while True:
+                # Clear screen-ish: print separator
+                print("\033[2J\033[H", end="")  # clear + home (if supported)
+                _do_status_once(ui, cfg)
+                print(ui.dim + f"\nRefreshing every {interval}s — Ctrl+C to exit watch mode (daemon keeps running)." + ui.reset)
+                _time.sleep(interval)
+        except KeyboardInterrupt:
+            print()
+            return EXIT_OK
+    return _do_status_once(ui, cfg)
+
+
+def _do_status_once(ui: _UI, cfg: Config) -> int:
     _header(ui, "CALLSHIELD STATUS")
     state, pid = daemon_status(cfg)
     db_ok = False
@@ -288,25 +384,63 @@ def _cmd_status(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
             "STALE": ui.yellow,
         }.get(state_text, "")
 
-    print(f"Engine      {color_for(state)}{state}{ui.reset}")
-    if pid:
-        print(f"PID         {pid}")
-    print(
-        f"Database    {ui.green + 'ONLINE' + ui.reset if db_ok else ui.red + 'ERROR' + ui.reset}"
-    )
-    print(f"Protection  STANDBY")
-    print(f"Profile     {cfg.protection_mode}")
-    # Also show generic Status for backward compat
-    print(f"Status      {color_for(state)}{state}{ui.reset}")
-    if state == "STALE":
-        print(
-            ui.dim
-            + "(A stale PID file was found and will be cleaned up on next start.)"
-            + ui.reset
-        )
-    if state == "STOPPED":
+    # Try IPC for richer status if daemon is running
+    ipc_data = None
+    if state == "RUNNING":
+        resp = _ipc_request(cfg, {"command": "status"})
+        if resp and resp.get("status") == "ok" and isinstance(resp.get("data"), dict):
+            ipc_data = resp["data"]
+
+    if ipc_data:
+        # Use IPC data for detailed status per Phase 3 spec
+        print(f"Daemon          {color_for('RUNNING')}RUNNING{ui.reset}")
+        print(f"PID             {ipc_data.get('pid') or pid}")
+        uptime_h = ipc_data.get("uptime_human") or _format_uptime(int(ipc_data.get("uptime_seconds", 0)))
+        print(f"Uptime          {uptime_h}")
         print()
-        print("Use `callshield start` to launch the background engine.")
+        print(f"Engine          {ui.green + 'ONLINE' + ui.reset if ipc_data.get('db_status') == 'ONLINE' else ui.red + 'ERROR' + ui.reset}")
+        print(f"Database        {ui.green + 'ONLINE' + ui.reset if db_ok else ui.red + 'ERROR' + ui.reset}")
+        qsize = ipc_data.get("queue_size", 0)
+        qmax = ipc_data.get("queue_max", cfg.event_queue_size)
+        print(f"Queue           {qsize} / {qmax}")
+        print()
+        print("Events")
+        print(f"  Processed     {ipc_data.get('processed', 0)}")
+        print(f"  Failed        {ipc_data.get('failed', 0)}")
+        if ipc_data.get("last_event"):
+            print(f"Last Event      {ipc_data.get('last_event')}")
+        if ipc_data.get("last_heartbeat_human"):
+            print(f"Last Heartbeat  {ipc_data.get('last_heartbeat_human')}")
+        elif ipc_data.get("last_heartbeat"):
+            import time as _t
+            print(f"Last Heartbeat  {_t.strftime('%Y-%m-%dT%H:%M:%SZ', _t.gmtime(ipc_data.get('last_heartbeat')))}")
+        print()
+        print(f"Call Screening  {ui.dim}NOT CONNECTED{ui.reset}")
+        print(f"Profile         {cfg.protection_mode}")
+    else:
+        # Fallback to legacy status (PID file)
+        print(f"Engine      {color_for(state)}{state}{ui.reset}")
+        if pid:
+            print(f"PID         {pid}")
+        print(
+            f"Database    {ui.green + 'ONLINE' + ui.reset if db_ok else ui.red + 'ERROR' + ui.reset}"
+        )
+        print(f"Protection  STANDBY")
+        print(f"Profile     {cfg.protection_mode}")
+        print(f"Status      {color_for(state)}{state}{ui.reset}")
+        # Show queue metrics if available via DB fallback
+        if state == "RUNNING":
+            print(f"Queue       0 / {cfg.event_queue_size}  {ui.dim}(IPC unavailable — using PID fallback){ui.reset}")
+            print(f"Call Screening  {ui.dim}NOT CONNECTED{ui.reset}")
+        if state == "STALE":
+            print(
+                ui.dim
+                + "(A stale PID file was found and will be cleaned up on next start.)"
+                + ui.reset
+            )
+        if state == "STOPPED":
+            print()
+            print("Use `callshield start` to launch the background engine.")
     print()
     print(f"Use `{ui.bold}callshield --help{ui.reset}` for commands.")
     return EXIT_OK
@@ -761,6 +895,17 @@ def _cmd_config(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
             ("Database Path", cfg.database_path),
             ("PID File", cfg.pid_file),
             ("Log File", cfg.log_file),
+            ("Daemon", "ENABLED" if getattr(cfg, "daemon_enabled", True) else "DISABLED"),
+            ("Heartbeat", f"{cfg.heartbeat_interval}s"),
+            ("Queue Size", str(cfg.event_queue_size)),
+            ("Shutdown Timeout", f"{cfg.shutdown_timeout}s"),
+            ("Status Refresh", f"{cfg.status_refresh_interval}s"),
+            ("Log Size", f"{cfg.max_log_size // (1024*1024)}MB" if cfg.max_log_size >= 1024*1024 else f"{cfg.max_log_size // 1024}KB"),
+            ("Log Files", str(cfg.max_log_files)),
+            ("IPC", "ENABLED" if getattr(cfg, "ipc_enabled", True) else "DISABLED"),
+            ("Run Dir", cfg.run_dir),
+            ("Socket", cfg.socket_path),
+            ("Daemon Log", cfg.daemon_log_file),
         ]
         label_w = max(len(k) for k, _ in rows)
         for k, v in rows:
@@ -770,6 +915,21 @@ def _cmd_config(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
             + "\nUse `callshield config set <key> <value>` or `callshield config profile <mode>`."
             + ui.reset
         )
+        # Also show daemon config section per Phase 3 spec
+        print()
+        _header(ui, "CALLSHIELD DAEMON CONFIG")
+        drows = [
+            ("Daemon", "ENABLED" if getattr(cfg, "daemon_enabled", True) else "DISABLED"),
+            ("Heartbeat", f"{cfg.heartbeat_interval}s"),
+            ("Queue Size", str(cfg.event_queue_size)),
+            ("Shutdown Timeout", f"{cfg.shutdown_timeout}s"),
+            ("Log Size", f"{cfg.max_log_size // (1024*1024)}MB" if cfg.max_log_size >= 1024*1024 else f"{cfg.max_log_size // 1024}KB"),
+            ("Log Files", str(cfg.max_log_files)),
+            ("IPC", "ENABLED" if getattr(cfg, "ipc_enabled", True) else "DISABLED"),
+        ]
+        lw = max(len(k) for k,_ in drows)
+        for k,v in drows:
+            print(f"{k.ljust(lw)}    {v}")
         return EXIT_OK
 
     if cmd in ("mode", "profile"):
@@ -845,7 +1005,8 @@ def _cmd_start(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
             break
 
     _header(ui)
-    print("Protection engine started.")
+    # Phase 3 spec says "Protection daemon started." — keep both for compat
+    print("Protection daemon started." if hasattr(cfg, "daemon_enabled") else "Protection engine started.")
     print(f"Mode       STANDBY")
     print(f"Engine     LOCAL")
     print(f"Profile    {cfg.protection_mode}")
@@ -853,9 +1014,18 @@ def _cmd_start(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     s2, pid2 = daemon_status(cfg)
     shown_pid = pid2 if pid2 else proc.pid
     print(f"PID        {shown_pid}")
+    # Phase 3 queue/engine details
+    print(f"Status     RUNNING")
+    print(f"Queue      READY  (0 / {cfg.event_queue_size})")
+    print(f"Engine     ONLINE")
     print(
         ui.dim
-        + "\nLive call screening is not enabled in this phase."
+        + "\nLive call screening: NOT CONNECTED"
+        + ui.reset
+    )
+    print(
+        ui.dim
+        + "Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls."
         + ui.reset
     )
     print(ui.dim + "Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls." + ui.reset)
@@ -896,6 +1066,171 @@ def _cmd_run_fg(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
         return EXIT_DAEMON
 
 
+def _cmd_metrics(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    _header(ui, "CALLSHIELD METRICS")
+    state, pid = daemon_status(cfg)
+    # Try IPC first
+    ipc_resp = _ipc_request(cfg, {"command": "metrics"}) if state == "RUNNING" else None
+    if ipc_resp and ipc_resp.get("status") == "ok" and isinstance(ipc_resp.get("data"), dict):
+        d = ipc_resp["data"]
+        print(f"Uptime              {d.get('uptime_human') or _format_uptime(int(d.get('uptime_seconds',0)))}")
+        print()
+        print(f"Events Received     {d.get('received', d.get('events_received', 0))}")
+        print(f"Processed           {d.get('processed', d.get('events_processed', 0))}")
+        print(f"Failed              {d.get('failed', d.get('events_failed', 0))}")
+        print(f"Dropped             {d.get('dropped', d.get('events_dropped', 0))}")
+        print()
+        print(f"High Risk           {d.get('high_risk_count', 0)}")
+        print(f"Block Recommendations {d.get('blocked_recommendations', 0)}")
+        print()
+        print(f"Queue Peak          {d.get('queue_peak', 0)} / {d.get('queue_max', cfg.event_queue_size)}")
+        print(f"Queue Size          {d.get('queue_size', 0)} / {d.get('queue_max', cfg.event_queue_size)}")
+        if d.get("memory_kb"):
+            print(f"Memory              {d.get('memory_kb')} kB")
+        print()
+        print(f"Call Screening      {ui.dim}NOT CONNECTED{ui.reset}")
+        return EXIT_OK
+    # Fallback: show DB-derived metrics when daemon not running
+    db = open_database(cfg)
+    try:
+        total = len(db.recent_events(limit=10000))
+        # Estimate from DB
+        print(f"Uptime              {ui.dim}daemon not running{ui.reset}")
+        print()
+        print(f"Events Received     {total}")
+        print(f"Processed           {total}")
+        print(f"Failed              0")
+        print(f"Dropped             0")
+        print()
+        print(f"Queue Peak          0 / {cfg.event_queue_size}")
+        print(f"Queue Size          0 / {cfg.event_queue_size}")
+        print()
+        print(f"Call Screening      {ui.dim}NOT CONNECTED{ui.reset}")
+        if state == "RUNNING":
+            print(ui.dim + "(IPC unavailable — daemon running but not responding)" + ui.reset)
+    finally:
+        db.close()
+    return EXIT_OK
+
+
+def _cmd_daemon(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    cmd = getattr(args, "daemon_cmd", None)
+    if cmd in (None, "status"):
+        # Delegate to status
+        fake = argparse.Namespace(watch=False, interval=None)
+        return _do_status_once(ui, cfg)
+    if cmd == "start":
+        return _cmd_start(ui, args, cfg)
+    if cmd == "stop":
+        return _cmd_stop(ui, args, cfg)
+    if cmd == "restart":
+        _cmd_stop(ui, args, cfg)
+        import time as _t
+        _t.sleep(0.5)
+        return _cmd_start(ui, args, cfg)
+    if cmd == "info":
+        return _cmd_daemon_info(ui, args, cfg)
+    if cmd == "health":
+        return _cmd_daemon_health(ui, args, cfg)
+    _print_error(ui, "Unknown daemon subcommand")
+    return EXIT_USAGE
+
+
+def _cmd_daemon_info(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    _header(ui, "CALLSHIELD DAEMON INFO")
+    state, pid = daemon_status(cfg)
+    print(f"Daemon          {state}")
+    if pid:
+        print(f"PID             {pid}")
+    # Try IPC
+    resp = _ipc_request(cfg, {"command": "daemon_info"}) if state == "RUNNING" else None
+    if resp and resp.get("status") == "ok":
+        d = resp.get("data", {})
+        for k, v in d.items():
+            print(f"{k:<15} {v}")
+    else:
+        print(f"Engine          {'ONLINE' if state=='RUNNING' else 'OFFLINE'}")
+        # Show config daemon details
+        print(f"Daemon Enabled  {'ENABLED' if cfg.daemon_enabled else 'DISABLED'}")
+        print(f"IPC             {'ENABLED' if cfg.ipc_enabled else 'DISABLED'}")
+        print(f"Heartbeat       {cfg.heartbeat_interval}s")
+        print(f"Queue Size      {cfg.event_queue_size}")
+        print(f"Socket          {cfg.socket_path}")
+        print(f"Run Dir         {cfg.run_dir}")
+    print()
+    print(f"Call Screening  {ui.dim}NOT CONNECTED{ui.reset}")
+    return EXIT_OK
+
+
+def _cmd_daemon_health(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    _header(ui, "CALLSHIELD HEALTH")
+    state, pid = daemon_status(cfg)
+    if state != "RUNNING":
+        print(f"Daemon          {state}")
+        if pid:
+            print(f"PID             {pid}")
+        print("Health          UNKNOWN (daemon not running)")
+        return EXIT_OK
+    resp = _ipc_request(cfg, {"command": "health"})
+    if resp and resp.get("status") == "ok":
+        data = resp.get("data", {})
+        healthy = resp.get("healthy", False)
+        print(f"Daemon          RUNNING")
+        print(f"PID             {data.get('pid') or pid}")
+        print(f"Uptime          {data.get('uptime_human')}")
+        print(f"Health          {ui.green + 'HEALTHY' + ui.reset if healthy else ui.yellow + 'DEGRADED' + ui.reset}")
+        print(f"Database        {data.get('db_status')}")
+        print(f"Queue           {data.get('queue_size')} / {data.get('queue_max')}")
+        print(f"Processed       {data.get('processed')}  Failed {data.get('failed')}")
+        if data.get("last_heartbeat_human"):
+            print(f"Last Heartbeat  {data.get('last_heartbeat_human')}")
+        print(f"Memory          {data.get('memory_kb') or 'unknown'} kB")
+        print(f"Call Screening  {ui.dim}NOT CONNECTED{ui.reset}")
+    else:
+        print(f"Daemon          RUNNING (IPC unavailable)")
+        print(f"PID             {pid}")
+        print("Health          UNKNOWN (IPC failed)")
+    return EXIT_OK
+
+
+def _cmd_event(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    cmd = getattr(args, "event_cmd", None)
+    if cmd == "test":
+        # Normalize number
+        n = _normalize_or_error(ui, args.number, cfg, usage_hint="callshield event test <number>")
+        if n is None:
+            return EXIT_INVALID_NUMBER
+        # Must have daemon running for real pipeline test
+        state, pid = daemon_status(cfg)
+        if state != "RUNNING":
+            _print_error(ui, "Daemon is not running. Start it with `callshield start` first.")
+            return EXIT_DAEMON
+        # Send via IPC
+        payload = {
+            "event_type": "NUMBER_SCAN",
+            "number": n.normalized,
+            "source": "TEST",
+            "payload": {"reason": args.reason} if args.reason else {},
+        }
+        # For spec, label clearly as TEST EVENT
+        _header(ui, "TEST EVENT")
+        print(f"Number        {n.normalized}")
+        print(f"Sending NUMBER_SCAN via daemon event queue...")
+        resp = _ipc_request(cfg, {"command": "event", "event": payload})
+        if not resp:
+            _print_error(ui, "Failed to communicate with daemon (IPC timeout).")
+            return EXIT_DAEMON
+        if resp.get("status") != "ok":
+            _print_error(ui, f"Daemon rejected event: {resp.get('error')}")
+            return EXIT_DAEMON
+        print(f"Event ID      {resp.get('event_id')}")
+        print(ui.dim + "Event accepted — processing via daemon pipeline (TEST EVENT, not a phone call)." + ui.reset)
+        print(ui.dim + "Check `callshield history <number>` or `callshield metrics` for result." + ui.reset)
+        return EXIT_OK
+    _print_error(ui, "Unknown event subcommand. Use `callshield event test <number>`")
+    return EXIT_USAGE
+
+
 _COMMANDS = {
     "version": _cmd_version,
     "status": _cmd_status,
@@ -914,6 +1249,9 @@ _COMMANDS = {
     "config": _cmd_config,
     "start": _cmd_start,
     "stop": _cmd_stop,
+    "metrics": _cmd_metrics,
+    "daemon": _cmd_daemon,
+    "event": _cmd_event,
     "_run-fg": _cmd_run_fg,
 }
 

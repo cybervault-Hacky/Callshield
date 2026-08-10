@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.0 — Phase 3: Background Engine
+
+### Added
+- Persistent background daemon (`callshield/daemon/`): `service.py` (EventQueue, Processor, Heartbeat, Health, IPC, signals), `process.py` (PID/socket/run-dir, stale detection, verify callshield, never kill unrelated), `heartbeat.py` (configurable 30s, lightweight state file + DB), `health.py` (uptime, PID, queue, processed/failed/received/dropped, last event/heartbeat, DB, memory), `signals.py` (SIGTERM/SIGINT/SIGHUP), `recovery.py` (validate_startup, per-event isolation)
+- Event pipeline (`callshield/events/`): `types.py` (NUMBER_SCAN/USER_REPORT/BLOCK_ACTION/ALLOW_ACTION/SYSTEM/HEARTBEAT, extensible), `models.py` (Event with uuid, timestamp, source, payload, 8KB limit), `queue.py` (EventQueue bounded 256, thread-safe, metrics, close), `processor.py` (validate→normalize→analyze_number→persist→log→metrics)
+- Local IPC via Unix domain socket `~/.callshield/run/callshield.sock` (700, JSON, 16KB req limit, timeout, no eval/exec, no TCP, validated commands: status/metrics/health/daemon_info/event/stop/ping, fallback to PID/DB when IPC unavailable)
+- Health monitoring and heartbeat: `callshield status` now shows Daemon RUNNING/PID/Uptime/Engine/Database/Queue 0/256/Events Processed/Failed/Last Event/Heartbeat/Call Screening NOT CONNECTED (IPC) with PID fallback
+- Real-time status: `callshield status --watch` (configurable interval, Ctrl+C exits watch only, no animation)
+- Daemon logging with rotation: `~/.callshield/logs/daemon.log` (2MB ×3, size-based)
+- Resource controls: bounded queue, sleep when idle (queue timeout 0.5s, heartbeat 1s), no busy loops, transactions, timeouts
+- Metrics: `callshield metrics` (Uptime, Received/Processed/Failed/Dropped, High Risk, Block, Queue Peak/Size, Memory, NOT CONNECTED)
+- Event injection for testing: `callshield event test <number> [--reason]` (real NUMBER_SCAN via queue, labeled TEST EVENT, not a phone call)
+- New CLI: `callshield metrics`, `callshield status --watch`, `callshield daemon [start|stop|restart|status|info|health]`, `callshield event test`
+- Daemon wrapper commands: `callshield daemon start/stop/restart/status` with backward compat `callshield start/stop/status`
+- Startup validation (10 steps): config, DB, run/log dirs, IPC, duplicate check, queue, workers, heartbeat, RUNNING
+- Filesystem layout `~/.callshield/{config,data,logs,run,state}` (run for pid/sock/heartbeat, state reserved)
+- Configuration extensions: `daemon_enabled`, `heartbeat_interval` (5–600), `event_queue_size` (16–2048), `shutdown_timeout` (1–60), `status_refresh_interval` (1–10), `max_log_size` (64KB–100MB), `max_log_files` (1–10), `ipc_enabled`, `run_dir`, `socket_path`, `daemon_log_file` (all validated)
+- Tests: 42 new (128 total) — `test_daemon`, `test_process`, `test_events`, `test_queue`, `test_health`, `test_ipc`, `test_metrics`, `test_recovery` plus existing Phase 1/2 preserved
+
+### Improved
+- Runtime status now reflects actual daemon state via IPC
+- Process management: safe PID verification via `/proc/<pid>/cmdline`, stale- PID age check, socket cleanup on shutdown, never kills unrelated PIDs
+- Background architecture: queue saturation recorded, health `is_healthy()` checks DB/heartbeat/queue
+- CLI `start` now shows PID/Status/Queue/Engine + `Live call screening: NOT CONNECTED` and Phase 3 disclaimer
+
+### Notes
+- Phase 3 is still offline, no network listener, no APK/GUI/ML/cloud, no `INCOMING_CALL` fake events — extensible for Phase 4
+- `Termux:Boot` compatible but not auto-installed
+
 ## 0.2.0 — Phase 2: Advanced Intelligence
 
 ### Added

@@ -144,7 +144,7 @@ def _apply_weight_multipliers(cfg: Config) -> Config:
     # Build a new Config instance sharing most fields but with adjusted weights.
     weights = dict(cfg.signal_weights)
     # history_weight affects prior-blocks, repeated-suspicious, rapid-repeat
-    for key in ("previous_block_events", "repeated_suspicious_events",
+    for key in ("previous_block_events", "repeated_suspicious_events", "previous_suspicious_events",
                 "rapid_repeat_events", "reputation_history"):
         if key in weights:
             weights[key] = max(0, int(round(weights[key] * cfg.history_weight)))
@@ -152,10 +152,11 @@ def _apply_weight_multipliers(cfg: Config) -> Config:
         weights["manual_user_report"] = max(
             0, int(round(weights["manual_user_report"] * cfg.report_weight))
         )
-    if "format_anomaly" in weights:
-        weights["format_anomaly"] = max(
-            0, int(round(weights["format_anomaly"] * cfg.pattern_weight))
-        )
+    for k in ("format_anomaly", "number_format_anomaly"):
+        if k in weights:
+            weights[k] = max(
+                0, int(round(weights[k] * cfg.pattern_weight))
+            )
     cfg.signal_weights = weights
     return cfg
 

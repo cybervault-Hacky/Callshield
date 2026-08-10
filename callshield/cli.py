@@ -262,16 +262,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _cmd_version(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     if getattr(args, "json", False):
-        _print_json({"name": "callshield", "version": __version__, "phase": _PHASE, "phase_compat": _PHASE_COMPAT})
+        _print_json({"name": "callshield", "version": __version__, "phase": _PHASE})
         return EXIT_OK
     print(f"{ui.bold}CALLSHIELD {__version__}{ui.reset}")
     print(_PHASE)
-    # Keep Phase 1 compatibility visible for spec-checkers that look for 0.1.0 / Phase 1 wording
-    if _PHASE_COMPAT and _PHASE_COMPAT != _PHASE:
-        print(_PHASE_COMPAT)
-        # Also show the 0.1.0 identifier that Phase 1 spec expects
-        if __version__ != "0.1.0":
-            print(f"Compatible with CALLSHIELD 0.1.0 — {_PHASE_COMPAT}")
     return EXIT_OK
 
 

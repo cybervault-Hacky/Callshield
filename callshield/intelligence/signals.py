@@ -117,7 +117,11 @@ def _signal_previous_blocks(ctx: SignalContext) -> Optional[SignalResult]:
 
 
 def _signal_repeated_suspicious(ctx: SignalContext) -> Optional[SignalResult]:
-    weight = int(ctx.cfg.signal_weights.get("repeated_suspicious_events", 15))
+    # Support both naming variants from spec: previous_suspicious_events (sec 5) and repeated_suspicious_events (sec 6)
+    weight = ctx.cfg.signal_weights.get("previous_suspicious_events")
+    if weight is None:
+        weight = ctx.cfg.signal_weights.get("repeated_suspicious_events", 15)
+    weight = int(weight)
     if weight <= 0:
         return None
     beh = ctx.behavior
@@ -127,8 +131,9 @@ def _signal_repeated_suspicious(ctx: SignalContext) -> Optional[SignalResult]:
     if count < 2:
         return None
     delta = min(weight, 3 * min(count, 8))
+    # Use the Phase 2 spec's canonical name for this signal
     return SignalResult(
-        name="repeated_suspicious_events",
+        name="previous_suspicious_events",
         score=delta,
         confidence=min(0.85, 0.4 + 0.07 * min(count, 8)),
         reason=f"Repeated suspicious activity in local history ({count} events)",
@@ -211,7 +216,10 @@ def _signal_reputation_history(ctx: SignalContext) -> Optional[SignalResult]:
 
 
 def _signal_format_anomaly(ctx: SignalContext) -> Optional[SignalResult]:
-    weight = int(ctx.cfg.signal_weights.get("format_anomaly", 5))
+    w = ctx.cfg.signal_weights.get("number_format_anomaly")
+    if w is None:
+        w = ctx.cfg.signal_weights.get("format_anomaly", 5)
+    weight = int(w)
     if weight <= 0:
         return None
     intel = ctx.intel

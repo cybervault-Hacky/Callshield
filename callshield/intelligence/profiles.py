@@ -30,12 +30,16 @@ class Profile:
 
 
 # Default weight set; values are the raw additive contributions before clamping.
+# Alias keys are kept for spec compatibility: spec lists both previous_suspicious_events
+# and repeated_suspicious_events, and both number_format_anomaly and format_anomaly.
 _DEFAULT_WEIGHTS: Dict[str, int] = {
     "blacklist_match": 80,
     "previous_block_events": 20,
     "repeated_suspicious_events": 15,
+    "previous_suspicious_events": 15,
     "manual_user_report": 25,
     "format_anomaly": 5,
+    "number_format_anomaly": 5,
     "rapid_repeat_events": 10,
     "reputation_history": 10,
 }
@@ -48,7 +52,7 @@ PROFILES: Dict[str, Profile] = {
         high_risk_threshold=70,
         suspicious_threshold=45,
         monitor_threshold=30,
-        signal_weights={**_DEFAULT_WEIGHTS, "format_anomaly": 3, "rapid_repeat_events": 5},
+        signal_weights={**_DEFAULT_WEIGHTS, "format_anomaly": 3, "number_format_anomaly": 3, "rapid_repeat_events": 5},
         confidence_floor_for_block=75,
         description="Prefer fewer false positives; only strong evidence triggers BLOCK.",
     ),
@@ -68,7 +72,7 @@ PROFILES: Dict[str, Profile] = {
         high_risk_threshold=50,
         suspicious_threshold=20,
         monitor_threshold=10,
-        signal_weights={**_DEFAULT_WEIGHTS, "repeated_suspicious_events": 20,
+        signal_weights={**_DEFAULT_WEIGHTS, "repeated_suspicious_events": 20, "previous_suspicious_events": 20,
                         "rapid_repeat_events": 15, "manual_user_report": 30},
         confidence_floor_for_block=45,
         description="Stronger blocking recommendations when evidence is solid.",

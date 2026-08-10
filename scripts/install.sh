@@ -49,7 +49,12 @@ if [ -n "${PREFIX:-}" ] && [ -d "${PREFIX}/bin" ]; then
 elif [ -d "${HOME}/.local/bin" ]; then
     BIN_DIR="${HOME}/.local/bin"
 else
-    BIN_DIR="${HOME}/bin"
+    # Prefer ~/.local/bin (created if missing) as it is commonly on PATH on Linux
+    if [ -d "${HOME}/.local" ] || mkdir -p "${HOME}/.local/bin" 2>/dev/null; then
+        BIN_DIR="${HOME}/.local/bin"
+    else
+        BIN_DIR="${HOME}/bin"
+    fi
 fi
 mkdir -p "${BIN_DIR}"
 
@@ -66,9 +71,23 @@ EOF
 chmod 700 "${WRAPPER}"
 ok "Command installed: ${WRAPPER}"
 
+# Also try to ensure a wrapper on a PATH directory for non-Termux desktops
+if [ "${BIN_DIR}" != "${HOME}/.local/bin" ] && [ -d "${HOME}/.local/bin" ]; then
+    ln -sf "${WRAPPER}" "${HOME}/.local/bin/callshield" 2>/dev/null || true
+fi
+# Best-effort system-wide symlink if we have permission (common on dev containers)
+if [ -w /usr/local/bin ] 2>/dev/null; then
+    ln -sf "${WRAPPER}" /usr/local/bin/callshield 2>/dev/null || true
+fi
+
 if ! echo ":${PATH}:" | grep -q ":${BIN_DIR}:"; then
     warn "${BIN_DIR} is not on your PATH. Add this to your shell rc file:"
     warn "    export PATH=\"${BIN_DIR}:\$PATH\""
+fi
+# Ensure PATH for current session if we just created ~/.local/bin
+if [ -d "${HOME}/.local/bin" ] && ! echo ":${PATH}:" | grep -q ":${HOME}/.local/bin:"; then
+    export PATH="${HOME}/.local/bin:${PATH}"
+    warn "Added ${HOME}/.local/bin to PATH for this session."
 fi
 
 # ---- Initialize DB (idempotent) ----
@@ -95,5 +114,6 @@ echo "  callshield --help"
 echo "  callshield status"
 echo "  callshield scan +919876543210"
 echo
+echo "Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls."
 echo "Phase 2 runs locally and offline. It does NOT intercept or reject"
 echo "live phone calls."

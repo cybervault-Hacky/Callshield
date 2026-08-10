@@ -2,7 +2,9 @@
 
 > **Local fraud-number analysis and protection foundation.**
 >
-> Phase 2 — Advanced Intelligence.
+> Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls.
+>
+> Phase 2 — Advanced Intelligence builds on Phase 1.
 >
 > **CALLSHIELD does NOT yet intercept or reject live phone calls.**
 > It runs locally on Android/Termux (or any Linux system), keeps its database
@@ -422,6 +424,7 @@ Nothing beyond this repository is promised by Phase 2.
 
 ## Limitations
 
+- **Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls.**
 - **Phase 2 cannot intercept or block live phone calls.** It is an
   analysis and listing foundation. The `start` command launches a
   STANDBY engine for future integration work.
@@ -456,7 +459,8 @@ MIT — see `LICENSE`.
 
 ---
 
-**Remember:** CALLSHIELD Phase 2 analyzes phone-number risk locally. It
+**Remember:** CALLSHIELD Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls.
+CALLSHIELD Phase 2 analyzes phone-number risk locally. It
 does not yet intercept or automatically reject live phone calls. That
 capability is reserved for a future phase that will require privileged
 Android integration.

@@ -1,0 +1,4 @@
+{
+  "_comment": "Initial blacklist seed. Phase 2 ships empty so it never makes accusations out of the box. Add numbers at your discretion.",
+  "numbers": []
+}

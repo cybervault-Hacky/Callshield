@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "callshield"
+version = "0.2.0"
+description = "CALLSHIELD — local fraud-number analysis and protection foundation (Phase 2: Advanced Intelligence)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+authors = [{ name = "CALLSHIELD Contributors" }]
+keywords = ["security", "telephony", "fraud", "spam", "termux", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: Communications :: Telephony",
+]
+dependencies = []
+
+[project.scripts]
+callshield = "callshield.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["callshield*"]

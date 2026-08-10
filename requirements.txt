@@ -1,0 +1,3 @@
+# CALLSHIELD dependencies.
+# Phase 1 is standard-library only; this file is intentionally minimal.
+# Future phases may add carefully-reviewed dependencies here.

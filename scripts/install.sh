@@ -77,11 +77,6 @@ ok "Command installed: ${WRAPPER}"
 if [ "${BIN_DIR}" != "${HOME}/.local/bin" ] && [ -d "${HOME}/.local/bin" ]; then
     ln -sf "${WRAPPER}" "${HOME}/.local/bin/callshield" 2>/dev/null || true
 fi
-# Best-effort system-wide symlink if we have permission (common on dev containers)
-if [ -w /usr/local/bin ] 2>/dev/null; then
-    ln -sf "${WRAPPER}" /usr/local/bin/callshield 2>/dev/null || true
-fi
-
 if ! echo ":${PATH}:" | grep -q ":${BIN_DIR}:"; then
     warn "${BIN_DIR} is not on your PATH. Add this to your shell rc file:"
     warn "    export PATH=\"${BIN_DIR}:\$PATH\""
@@ -121,4 +116,4 @@ echo
 echo "Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls."
 echo "Phase 2 runs locally and offline. It does NOT intercept or reject"
 echo "live phone calls."
-echo "Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls."
+echo "Phase 3 is Termux-first background infrastructure. Live call interception and automatic rejection are not implemented."

@@ -51,6 +51,41 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(snap["processed"], 1)
         self.assertEqual(snap["failed"], 1)
 
+    def test_metrics_complete_when_daemon_stopped(self):
+        import os
+        import pathlib
+        import subprocess
+        import sys
+
+        env = os.environ.copy()
+        env["CALLSHIELD_DATA_DIR"] = str(self.env.data)
+        env["CALLSHIELD_LOG_DIR"] = str(self.env.logs)
+        root = pathlib.Path(__file__).resolve().parents[1]
+        env["PYTHONPATH"] = str(root)
+        result = subprocess.run(
+            [sys.executable, "-m", "callshield", "metrics"],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=str(root),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for label in (
+            "Uptime",
+            "Events Received",
+            "Processed",
+            "Failed",
+            "Dropped",
+            "Queue Size",
+            "Queue Peak",
+            "High-Risk Detections",
+            "Block Recommendations",
+            "Memory",
+            "Call Screening:",
+        ):
+            self.assertIn(label, result.stdout)
+        self.assertIn("NOT CONNECTED", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

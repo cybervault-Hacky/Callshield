@@ -1,17 +1,15 @@
 # CALLSHIELD
 
-> **Local fraud-number analysis and protection with Android screening bridge (dry-run).**
+> **Local fraud-number analysis and protection foundation — now with persistent background engine.**
 >
 > Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls.
 >
 > Phase 2 — Advanced Intelligence builds on Phase 1.
 >
-> Phase 3 — Background Engine adds a real Termux daemon, event queue, and IPC.
->
-> Phase 4 — Android Screening Bridge receives real incoming-call events via CallScreeningService, analyzes with the Termux daemon, but **does not automatically reject calls (dry-run).**
+> Phase 3 — Background Engine adds a real Termux daemon, event queue, health monitoring, and Unix-socket IPC. **It does not receive live phone calls or reject calls.**
 >
 > **CALLSHIELD does NOT yet intercept or reject live phone calls.**
-> It runs locally on Android/Termux (or any Linux system), keeps its database
+> It runs locally in Termux (or another POSIX/Linux environment), keeps its database
 > on-device, and never uploads your phone numbers.
 
 ```
@@ -27,6 +25,18 @@ Profile     BALANCED
 
 Use `callshield --help` for commands.
 ```
+
+---
+
+## Phase 3 scope
+
+- Termux-first, Python-only persistent daemon
+- Local bounded event pipeline and owner-only Unix domain socket IPC
+- Heartbeat, health, metrics, safe recovery, and graceful shutdown
+- **Android project: not implemented — Phase 4**
+- **Live call interception: not implemented**
+- **Automatic call rejection: disabled / not implemented**
+- **TCP/network listener: none**
 
 ---
 
@@ -46,10 +56,9 @@ Use `callshield --help` for commands.
 - **Event logging** — every analysis recorded; masked by default (`--full` reveals).
 - **JSON output** — `callshield scan <number> --json`; `QUIET` mode.
 - **Persistent background daemon (Phase 3)** — real Linux process, PID + socket, `start`/`stop`/`status`, graceful shutdown, stale-PID recovery, never kills unrelated PIDs.
-- **Event pipeline** — bounded thread-safe queue (default 256), `NUMBER_SCAN`/`USER_REPORT`/`BLOCK_ACTION`/`ALLOW_ACTION`/`SYSTEM`/`HEARTBEAT`/`INCOMING_CALL` (Phase 4, extensible).
-- **Android CallScreeningService bridge (Phase 4)** — minimal Kotlin `CallShieldScreeningService` (no GUI, no CAMERA/MIC/LOCATION/SMS/CONTACTS/STORAGE/root), versioned `callshield/1` protocol, 1500ms timeout, dry-run `ALLOW` always, local IPC only.
+- **Event pipeline** — bounded thread-safe queue (default 256), `NUMBER_SCAN`/`USER_REPORT`/`BLOCK_ACTION`/`ALLOW_ACTION`/`SYSTEM`/`HEARTBEAT` (extensible, no fake `INCOMING_CALL`).
 - **Event processor** — validates, normalizes, calls `analyze_number()`, persists, logs, updates metrics; per-event exception isolated.
-- **Local IPC** — Unix domain socket `~/.callshield/run/callshield.sock` (700), JSON, size-limited (16KB req/64KB resp), timeout, no `eval`/`exec`, no TCP/network listener.
+- **Local IPC** — Unix domain socket `~/.callshield/run/callshield.sock` (0600), JSON, size-limited (16KB req/64KB resp), timeout, no `eval`/`exec`, no TCP/network listener.
 - **Health monitoring** — uptime, PID, queue size/peak, processed/failed/received/dropped, last event/heartbeat, DB status, memory.
 - **Heartbeat** — configurable (default 30s), lightweight state file + DB `heartbeat`.
 - **Metrics** — `callshield metrics` (uptime, events, high-risk, blocked, queue peak).
@@ -58,7 +67,7 @@ Use `callshield --help` for commands.
 - **Crash recovery** — single malformed event never kills daemon; fatal init exits cleanly.
 - **Offline-first, privacy-preserving** — zero network, no analytics, masked logs.
 - **Termux-friendly** — pure stdlib, no root, no GUI/APK, PID/socket in `~/.callshield/run`.
-- **Well tested** — 137 unit tests covering every subsystem.
+- **Well tested** — 163 unit tests covering every subsystem.
 
 ---
 
@@ -104,16 +113,9 @@ callshield/
 │       ├── __init__.py
 │       ├── engine.py
 │       └── defaults.py
-├── android/                  # Phase 4 — minimal CallScreeningService bridge (Kotlin, no GUI)
-│   ├── app/src/main/java/com/callshield/bridge/
-│   │   ├── CallShieldScreeningService.kt
-│   │   ├── BridgeClient.kt
-│   │   ├── Protocol.kt
-│   │   └── ScreeningResult.kt
-│   └── README.md
 ├── data/                     # Git-kept seed only; runtime is ~/.callshield/data
 ├── logs/                     # Git-kept .gitkeep; runtime is ~/.callshield/logs
-├── tests/                    # 137 tests (Phase1/2/3/4)
+├── tests/                    # 163 tests (Phase 1/2/3)
 ├── scripts/
 │   ├── install.sh
 │   └── uninstall.sh
@@ -126,14 +128,17 @@ Filesystem layout (Termux-safe, outside repo unless `CALLSHIELD_DATA_DIR` set):
 
 ```
 ~/.callshield/
-├── config/config.json  (also ~/.callshield/data/config.json for compat)
-├── data/callshield.db
-├── logs/callshield.log
-├── logs/daemon.log (rotated: daemon.log.1, .2)
-├── run/callshield.pid
-├── run/callshield.sock  (700, Unix socket, local-only)
-├── run/heartbeat.json
-└── state/
+├── data/
+│   ├── callshield.db
+│   └── config.json
+├── logs/
+│   ├── callshield.log
+│   └── daemon.log (rotated: daemon.log.1, .2)
+├── run/
+│   ├── callshield.pid
+│   ├── callshield.sock  (600, Unix socket, local-only)
+│   └── heartbeat.json
+└── state/daemon_metrics.json
 ```
 
 Event flow:
@@ -186,7 +191,7 @@ cd Callshield
 bash scripts/install.sh
 ```
 
-Installer: verifies Python, creates `~/.callshield/{data,logs,run,state}` (700), installs wrapper to `$PREFIX/bin` (Termux) or `~/.local/bin` (+ symlink to `/usr/local/bin` if writable), initializes DB, runs 128 tests.
+Installer: verifies Python, creates `~/.callshield/{data,logs,run,state}` (700), installs an owner-only wrapper to `$PREFIX/bin` (Termux) or `~/.local/bin`, initializes the database, and runs 163 tests. It never requires or invokes root.
 
 ### Uninstall
 
@@ -225,9 +230,6 @@ callshield status                       # Daemon RUNNING, Uptime, Queue 0/256, E
 callshield status --watch               # live refresh (Ctrl+C to exit watch, daemon stays)
 callshield metrics                      # uptime, received/processed/failed/dropped, high-risk, queue peak
 callshield event test +919876543210     # TEST NUMBER_SCAN via daemon queue (not a phone call)
-callshield screening status             # Bridge CONNECTED, Mode DRY_RUN, Timeout 1500ms
-callshield screening enable/disable     # toggle bridge
-callshield screening mode               # show/set DRY_RUN
 callshield daemon info                  # daemon info via IPC
 callshield daemon health                # health check
 callshield daemon restart               # stop + start
@@ -241,7 +243,7 @@ callshield stop                         # graceful shutdown (drains queue, flush
 | Command | Description |
 |---|---|
 | `callshield` | Banner (READY/LOCAL/ONLINE/STANDBY) + disclaimer |
-| `callshield --help`, `--version`, `version` | Help / `0.4.0 Phase 4 — Android Screening Bridge` |
+| `callshield --help`, `--version`, `version` | Help / `0.3.0 Phase 3 — Background Engine` |
 | `callshield status` | Full daemon status (IPC when running, PID fallback otherwise) |
 | `callshield status --watch [--interval N]` | Live watch (default 2s, Ctrl+C exits watch only) |
 | `callshield scan <number> [--json] [--quiet] [--no-log]` | Analyze |
@@ -255,10 +257,6 @@ callshield stop                         # graceful shutdown (drains queue, flush
 | `callshield daemon start/stop/restart/status/info/health` | Explicit daemon management |
 | `callshield metrics` | Real daemon metrics (IPC, fallback to DB when stopped) |
 | `callshield event test <number> [--reason]` | TEST event via daemon pipeline (labels TEST, not a call) |
-| `callshield screening status`           | Bridge status (CONNECTED, Mode, Timeout)       |
-| `callshield screening enable/disable`   | Enable/disable bridge                        |
-| `callshield screening mode [DRY_RUN]`   | Show/set mode (Phase 4 dry-run)              |
-| `callshield screening health/metrics`   | Screening health/metrics                     |
 
 All Phase 1/2 commands preserved.
 
@@ -276,7 +274,7 @@ Profiles tune thresholds/weights: RELAXED 80, BALANCED 60, STRICT 50.
 
 ## Database
 
-`~/.callshield/data/callshield.db` (WAL, 0600, parameterized). Tables: `schema_version`, `numbers`, `events` (+`confidence`/`reputation`/`risk_level`), `reports`, `settings`. Indexes `idx_numbers_number`, `idx_events_number_ts`, etc. Migration v1→v2→v3 preserves data, backs up.
+`~/.callshield/data/callshield.db` (WAL, 0600, parameterized). Tables: `schema_version`, `numbers`, `events` (+`confidence`/`reputation`/`risk_level`), `reports`, `settings`. Indexes `idx_numbers_number`, `idx_events_number_ts`, etc. Migration v1→v2 preserves data and creates a backup.
 
 ---
 
@@ -287,15 +285,18 @@ Profiles tune thresholds/weights: RELAXED 80, BALANCED 60, STRICT 50.
 | Key | Default | Description |
 |---|---|---|
 | `daemon_enabled` | true | Enable daemon |
+| `pid_file` | `~/.callshield/run/callshield.pid` | Daemon PID state |
 | `heartbeat_interval` | 30 | Heartbeat seconds (5–600) |
 | `event_queue_size` | 256 | Bounded queue (16–2048) |
 | `shutdown_timeout` | 10 | Graceful shutdown seconds (1–60) |
 | `status_refresh_interval` | 2 | Watch refresh (1–10) |
+| `ipc_timeout` | 5.0 | Local IPC timeout seconds (0.1–30) |
+| `event_payload_limit` | 8192 | Maximum event payload bytes (256–8192) |
 | `max_log_size` | 2097152 | Daemon log 2MB (64KB–100MB) |
 | `max_log_files` | 3 | Rotated files (1–10) |
 | `ipc_enabled` | true | Unix socket IPC |
 | `run_dir` | `~/.callshield/run` | PID + socket + heartbeat |
-| `socket_path` | `~/.callshield/run/callshield.sock` | 700 socket |
+| `socket_path` | `~/.callshield/run/callshield.sock` | Owner-only 0600 Unix socket |
 | `daemon_log_file` | `~/.callshield/logs/daemon.log` | Rotated daemon log |
 
 Plus Phase 1/2 keys (profile, thresholds, weights, `database_path`, `pid_file`, `log_file`, etc.). Validated, `config set` coerces types, `config profile` resets thresholds/weights.
@@ -304,8 +305,8 @@ Plus Phase 1/2 keys (profile, thresholds, weights, `database_path`, `pid_file`, 
 
 ## Security
 
-- No network listener; IPC is local Unix socket only (700, size-limited 16KB req, timeout, no `eval`/`exec`/shell, validates `command` whitelist).
-- Parameterized SQL, validated CLI/config, sanitized report reasons (500 char), safe JSON, PID verified via `/proc/<pid>/cmdline` contains `callshield`/`python`, never kills unrelated PID, stale-PID age check.
+- No network listener; IPC uses `AF_UNIX` only (0600 socket, 16 KiB request/64 KiB response bounds, configured timeout, strict UTF-8 JSON, command allowlist).
+- Parameterized SQL, validated CLI/config, sanitized report reasons (500 char), safe JSON, PID ownership requires the exact `python -m callshield _run-fg` command from `/proc/<pid>/cmdline`; a generic Python process is never accepted. PID identity is rechecked before any final signal.
 - Masked numbers by default; `0600`/`0700` perms; no analytics/IDs/telemetry; offline.
 - Per-event exception isolated, daemon continues; fatal init (DB/config/IPC) exits cleanly.
 
@@ -314,8 +315,8 @@ Plus Phase 1/2 keys (profile, thresholds, weights, `database_path`, `pid_file`, 
 ## Termux Compatibility
 
 - Pure stdlib, `python3`, no root, no GUI/APK.
-- Installer creates `~/.callshield/{data,logs,run,state}` 700, handles `$PREFIX/bin` vs `~/.local/bin` + `/usr/local/bin` symlink, adds to PATH if needed, documents `Termux:Boot` concept without installing outside repo.
-- Daemon sleeps when idle (`queue.get(timeout=0.5)`, `heartbeat wait 1s`, `status wait 1s`), bounded queue prevents memory growth, no busy loops, low idle CPU.
+- Installer creates `~/.callshield/{data,logs,run,state}` 700, handles `$PREFIX/bin` vs `~/.local/bin`, adds to PATH if needed, and documents `Termux:Boot` concept without installing outside repo.
+- Daemon sleeps when idle (`queue.get(timeout=0.25)`, `heartbeat wait 1s`, `status wait 1s`), bounded queue prevents memory growth, no busy loops, low idle CPU.
 
 ---
 
@@ -325,18 +326,18 @@ Plus Phase 1/2 keys (profile, thresholds, weights, `database_path`, `pid_file`, 
 git clone <repo-url> Callshield
 cd Callshield
 python3 -m callshield --help
-python3 -m unittest discover -s tests  # 128 tests
+pytest -q                              # 163 tests
 ```
 
-Core engine has no CLI imports; `analyze_number()` stable for future `CallScreeningService`.
+The core engine has no CLI or daemon dependency; Phase 3 reuses the existing `analyze_number()` API.
 
 ---
 
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests
-# 128 tests: normalizer, database, scoring, detector, config, signals, reputation, behavior, confidence, profiles, reports, rules, daemon, process, events, queue, health, ipc, metrics, recovery
+pytest -q
+# 163 tests: normalizer, database, scoring, detector, config, signals, reputation, behavior, confidence, profiles, reports, rules, daemon, process, events, queue, health, ipc, metrics, recovery
 ```
 
 Spec-required suites: `test_daemon` (start/duplicate/stop/stale/cleanup), `test_process` (pid alive/write/read/clear/stale), `test_events` (create/valid/invalid/payload limit, processor number/system/missing/malformed), `test_queue` (bounded, full→dropped, thread-safe, close), `test_health` (snapshot/heartbeat fresh/stale/DB/queue/metrics), `test_ipc` (valid status/metrics/invalid/oversized/socket perms/cleanup), `test_metrics` (CLI + HealthMonitor), `test_recovery` (event exception isolated, malformed, DB failure, SIGTERM graceful).
@@ -350,22 +351,17 @@ All Phase 1+2 still pass.
 - **Phase 1** — Foundation ✅
 - **Phase 2** — Advanced Intelligence ✅
 - **Phase 3** — Background Engine ✅ (this release)
-- **Phase 4** — Optional crowd-sourced (opt-in, privacy-preserving)
-- **Phase 5** — Contact integration
-- **Phase 6** — Notifications
-- **Phase 7** — Hardened daemon
-- **Future** — `CallScreeningService` (calls `analyze_number()`)
+- **Phase 4** — Future work; not implemented in this repository state
 
-Nothing beyond promised.
+No Phase 4, Phase 5, or Phase 6 functionality is included in version 0.3.0.
 
 ---
 
 ## Limitations
 
-- **Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls.**
-- **Phase 4 receives and analyzes real Android call-screening events but does not automatically reject calls. Automatic rejection is intentionally disabled until Phase 5.** `CallShieldScreeningService` always returns `ALLOW` (`recommended BLOCK → applied ALLOW, reason DRY_RUN`), timeout → `UNKNOWN/ALLOW/SCREENING_TIMEOUT`, daemon unavailable → `UNKNOWN/ALLOW`.
+- **Phase 3 provides background processing infrastructure only. It does not receive or reject live phone calls.** `start` is `STANDBY`, `Call Screening: NOT CONNECTED`, `event test` is labeled `TEST EVENT` not a call.
 - Normalizer curated country table; weak pattern signals never alone cause BLOCK.
-- No network/ML/cloud/GUI/APK; offline; `INCOMING_CALL` not implemented (extensible types only).
+- No network/ML/cloud/GUI/APK or Android project. There is no live incoming-call event in Phase 3.
 - Daemon is not auto-restarted internally; watchdog foundation only (alive/heartbeat/queue/DB checks).
 
 ---
@@ -382,4 +378,4 @@ MIT — see `LICENSE`.
 
 ---
 
-**Remember:** CALLSHIELD Phase 4 receives and analyzes real Android call-screening events but does not automatically reject calls. Automatic rejection is intentionally disabled until Phase 5. Future phases will enable controlled rejection.
+**Remember:** CALLSHIELD Phase 3 is Termux-first background infrastructure. Live call interception and automatic call rejection are not implemented. Phase 4 remains future work.

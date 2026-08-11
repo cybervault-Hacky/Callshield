@@ -1,12 +1,8 @@
-"""Event type definitions for CALLSHIELD Phase 3.
-
-Phase 3 supports local event types only. No fake INCOMING_CALL.
-The enum is extensible for Phase 4 call-screening.
-"""
+"""The six local event type definitions for CALLSHIELD Phase 3."""
 
 from __future__ import annotations
 
-# Valid event types for Phase 3+4
+# Valid event types for Phase 3
 VALID_EVENT_TYPES = (
     "NUMBER_SCAN",
     "USER_REPORT",
@@ -14,7 +10,6 @@ VALID_EVENT_TYPES = (
     "ALLOW_ACTION",
     "SYSTEM",
     "HEARTBEAT",
-    "INCOMING_CALL",
 )
 
 # Keep as constants for validation
@@ -24,7 +19,6 @@ EVENT_TYPE_BLOCK_ACTION = "BLOCK_ACTION"
 EVENT_TYPE_ALLOW_ACTION = "ALLOW_ACTION"
 EVENT_TYPE_SYSTEM = "SYSTEM"
 EVENT_TYPE_HEARTBEAT = "HEARTBEAT"
-EVENT_TYPE_INCOMING_CALL = "INCOMING_CALL"
 
 # Source identifiers
 SOURCE_CLI = "CLI"
@@ -32,7 +26,6 @@ SOURCE_DAEMON = "DAEMON"
 SOURCE_TEST = "TEST"
 SOURCE_USER = "USER"
 SOURCE_SYSTEM = "SYSTEM"
-SOURCE_ANDROID = "android_call_screening"
 
 __all__ = [
     "VALID_EVENT_TYPES",
@@ -42,11 +35,9 @@ __all__ = [
     "EVENT_TYPE_ALLOW_ACTION",
     "EVENT_TYPE_SYSTEM",
     "EVENT_TYPE_HEARTBEAT",
-    "EVENT_TYPE_INCOMING_CALL",
     "SOURCE_CLI",
     "SOURCE_DAEMON",
     "SOURCE_TEST",
     "SOURCE_USER",
     "SOURCE_SYSTEM",
-    "SOURCE_ANDROID",
 ]

@@ -3,6 +3,7 @@
 import json
 import os
 import socket
+import stat
 import time
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ from tests._common import IsolatedEnv
 class TestIPC(unittest.TestCase):
     def setUp(self):
         self.env = IsolatedEnv().start()
-        self.cfg = self.env.make_config()
+        self.cfg = self.env.make_config(ipc_timeout=0.25)
         # Start daemon
         import subprocess, sys, pathlib
         self.env_vars = os.environ.copy()
@@ -32,14 +33,16 @@ class TestIPC(unittest.TestCase):
         self.env.stop()
 
     def _req(self, payload):
+        return self._raw((json.dumps(payload) + "\n").encode())
+
+    def _raw(self, data):
         sock_path = Path(self.cfg.socket_path)
-        # Also try run_dir sock if different
         if not sock_path.exists():
             sock_path = Path(self.cfg.run_dir) / "callshield.sock"
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(2.0)
         s.connect(str(sock_path))
-        s.sendall((json.dumps(payload) + "\n").encode())
+        s.sendall(data)
         resp = s.recv(4096)
         s.close()
         return json.loads(resp.decode().strip())
@@ -63,10 +66,52 @@ class TestIPC(unittest.TestCase):
 
     def test_oversized_request(self):
         big = {"command": "status", "data": "x" * 20000}
-        # Should be rejected due to size limit 16KB
         resp = self._req(big)
-        # Either error or truncated, but should not crash daemon
-        self.assertIn(resp.get("status"), ("error", "ok"))
+        self.assertEqual(resp.get("status"), "error")
+        self.assertIn("large", resp.get("error", "").lower())
+        self.assertEqual(self._req({"command": "ping"})["status"], "ok")
+
+    def test_ping_health_and_daemon_info(self):
+        ping = self._req({"command": "ping"})
+        self.assertEqual(ping, {"status": "ok", "pong": True})
+        health = self._req({"command": "health"})
+        self.assertEqual(health.get("status"), "ok")
+        self.assertIn("healthy", health)
+        info = self._req({"command": "daemon_info"})
+        self.assertEqual(info.get("status"), "ok")
+        self.assertEqual(info["data"]["state"], "RUNNING")
+
+    def test_event_operation_and_validation(self):
+        accepted = self._req(
+            {
+                "command": "event",
+                "event": {
+                    "event_type": "NUMBER_SCAN",
+                    "number": "+919876543210",
+                    "source": "TEST",
+                    "payload": {"reason": "ipc test"},
+                },
+            }
+        )
+        self.assertEqual(accepted.get("status"), "ok")
+        self.assertTrue(accepted.get("event_id"))
+        rejected = self._req({"command": "event", "event": {"source": "TEST"}})
+        self.assertEqual(rejected.get("status"), "error")
+
+    def test_malformed_json_returns_error_and_daemon_survives(self):
+        response = self._raw(b"{not-json}\n")
+        self.assertEqual(response.get("status"), "error")
+        self.assertEqual(self._req({"command": "ping"})["status"], "ok")
+
+    def test_partial_request_times_out_safely(self):
+        response = self._raw(b'{"command":')
+        self.assertEqual(response.get("status"), "error")
+        self.assertIn("timeout", response.get("error", "").lower())
+
+    def test_socket_is_unix_only(self):
+        sock_path = Path(self.cfg.socket_path)
+        self.assertTrue(stat.S_ISSOCK(sock_path.stat().st_mode))
+        self.assertEqual(self._req({"command": "ping"})["status"], "ok")
 
     def test_socket_permissions(self):
         sock_path = Path(self.cfg.socket_path)

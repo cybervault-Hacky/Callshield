@@ -1,7 +1,8 @@
-"""Main daemon service for CALLSHIELD Phase 3.
+"""Persistent CALLSHIELD Phase 3 background service.
 
-Orchestrates EventQueue, Processor, Heartbeat, Health, IPC, Signals,
-graceful shutdown, crash recovery, resource control.
+The service composes the bounded event queue, Phase 2 detector pipeline,
+heartbeat, health monitor, safe signals/recovery, and owner-only Unix IPC.
+It intentionally has no phone-call interception or active blocking behavior.
 """
 
 from __future__ import annotations
@@ -13,616 +14,542 @@ import socket
 import threading
 import time
 import uuid
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..config import Config, load_config
-from ..database import Database
-from ..events import Event, EventQueue, EventProcessor
-from ..events.types import VALID_EVENT_TYPES
-from ..utils import safe_write_text
+from ..events import EventQueue, EventProcessor
+from ..events.models import Event
+from ..utils import iso_now, safe_write_text
 from .health import HealthMonitor
 from .heartbeat import Heartbeat
-from .process import _clear_pid, _clear_socket, _pid_path, _socket_path, _write_pid, _run_dir
-from .recovery import validate_startup
+from .process import _clear_pid, _clear_socket, _socket_path, _write_pid
+from .recovery import recover_runtime, validate_startup
 from .signals import SignalHandler
 
+MAX_IPC_REQUEST = 16 * 1024
+MAX_IPC_RESPONSE = 64 * 1024
+_ALLOWED_IPC_COMMANDS = {
+    "status",
+    "metrics",
+    "health",
+    "daemon_info",
+    "event",
+    "stop",
+    "ping",
+}
 
-# Daemon logger with rotation
+
 def _get_daemon_logger(cfg: Config) -> logging.Logger:
+    """Create a private size-rotated daemon logger."""
+
     logger = logging.getLogger("callshield.daemon")
-    if getattr(logger, "_callshield_daemon_configured", False):
-        return logger
     logger.setLevel(logging.INFO)
-    logger.handlers = []
+    requested_path = str(Path(cfg.daemon_log_file).expanduser())
+    configured_path = getattr(logger, "_callshield_path", None)
+    if configured_path == requested_path and logger.handlers:
+        return logger
+
+    for existing in list(logger.handlers):
+        try:
+            existing.close()
+        except Exception:
+            pass
+        logger.removeHandler(existing)
     try:
-        log_path = Path(cfg.daemon_log_file)
+        log_path = Path(requested_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        handler = _RotatingFileHandler(
-            log_path,
-            max_bytes=int(cfg.max_log_size),
-            backup_count=int(cfg.max_log_files),
+        try:
+            log_path.parent.chmod(0o700)
+        except OSError:
+            pass
+        handler = RotatingFileHandler(
+            str(log_path),
+            maxBytes=int(cfg.max_log_size),
+            backupCount=int(cfg.max_log_files),
+            encoding="utf-8",
         )
-        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        try:
+            log_path.chmod(0o600)
+        except OSError:
+            pass
     except Exception:
-        # Fallback to stream
-        sh = logging.StreamHandler()
-        sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        logger.addHandler(sh)
+        handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
     logger.propagate = False
-    logger._callshield_daemon_configured = True  # type: ignore
+    logger._callshield_path = requested_path  # type: ignore[attr-defined]
     return logger
 
 
-class _RotatingFileHandler(logging.FileHandler):
-    """Simple size-based rotating file handler."""
-
-    def __init__(self, path: Path, max_bytes: int = 2*1024*1024, backup_count: int = 3, encoding: str = "utf-8"):
-        self.path = Path(path)
-        self.max_bytes = max_bytes
-        self.backup_count = backup_count
-        super().__init__(str(self.path), encoding=encoding)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            if self.path.exists() and self.path.stat().st_size >= self.max_bytes:
-                self.do_rollover()
-        except Exception:
-            pass
-        super().emit(record)
-
-    def do_rollover(self) -> None:
-        try:
-            self.close()
-            # Rotate: daemon.log.3 -> remove, 2->3, 1->2, .log->.1
-            for i in range(self.backup_count, 0, -1):
-                src = self.path.parent / f"{self.path.name}.{i}" if i > 1 else self.path
-                # Actually logic: for i == backup_count down to 1, src is .i, dst is .(i+1) except base
-                # Simpler: rotate from high to low
-                pass
-            # Implement correctly
-            if self.backup_count > 0:
-                # Remove oldest
-                oldest = self.path.parent / f"{self.path.name}.{self.backup_count}"
-                if oldest.exists():
-                    oldest.unlink()
-                # Shift
-                for i in range(self.backup_count - 1, 0, -1):
-                    src = self.path.parent / f"{self.path.name}.{i}"
-                    dst = self.path.parent / f"{self.path.name}.{i+1}"
-                    if src.exists():
-                        src.rename(dst)
-                # Base -> .1
-                if self.path.exists():
-                    self.path.rename(self.path.parent / f"{self.path.name}.1")
-            self.stream = self._open()
-        except Exception:
-            try:
-                self.stream = self._open()
-            except Exception:
-                pass
-
-
 class DaemonService:
-    """Persistent daemon service."""
+    """Real persistent daemon process for CALLSHIELD Phase 3."""
 
     def __init__(self, cfg: Optional[Config] = None) -> None:
-        self.cfg = cfg or load_config()
-        self.cfg = validate_startup(self.cfg)
+        self.cfg = validate_startup(cfg or load_config())
         self.queue = EventQueue(maxsize=int(self.cfg.event_queue_size))
         self.health = HealthMonitor(self.cfg)
-        self.heartbeat = Heartbeat(self.cfg)
-        self.processor = EventProcessor(self.cfg, logger=_get_daemon_logger(self.cfg))
+        self.heartbeat = Heartbeat(
+            self.cfg,
+            on_beat=lambda timestamp: self.health.set_heartbeat(timestamp),
+        )
         self.logger = _get_daemon_logger(self.cfg)
+        self.processor = EventProcessor(self.cfg, logger=self.logger)
         self._shutdown = threading.Event()
-        self._ipc_thread: Optional[threading.Thread] = None
-        self._processor_thread: Optional[threading.Thread] = None
-        self._ipc_socket: Optional[socket.socket] = None
         self._ipc_stop = threading.Event()
+        self._ipc_thread = None  # type: Optional[threading.Thread]
+        self._processor_thread = None  # type: Optional[threading.Thread]
+        self._ipc_socket = None  # type: Optional[socket.socket]
+        self._signal_handler = None  # type: Optional[SignalHandler]
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_complete = False
+        self._pid_claimed = False
 
     def start(self) -> int:
-        # Startup validation already done
+        """Claim runtime state, start workers, and remain alive until shutdown."""
+
+        recover_runtime(self.cfg)
         pid = _write_pid(self.cfg)
+        self._pid_claimed = True
         self.health.pid = pid
-        self.health.set_state("RUNNING")
-        self.logger.info(f"Daemon starting pid={pid} queue={self.cfg.event_queue_size} heartbeat={self.cfg.heartbeat_interval}s")
-
-        # Start heartbeat
-        self.heartbeat.start()
-        self.health.set_heartbeat()
-
-        # Install signal handlers
-        def _do_shutdown():
-            self.request_shutdown()
-
-        def _do_reload():
-            try:
-                new_cfg = load_config()
-                self.cfg = new_cfg
-                self.logger.info("Configuration reloaded via SIGHUP")
-            except Exception as exc:
-                self.logger.error(f"Failed to reload config: {exc}")
-
-        sig_handler = SignalHandler(self.cfg, shutdown_cb=_do_shutdown, reload_cb=_do_reload)
-        sig_handler.install()
-
-        # Start IPC
-        if self.cfg.ipc_enabled:
-            self._start_ipc()
-
-        # Start processor thread
-        self._processor_thread = threading.Thread(target=self._processor_loop, name="callshield-processor", daemon=True)
-        self._processor_thread.start()
-
-        # Main loop: just wait for shutdown, handle heartbeat via its own thread
+        self.logger.info(
+            "Daemon starting pid=%s queue=%s heartbeat=%ss",
+            pid,
+            self.cfg.event_queue_size,
+            self.cfg.heartbeat_interval,
+        )
         try:
-            while not self._shutdown.is_set():
-                # Check health periodically, update DB status
+            self._install_signals()
+            self.health.check_db()
+            self.heartbeat.start()
+            if self.cfg.ipc_enabled:
+                self._start_ipc()
+            self._processor_thread = threading.Thread(
+                target=self._processor_loop,
+                name="callshield-processor",
+                daemon=True,
+            )
+            self._processor_thread.start()
+            self.health.set_state("RUNNING")
+
+            while not self._shutdown.wait(timeout=1.0):
                 try:
                     self.health.check_db()
+                    self._sync_runtime_metrics()
                 except Exception:
+                    # Health collection must never terminate the daemon.
                     pass
-                # Update queue metrics
-                try:
-                    self.health.update_queue(self.queue.qsize(), peak=self.queue.metrics().get("peak"))
-                except Exception:
-                    pass
-                # Sleep with interruption
-                self._shutdown.wait(timeout=1.0)
-                # Resource control: avoid busy loop, sleep when idle is already handled via wait
+        except BaseException:
+            self.logger.exception("Daemon startup/runtime failure")
+            raise
         finally:
             self._do_graceful_shutdown()
         return 0
 
+    def _install_signals(self) -> None:
+        self._signal_handler = SignalHandler(
+            self.cfg,
+            shutdown_cb=self.request_shutdown,
+            reload_cb=self._reload_config,
+        )
+        self._signal_handler.install()
+
+    def _reload_config(self) -> None:
+        """Apply safe SIGHUP changes without moving live runtime endpoints."""
+
+        try:
+            new_cfg = load_config()
+            immutable = (
+                "pid_file",
+                "socket_path",
+                "run_dir",
+                "database_path",
+                "event_queue_size",
+                "ipc_enabled",
+                "daemon_log_file",
+                "max_log_size",
+                "max_log_files",
+            )
+            ignored = []
+            for name in immutable:
+                old_value = getattr(self.cfg, name)
+                if getattr(new_cfg, name) != old_value:
+                    ignored.append(name)
+                    setattr(new_cfg, name, old_value)
+            self.cfg = new_cfg
+            self.processor.cfg = new_cfg
+            self.processor.db_path = new_cfg.database_path
+            self.health.update_config(new_cfg)
+            self.heartbeat.cfg = new_cfg
+            self.heartbeat.update_interval(float(new_cfg.heartbeat_interval))
+            if self._signal_handler:
+                self._signal_handler.cfg = new_cfg
+            if ignored:
+                self.logger.warning(
+                    "SIGHUP ignored restart-required settings: %s",
+                    ", ".join(ignored),
+                )
+            self.logger.info("Configuration reloaded safely via SIGHUP")
+        except Exception as exc:
+            self.logger.error("Configuration reload rejected: %s", exc)
+
     def _processor_loop(self) -> None:
-        """Worker that dequeues and processes events."""
-        while not self._shutdown.is_set():
+        """Process all accepted events, including queued work during shutdown."""
+
+        while True:
+            event = None
             try:
-                event = self.queue.get(block=True, timeout=0.5)
+                event = self.queue.dequeue(block=True, timeout=0.25)
                 if event is None:
+                    if self._shutdown.is_set() and self.queue.empty():
+                        break
                     continue
-                # Update health
-                self.health.update_queue(self.queue.qsize())
-                try:
-                    result = self.processor.process(event)
-                    # Update metrics based on result
-                    if result.get("status") == "processed":
-                        det = result.get("detection") or {}
-                        verdict = det.get("verdict")
-                        action = det.get("recommended_action") or det.get("action")
-                        self.health.inc_processed(verdict=verdict, action=action)
-                    else:
-                        self.health.inc_failed(error=result.get("error"))
-                except Exception as exc:
-                    # Crash recovery: log, increment failed, continue
-                    try:
-                        self.logger.exception(f"Processor exception for event {getattr(event, 'event_id', 'unknown')}: {exc}")
-                    except Exception:
-                        pass
-                    self.health.inc_failed(error=str(exc))
-                finally:
-                    # Mark queue task done if needed (queue.Queue doesn't require)
-                    pass
+                result = self.processor.process(event)
+                if result.get("status") == "processed":
+                    detection = result.get("detection") or {}
+                    self.health.inc_processed(
+                        verdict=detection.get("verdict"),
+                        action=detection.get("recommended_action")
+                        or detection.get("action"),
+                    )
+                else:
+                    self.health.inc_failed(error=result.get("error"))
             except Exception as exc:
-                # Ensure daemon doesn't crash
+                event_id = getattr(event, "event_id", "unknown")
                 try:
-                    self.logger.exception(f"Processor loop exception: {exc}")
+                    self.logger.exception(
+                        "Processor exception for event %s: %s", event_id, exc
+                    )
                 except Exception:
                     pass
-                time.sleep(0.1)
+                self.health.inc_failed(error=str(exc))
+            finally:
+                if event is not None:
+                    try:
+                        self.queue.task_done()
+                    except Exception:
+                        pass
+                try:
+                    self._sync_runtime_metrics()
+                except Exception:
+                    pass
+
+    def _sync_runtime_metrics(self) -> None:
+        metrics = self.queue.metrics()
+        self.health.update_queue(
+            int(metrics.get("size", 0)), peak=int(metrics.get("peak", 0))
+        )
+        last_beat = self.heartbeat.last_beat
+        if last_beat:
+            self.health.set_heartbeat(last_beat)
+
+    # ------------------------------------------------------------------ IPC
 
     def _start_ipc(self) -> None:
+        endpoint = _socket_path(self.cfg)
+        if endpoint.exists() or endpoint.is_symlink():
+            # recover_runtime has already proved it stale and removed it. An
+            # endpoint appearing now belongs to a competing startup.
+            raise RuntimeError(f"Unix socket path became occupied: {endpoint}")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sp = _socket_path(self.cfg)
-            # Clean stale
-            if sp.exists():
-                try:
-                    sp.unlink()
-                except OSError:
-                    pass
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            # Remove if exists
+            listener.bind(str(endpoint))
+            os.chmod(endpoint, 0o600)
+            listener.listen(8)
+            listener.settimeout(0.5)
+        except Exception:
+            listener.close()
+            _clear_socket(self.cfg)
+            raise
+        self._ipc_socket = listener
+        self._ipc_stop.clear()
+        self._ipc_thread = threading.Thread(
+            target=self._ipc_loop, name="callshield-ipc", daemon=True
+        )
+        self._ipc_thread.start()
+        self.logger.info("IPC listening on owner-only Unix socket %s", endpoint)
+
+    def _ipc_loop(self) -> None:
+        listener = self._ipc_socket
+        if listener is None:
+            return
+        while not self._ipc_stop.is_set():
             try:
-                # Allow reuse
-                pass
-            except Exception:
-                pass
-            sock.bind(str(sp))
-            sock.listen(5)
-            # Restrict permissions to user only
-            try:
-                os.chmod(sp, 0o700)
+                connection, _ = listener.accept()
+            except socket.timeout:
+                continue
             except OSError:
-                pass
-            self._ipc_socket = sock
+                break
+            # Handle serially to keep local connection resource usage bounded.
+            self._handle_ipc_conn(connection)
 
-            def _ipc_loop():
-                while not self._ipc_stop.is_set():
-                    try:
-                        sock.settimeout(1.0)
-                        try:
-                            conn, _ = sock.accept()
-                        except socket.timeout:
-                            continue
-                        except OSError:
-                            break
-                        # Handle connection in new thread to avoid blocking
-                        t = threading.Thread(target=self._handle_ipc_conn, args=(conn,), daemon=True)
-                        t.start()
-                    except Exception as exc:
-                        if not self._ipc_stop.is_set():
-                            try:
-                                self.logger.error(f"IPC accept failed: {exc}")
-                            except Exception:
-                                pass
-                        time.sleep(0.1)
-            self._ipc_thread = threading.Thread(target=_ipc_loop, name="callshield-ipc", daemon=True)
-            self._ipc_thread.start()
-            self.logger.info(f"IPC listening on {sp}")
-        except Exception as exc:
-            self.logger.error(f"Failed to start IPC socket: {exc}")
-            # Fallback: continue without IPC, document via log
-            self.logger.warning("IPC disabled due to socket failure; CLI will fallback to PID/DB polling")
-
-    def _handle_ipc_conn(self, conn: socket.socket) -> None:
-        try:
-            conn.settimeout(5.0)
-            data = b""
-            # Limit request size to 16KB
-            max_size = 16 * 1024
-            while len(data) < max_size:
-                try:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
-                    # Check if we have complete JSON (simple: try parse)
-                    if b"\n" in data or len(chunk) < 4096:
-                        # Try to parse
-                        try:
-                            txt = data.decode(errors="ignore").strip()
-                            if txt:
-                                json.loads(txt)
-                                break
-                        except Exception:
-                            # Not yet complete
-                            if len(data) >= max_size:
-                                break
-                            continue
-                    if len(data) >= max_size:
-                        break
-                except socket.timeout:
-                    break
-            if not data:
-                conn.close()
-                return
-            txt = data.decode(errors="ignore").strip()
-            if len(txt) > max_size:
-                resp = {"status": "error", "error": "Request too large"}
-                conn.sendall((json.dumps(resp) + "\n").encode())
-                conn.close()
-                return
+    def _handle_ipc_conn(self, connection: socket.socket) -> None:
+        with connection:
+            connection.settimeout(float(self.cfg.ipc_timeout))
             try:
-                req = json.loads(txt)
+                request = self._read_ipc_request(connection)
+                response = self._validate_and_dispatch(request)
+            except socket.timeout:
+                response = {"status": "error", "error": "Request timeout"}
+            except (UnicodeError, ValueError) as exc:
+                response = {"status": "error", "error": str(exc)}
             except Exception as exc:
-                resp = {"status": "error", "error": f"Invalid JSON: {exc}"}
-                conn.sendall((json.dumps(resp) + "\n").encode())
-                conn.close()
-                return
-            # Validate
-            if not isinstance(req, dict) or "command" not in req:
-                resp = {"status": "error", "error": "Invalid request: missing command"}
-                conn.sendall((json.dumps(resp) + "\n").encode())
-                conn.close()
-                return
-            # Never exec/eval, only allow known commands
-            cmd = req.get("command")
-            allowed = {"status", "metrics", "health", "daemon_info", "event", "stop", "ping", "incoming_call", "screening", "screening_status", "bridge_status"}
-            if cmd not in allowed:
-                resp = {"status": "error", "error": f"Unknown command: {cmd}"}
-                conn.sendall((json.dumps(resp) + "\n").encode())
-                conn.close()
-                return
+                self.logger.error("IPC request failed safely: %s", exc)
+                response = {"status": "error", "error": "Request handling failed"}
+            self._send_ipc_response(connection, response)
 
-            resp = self._handle_ipc_command(req)
-            conn.sendall((json.dumps(resp) + "\n").encode())
-            conn.close()
-        except Exception as exc:
-            try:
-                self.logger.error(f"IPC handling failed: {exc}")
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _handle_ipc_command(self, req: Dict[str, Any]) -> Dict[str, Any]:
-        cmd = req.get("command")
+    @staticmethod
+    def _read_ipc_request(connection: socket.socket) -> Any:
+        data = b""
+        while True:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX_IPC_REQUEST:
+                raise ValueError(
+                    f"Request too large (maximum {MAX_IPC_REQUEST} bytes)"
+                )
+            if b"\n" in data:
+                first, remainder = data.split(b"\n", 1)
+                if remainder.strip():
+                    raise ValueError("Only one JSON request is allowed per connection")
+                data = first
+                break
+        if not data:
+            raise ValueError("Empty request")
         try:
-            if cmd == "ping":
+            text = data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Request must be valid UTF-8") from exc
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON: {exc.msg}") from exc
+
+    @staticmethod
+    def _send_ipc_response(connection: socket.socket, response: Dict[str, Any]) -> None:
+        try:
+            encoded = (json.dumps(response, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
+            if len(encoded) > MAX_IPC_RESPONSE:
+                encoded = b'{"status":"error","error":"Response too large"}\n'
+            connection.sendall(encoded)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def _validate_and_dispatch(self, request: Any) -> Dict[str, Any]:
+        if not isinstance(request, dict):
+            return {"status": "error", "error": "Request must be a JSON object"}
+        command = request.get("command")
+        if not isinstance(command, str) or not command:
+            return {"status": "error", "error": "Invalid request: missing command"}
+        if command not in _ALLOWED_IPC_COMMANDS:
+            return {"status": "error", "error": f"Unknown command: {command}"}
+        return self._handle_ipc_command(command, request)
+
+    def _snapshot(self) -> Dict[str, Any]:
+        self._sync_runtime_metrics()
+        return self.health.snapshot()
+
+    def _handle_ipc_command(
+        self, command: str, request: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        try:
+            if command == "ping":
                 return {"status": "ok", "pong": True}
-            elif cmd == "status":
-                snap = self.health.snapshot()
-                snap["ipc"] = "ENABLED"
-                snap["call_screening"] = "NOT CONNECTED"
-                return {"status": "ok", "data": snap}
-            elif cmd == "metrics":
-                snap = self.health.snapshot()
-                # Add queue metrics
-                qm = self.queue.metrics()
-                snap.update({
-                    "events_received": snap["received"],
-                    "events_processed": snap["processed"],
-                    "events_failed": snap["failed"],
-                    "events_dropped": snap["dropped"],
-                    "queue_peak": qm.get("peak"),
-                    "screening_mode": getattr(self.cfg, "screening_mode", "DRY_RUN"),
-                })
-                # Also add screening metrics from DB if available
-                try:
-                    from ..database import Database
-                    db = Database(self.cfg.database_path)
-                    sm = db.screening_metrics()
-                    db.close()
-                    snap.update({
-                        "screening_total": sm.get("total", 0),
-                        "screening_high_risk": sm.get("high_risk", 0),
-                        "screening_block_recommended": sm.get("block_recommended", 0),
-                        "screening_actually_rejected": sm.get("actually_rejected", 0),
-                        "screening_timeouts": sm.get("timeouts", 0),
-                    })
-                except Exception:
-                    pass
-                return {"status": "ok", "data": snap}
-            elif cmd == "health":
-                snap = self.health.snapshot()
-                return {"status": "ok", "data": snap, "healthy": self.health.is_healthy()}
-            elif cmd == "daemon_info":
-                snap = self.health.snapshot()
-                return {"status": "ok", "data": {
-                    "pid": snap["pid"],
-                    "uptime": snap["uptime_human"],
-                    "state": snap["state"],
-                    "queue": f"{snap['queue_size']} / {snap['queue_max']}",
-                    "engine": "ONLINE" if snap["db_status"] == "ONLINE" else "ERROR",
-                    "database": snap["db_status"],
-                }}
-            elif cmd == "event":
-                # Expect event data
-                payload = req.get("event") or req.get("data") or {}
-                # Validate event type
-                etype = payload.get("event_type") or "NUMBER_SCAN"
-                number = payload.get("number")
-                source = payload.get("source") or "CLI"
-                # Create Event
-                try:
-                    from ..events.models import Event
-                    ev = Event(
-                        event_id=payload.get("event_id") or str(uuid.uuid4()),
-                        event_type=etype,
-                        timestamp=payload.get("timestamp") or __import__("callshield.utils", fromlist=["iso_now"]).iso_now(),
-                        source=source,
-                        number=number,
-                        payload=payload.get("payload") or {},
-                    )
-                except Exception as exc:
-                    return {"status": "error", "error": f"Invalid event: {exc}"}
-                # Try enqueue
-                ok = self.queue.put(ev, block=False)
-                if not ok:
-                    self.health.inc_dropped()
-                    return {"status": "error", "error": "Queue full", "dropped": True}
-                self.health.inc_received()
-                # Also update queue metrics
-                self.health.update_queue(self.queue.qsize(), peak=self.queue.metrics().get("peak"))
-                return {"status": "ok", "event_id": ev.event_id}
-            elif cmd in ("incoming_call", "screening"):
-                # Bridge protocol: expect protocol, request_id, number, timestamp
-                # Validate protocol
-                protocol = req.get("protocol") or req.get("version") or "callshield/1"
-                if protocol not in ("callshield/1", "callshield1", "1"):
-                    # Allow but log
-                    pass
-                request_id = req.get("request_id") or req.get("requestId") or str(uuid.uuid4())
-                number = req.get("number") or (req.get("payload") or {}).get("number")
-                if not number:
-                    return {"status": "error", "error": "Missing number", "request_id": request_id, "protocol": "callshield/1"}
-                # Validate size
-                if len(str(number)) > 100:
-                    return {"status": "error", "error": "Number too long", "request_id": request_id, "protocol": "callshield/1"}
-                # Check screening enabled and mode
-                if not getattr(self.cfg, "screening_enabled", True):
-                    return {
-                        "protocol": "callshield/1",
-                        "request_id": request_id,
-                        "risk_score": 0,
-                        "confidence": 0,
-                        "verdict": "UNKNOWN",
-                        "recommended_action": "ALLOW",
-                        "applied_action": "ALLOW",
-                        "mode": "DRY_RUN",
-                        "reason": "SCREENING_DISABLED",
-                    }
-                # Process with timeout
-                timeout_ms = int(getattr(self.cfg, "screening_timeout_ms", 1500))
-                start = time.time()
-                try:
-                    # Create INCOMING_CALL event
-                    from ..events.models import Event
-                    from ..utils import iso_now
-                    ev = Event(
-                        event_id=request_id,
-                        event_type="INCOMING_CALL",
-                        timestamp=req.get("timestamp") or iso_now(),
-                        source="android_call_screening",
-                        number=str(number),
-                        payload={"bridge_protocol": protocol, "request_id": request_id},
-                    )
-                    # Process synchronously with timeout handling
-                    # Use a thread with timeout to enforce screening_timeout_ms
-                    result_holder = {}
-                    exc_holder = {}
-                    def _do_process():
-                        try:
-                            result_holder["result"] = self.processor.process(ev)
-                        except Exception as e:
-                            exc_holder["exc"] = e
-                    t = threading.Thread(target=_do_process, daemon=True)
-                    t.start()
-                    t.join(timeout=timeout_ms/1000.0)
-                    if t.is_alive():
-                        # Timeout
-                        self.health.inc_screening_timeout()
-                        return {
-                            "protocol": "callshield/1",
-                            "request_id": request_id,
-                            "risk_score": 0,
-                            "confidence": 0,
-                            "verdict": "UNKNOWN",
-                            "recommended_action": "ALLOW",
-                            "applied_action": "ALLOW",
-                            "mode": "DRY_RUN",
-                            "reason": "SCREENING_TIMEOUT",
-                        }
-                    if "exc" in exc_holder:
-                        raise exc_holder["exc"]
-                    result = result_holder.get("result")
-                    if not result or result.get("status") != "processed":
-                        raise RuntimeError(result.get("error") if result else "Unknown error")
-                    det = result.get("detection") or {}
-                    screening = result.get("screening") or {}
-                    # Update health screening metrics
-                    try:
-                        self.health.inc_screening()
-                        self.health.inc_screening_processed()
-                        self.health.inc_received()
-                        self.health.inc_processed(verdict=det.get("verdict"), action=det.get("recommended_action"))
-                    except Exception:
-                        pass
-                    return {
-                        "protocol": "callshield/1",
-                        "request_id": request_id,
-                        "risk_score": det.get("risk_score", 0),
-                        "confidence": det.get("confidence", 0),
-                        "verdict": det.get("verdict", "UNKNOWN"),
-                        "recommended_action": det.get("recommended_action", "ALLOW"),
-                        "applied_action": screening.get("applied_action", "ALLOW"),
-                        "mode": screening.get("mode", "DRY_RUN"),
-                        "reason": det.get("reason", ""),
-                        "number_masked": __import__("callshield.utils", fromlist=["mask_number"]).mask_number(str(number)) if number else None,
-                    }
-                except Exception as exc:
-                    self.health.inc_bridge_error()
-                    return {
-                        "protocol": "callshield/1",
-                        "request_id": request_id,
-                        "risk_score": 0,
-                        "confidence": 0,
-                        "verdict": "UNKNOWN",
-                        "recommended_action": "ALLOW",
-                        "applied_action": "ALLOW",
-                        "mode": "DRY_RUN",
-                        "reason": f"BRIDGE_ERROR: {exc}",
-                    }
-            elif cmd == "screening_status":
-                # Return bridge status
-                state, pid = __import__("callshield.daemon.process", fromlist=["status"]).status(self.cfg)  # type: ignore
-                screening = {
-                    "bridge": "CONNECTED" if state == "RUNNING" else "NOT CONNECTED",
-                    "android_service": "AVAILABLE" if state == "RUNNING" else "NOT CONNECTED",
-                    "daemon": state,
-                    "mode": getattr(self.cfg, "screening_mode", "DRY_RUN"),
-                    "timeout_ms": getattr(self.cfg, "screening_timeout_ms", 1500),
-                    "live_calls": "READY" if state == "RUNNING" and getattr(self.cfg, "screening_enabled", True) else "NOT READY",
-                    "auto_reject": "DISABLED",
+            if command == "status":
+                snapshot = self._snapshot()
+                snapshot["ipc"] = "ENABLED"
+                snapshot["call_screening"] = "NOT CONNECTED"
+                return {"status": "ok", "data": snapshot}
+            if command == "metrics":
+                return {"status": "ok", "data": self._snapshot()}
+            if command == "health":
+                snapshot = self._snapshot()
+                return {
+                    "status": "ok",
+                    "data": snapshot,
+                    "healthy": self.health.is_healthy(),
                 }
-                return {"status": "ok", "data": screening}
-            elif cmd == "bridge_status":
-                return self._handle_ipc_command({"command": "screening_status"})
-            elif cmd == "stop":
-                # Request graceful shutdown
-                # Run in background to allow response
-                def _delayed_shutdown():
-                    time.sleep(0.2)
-                    self.request_shutdown()
-                threading.Thread(target=_delayed_shutdown, daemon=True).start()
+            if command == "daemon_info":
+                snapshot = self._snapshot()
+                return {
+                    "status": "ok",
+                    "data": {
+                        "pid": snapshot.get("pid"),
+                        "uptime": snapshot.get("uptime_human"),
+                        "state": snapshot.get("state"),
+                        "queue": (
+                            f"{snapshot.get('queue_size', 0)} / "
+                            f"{snapshot.get('queue_max', self.queue.maxsize)}"
+                        ),
+                        "engine": (
+                            "ONLINE"
+                            if snapshot.get("db_status") == "ONLINE"
+                            else "ERROR"
+                        ),
+                        "database": snapshot.get("db_status"),
+                    },
+                }
+            if command == "event":
+                return self._accept_event(request)
+            if command == "stop":
+                threading.Thread(
+                    target=self._delayed_shutdown,
+                    name="callshield-ipc-stop",
+                    daemon=True,
+                ).start()
                 return {"status": "ok", "message": "Shutting down"}
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
-        return {"status": "error", "error": "Unhandled"}
+        return {"status": "error", "error": "Unhandled command"}
+
+    def _accept_event(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        raw = request.get("event", request.get("data"))
+        if not isinstance(raw, dict):
+            return {"status": "error", "error": "event must be a JSON object"}
+        allowed_fields = {
+            "event_id",
+            "event_type",
+            "timestamp",
+            "source",
+            "number",
+            "payload",
+        }
+        unknown = sorted(set(raw) - allowed_fields)
+        if unknown:
+            return {
+                "status": "error",
+                "error": f"Unknown event field(s): {', '.join(unknown)}",
+            }
+        if "event_type" not in raw:
+            return {"status": "error", "error": "event_type is required"}
+        event_data = dict(raw)
+        event_data.setdefault("event_id", str(uuid.uuid4()))
+        event_data.setdefault("timestamp", iso_now())
+        event_data.setdefault("source", "CLI")
+        event_data.setdefault("payload", {})
+        try:
+            event = Event.from_dict(
+                event_data, payload_limit=int(self.cfg.event_payload_limit)
+            )
+        except (TypeError, ValueError) as exc:
+            return {"status": "error", "error": f"Invalid event: {exc}"}
+
+        self.health.inc_received()
+        accepted = self.queue.enqueue(event, block=False)
+        if not accepted:
+            self.health.inc_dropped()
+            self._sync_runtime_metrics()
+            reason = "Daemon is shutting down" if self.queue.is_closed() else "Queue full"
+            return {
+                "status": "error",
+                "error": reason,
+                "dropped": True,
+            }
+        self._sync_runtime_metrics()
+        return {"status": "ok", "event_id": event.event_id}
+
+    def _delayed_shutdown(self) -> None:
+        time.sleep(0.1)
+        self.request_shutdown()
+
+    # -------------------------------------------------------------- shutdown
 
     def request_shutdown(self) -> None:
-        if not self._shutdown.is_set():
-            self.logger.info("Shutdown requested")
-            self._shutdown.set()
+        """Stop accepting work and wake the main loop; safe to call repeatedly."""
 
-    def _do_graceful_shutdown(self) -> None:
-        self.logger.info("Graceful shutdown started")
-        self.health.set_state("STOPPING")
-        # 1. Stop accepting new events
-        self.queue.close()
-        # 2. Finish current event - wait for queue to drain with timeout
-        timeout = float(self.cfg.shutdown_timeout)
-        start = time.time()
-        while time.time() - start < timeout:
-            if self.queue.empty():
-                break
-            time.sleep(0.1)
-        # 3. Flush logs
+        if self._shutdown.is_set():
+            return
         try:
-            for h in self.logger.handlers:
-                try:
-                    h.flush()
-                except Exception:
-                    pass
+            self.logger.info("Shutdown requested")
         except Exception:
             pass
-        # 4. Close DB - nothing to do (per-event connections)
-        # 5. Stop heartbeat
+        self.queue.close()
+        self._stop_ipc_accepting()
+        self._shutdown.set()
+
+    def _stop_ipc_accepting(self) -> None:
+        self._ipc_stop.set()
+        listener = self._ipc_socket
+        self._ipc_socket = None
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+
+    def _do_graceful_shutdown(self) -> None:
+        with self._cleanup_lock:
+            if self._cleanup_complete:
+                return
+            self._cleanup_complete = True
+        self.health.set_state("STOPPING")
+        self.queue.close()
+        self._stop_ipc_accepting()
+        self._shutdown.set()
+
+        if (
+            self._ipc_thread
+            and self._ipc_thread.is_alive()
+            and self._ipc_thread is not threading.current_thread()
+        ):
+            self._ipc_thread.join(timeout=1.0)
+
+        # The worker loop deliberately continues until every accepted queue
+        # task has completed. Use a finite configured timeout for crash safety.
+        drained = self.queue.wait_until_done(float(self.cfg.shutdown_timeout))
+        if self._processor_thread and self._processor_thread.is_alive():
+            self._processor_thread.join(timeout=0.5)
+        if not drained:
+            self.logger.error(
+                "Shutdown timeout with %s queued event(s) still pending",
+                self.queue.qsize(),
+            )
+
         try:
             self.heartbeat.stop()
         except Exception:
             pass
-        # 6. Stop IPC
-        self._ipc_stop.set()
-        if self._ipc_socket:
-            try:
-                self._ipc_socket.close()
-            except Exception:
-                pass
-            try:
-                # Wait for thread
-                if self._ipc_thread and self._ipc_thread.is_alive():
-                    self._ipc_thread.join(timeout=1.0)
-            except Exception:
-                pass
-            try:
-                sp = _socket_path(self.cfg)
-                if sp.exists():
-                    sp.unlink()
-            except Exception:
-                pass
-        # 7. Remove PID file
-        try:
-            _clear_pid(self.cfg, expected_pid=os.getpid())
-        except Exception:
-            pass
-        # Also clear socket if any
-        try:
-            _clear_socket(self.cfg)
-        except Exception:
-            pass
+        self._sync_runtime_metrics()
         self.health.set_state("STOPPED")
+        self._persist_metrics()
+        try:
+            for handler in self.logger.handlers:
+                handler.flush()
+        except Exception:
+            pass
+
+        _clear_socket(self.cfg)
+        if self._pid_claimed:
+            _clear_pid(self.cfg, expected_pid=os.getpid())
         self.logger.info("Daemon stopped")
+
+    def _persist_metrics(self) -> None:
+        """Persist a bounded last-session snapshot for stopped-daemon metrics."""
+
+        try:
+            state_dir = Path(self.cfg.run_dir).expanduser().parent / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                state_dir.chmod(0o700)
+            except OSError:
+                pass
+            snapshot = self.health.snapshot()
+            snapshot["saved_at"] = iso_now()
+            safe_write_text(
+                state_dir / "daemon_metrics.json",
+                json.dumps(snapshot, sort_keys=True) + "\n",
+            )
+        except Exception:
+            pass
 
 
 def run_foreground(cfg: Optional[Config] = None) -> int:
-    """Entry point for `python -m callshield _run-fg`."""
-    if cfg is None:
-        cfg = load_config()
-    svc = DaemonService(cfg)
-    return svc.start()
+    """Entry point for ``python -m callshield _run-fg``."""
+
+    service = DaemonService(cfg or load_config())
+    return service.start()

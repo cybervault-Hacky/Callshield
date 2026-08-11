@@ -72,6 +72,37 @@ class TestHealth(unittest.TestCase):
         self.assertEqual(snap["high_risk_count"], 1)
         self.assertEqual(snap["blocked_recommendations"], 1)
 
+    def test_heartbeat_callback_updates_health(self):
+        from callshield.daemon.heartbeat import Heartbeat
+
+        hm = HealthMonitor(self.cfg)
+        heartbeat = Heartbeat(self.cfg, interval=1, on_beat=hm.set_heartbeat)
+        heartbeat.beat()
+        snap = hm.snapshot()
+        self.assertIsNotNone(snap["last_heartbeat"])
+        self.assertFalse(snap["heartbeat_stale"])
+
+    def test_stale_heartbeat_degrades_health(self):
+        hm = HealthMonitor(self.cfg)
+        hm.set_state("RUNNING")
+        hm.set_heartbeat(time.time() - self.cfg.heartbeat_interval * 4)
+        snap = hm.snapshot()
+        self.assertTrue(snap["heartbeat_stale"])
+        self.assertFalse(hm.is_healthy())
+
+    def test_snapshot_has_required_aliases_and_memory(self):
+        hm = HealthMonitor(self.cfg)
+        snap = hm.snapshot()
+        for key in (
+            "events_received",
+            "events_processed",
+            "events_failed",
+            "events_dropped",
+            "memory_kb",
+            "heartbeat_age_seconds",
+        ):
+            self.assertIn(key, snap)
+
 
 if __name__ == "__main__":
     unittest.main()

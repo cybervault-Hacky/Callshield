@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CALLSHIELD installer (Termux / Linux) — Phase 3.
+# CALLSHIELD installer (Termux / Linux) — Phase 4.
 #
 # - Verifies Python 3.8+
 # - Creates state directories under ~/.callshield (override with CALLSHIELD_HOME)
@@ -112,8 +112,9 @@ echo "  callshield status"
 echo "  callshield scan +919876543210"
 echo "  callshield metrics"
 echo "  callshield event test +919876543210"
+echo "  callshield screening status"
 echo
 echo "Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls."
 echo "Phase 2 runs locally and offline. It does NOT intercept or reject"
 echo "live phone calls."
-echo "Phase 3 is Termux-first background infrastructure. Live call interception and automatic rejection are not implemented."
+echo "Phase 4 adds a DRY_RUN Android screening bridge. Recommendations may be BLOCK; every applied action remains ALLOW."

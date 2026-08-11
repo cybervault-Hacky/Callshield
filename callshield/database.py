@@ -4,11 +4,12 @@ All queries are parameterized. The schema is created automatically on first
 connect. The layer exposes small, purpose-built methods used by the rest of the
 engine — it is not a generic ORM.
 
-Schema is migrated automatically from Phase 1 -> Phase 2 on first open.
+Schema is migrated automatically through Phase 4 on first open.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -18,14 +19,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from . import DATA_DIR
-from .utils import DatabaseError, ensure_parent
+from .utils import DatabaseError, ensure_parent, mask_number
 
 DEFAULT_DB_PATH = DATA_DIR / "callshield.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 # ----- Schema --------------------------------------------------------------
-# Phase 2 schema. Phase 1 databases are migrated on open.
+# Current schema. Earlier databases are migrated on open.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version  INTEGER PRIMARY KEY
@@ -78,6 +79,31 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS screening_events (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp          TEXT NOT NULL,
+    number             TEXT NOT NULL,
+    number_masked      TEXT NOT NULL,
+    number_hash        TEXT NOT NULL,
+    risk               INTEGER NOT NULL CHECK (risk BETWEEN 0 AND 100),
+    confidence         INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    verdict            TEXT NOT NULL,
+    recommended_action TEXT NOT NULL
+                         CHECK (recommended_action IN ('ALLOW','BLOCK','UNKNOWN')),
+    applied_action     TEXT NOT NULL DEFAULT 'ALLOW'
+                         CHECK (applied_action = 'ALLOW'),
+    reason             TEXT,
+    latency_ms         INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+    source             TEXT NOT NULL,
+    event_id           TEXT NOT NULL,
+    mode               TEXT NOT NULL DEFAULT 'DRY_RUN' CHECK (mode = 'DRY_RUN')
+);
+
+CREATE INDEX IF NOT EXISTS idx_screening_timestamp
+    ON screening_events(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_screening_hash
+    ON screening_events(number_hash);
 """
 
 
@@ -94,13 +120,17 @@ _P1_REPUTATION_MAP = {
 class Database:
     """Thin wrapper around a SQLite connection with CALLSHIELD schema helpers."""
 
-    def __init__(self, path: Optional[Path] = None) -> None:
+    def __init__(
+        self, path: Optional[Path] = None, *, timeout: float = 5.0
+    ) -> None:
         self.path = Path(path) if path else DEFAULT_DB_PATH
         ensure_parent(self.path)
+        connect_timeout = max(0.01, min(float(timeout), 30.0))
         try:
             self._conn = sqlite3.connect(
                 str(self.path),
                 check_same_thread=False,
+                timeout=connect_timeout,
             )
         except sqlite3.Error as exc:
             raise DatabaseError(f"Unable to open database at {self.path}: {exc}") from exc
@@ -161,6 +191,8 @@ class Database:
         try:
             if current_version <= 1:
                 self._migrate_v1_to_v2()
+            if current_version <= 2:
+                self._migrate_v2_to_v3()
         except sqlite3.Error as exc:
             raise DatabaseError(f"Database migration to v{SCHEMA_VERSION} failed: {exc}") from exc
 
@@ -274,6 +306,43 @@ class Database:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_events_number_ts ON events(number, timestamp DESC)"
+            )
+
+    def _migrate_v2_to_v3(self) -> None:
+        """Add the Phase 4 dry-run screening audit table."""
+
+        with self._conn:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS screening_events (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp          TEXT NOT NULL,
+                    number             TEXT NOT NULL,
+                    number_masked      TEXT NOT NULL,
+                    number_hash        TEXT NOT NULL,
+                    risk               INTEGER NOT NULL CHECK (risk BETWEEN 0 AND 100),
+                    confidence         INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+                    verdict            TEXT NOT NULL,
+                    recommended_action TEXT NOT NULL
+                                         CHECK (recommended_action IN ('ALLOW','BLOCK','UNKNOWN')),
+                    applied_action     TEXT NOT NULL DEFAULT 'ALLOW'
+                                         CHECK (applied_action = 'ALLOW'),
+                    reason             TEXT,
+                    latency_ms         INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+                    source             TEXT NOT NULL,
+                    event_id           TEXT NOT NULL,
+                    mode               TEXT NOT NULL DEFAULT 'DRY_RUN'
+                                         CHECK (mode = 'DRY_RUN')
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_timestamp "
+                "ON screening_events(timestamp DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_hash "
+                "ON screening_events(number_hash)"
             )
 
     def close(self) -> None:
@@ -537,6 +606,121 @@ class Database:
             (number, limit),
         )
         return [dict(r) for r in cur.fetchall()]
+
+    # ----- screening events (Phase 4) ------------------------------------
+    def add_screening_event(
+        self,
+        *,
+        timestamp: str,
+        number: str,
+        risk_score: int,
+        confidence: int,
+        verdict: str,
+        recommended_action: str,
+        applied_action: str = "ALLOW",
+        reason: Optional[str] = None,
+        latency_ms: int = 0,
+        source: str = "android_call_screening",
+        event_id: str,
+    ) -> int:
+        """Persist one dry-run screening result with privacy metadata."""
+
+        if applied_action != "ALLOW":
+            raise ValueError("Phase 4 screening events may only apply ALLOW")
+        if recommended_action not in ("ALLOW", "BLOCK", "UNKNOWN"):
+            raise ValueError("Invalid screening recommendation")
+        risk = int(risk_score)
+        conf = int(confidence)
+        latency = int(latency_ms)
+        if not (0 <= risk <= 100) or not (0 <= conf <= 100):
+            raise ValueError("Screening risk and confidence must be between 0 and 100")
+        if latency < 0:
+            raise ValueError("Screening latency cannot be negative")
+        raw_number = str(number or "")[:128]
+        masked = mask_number(raw_number)
+        number_hash = hashlib.sha256(raw_number.encode("utf-8")).hexdigest()
+        clean_reason = str(reason or "")[:500] or None
+        clean_source = str(source or "android_call_screening")[:64]
+        clean_event_id = str(event_id)[:64]
+        with self.transaction():
+            cursor = self._conn.execute(
+                """
+                INSERT INTO screening_events
+                    (timestamp, number, number_masked, number_hash, risk,
+                     confidence, verdict, recommended_action, applied_action,
+                     reason, latency_ms, source, event_id, mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ALLOW', ?, ?, ?, ?, 'DRY_RUN')
+                """,
+                (
+                    timestamp,
+                    raw_number,
+                    masked,
+                    number_hash,
+                    risk,
+                    conf,
+                    str(verdict or "UNKNOWN")[:32],
+                    recommended_action,
+                    clean_reason,
+                    latency,
+                    clean_source,
+                    clean_event_id,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def recent_screening_events(self, limit: int = 50) -> List[Dict[str, Any]]:
+        bounded_limit = max(1, min(int(limit), 1000))
+        cursor = self._conn.execute(
+            "SELECT * FROM screening_events ORDER BY timestamp DESC, id DESC LIMIT ?",
+            (bounded_limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def count_screening_events(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS count FROM screening_events"
+        ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def screening_metrics(self) -> Dict[str, int]:
+        row = self._conn.execute(
+            """
+            SELECT
+                COUNT(*) AS incoming_calls,
+                COUNT(*) AS screened,
+                COALESCE(SUM(CASE WHEN reason = 'SCREENING_TIMEOUT' THEN 1 ELSE 0 END), 0)
+                    AS timeouts,
+                COALESCE(SUM(CASE WHEN reason IN ('ANALYSIS_ERROR','INTERNAL_ERROR') THEN 1 ELSE 0 END), 0)
+                    AS bridge_errors,
+                COALESCE(SUM(CASE WHEN verdict IN ('HIGH_RISK','MALICIOUS') THEN 1 ELSE 0 END), 0)
+                    AS high_risk,
+                COALESCE(SUM(CASE WHEN applied_action = 'ALLOW' THEN 1 ELSE 0 END), 0)
+                    AS screening_allowed,
+                COALESCE(SUM(CASE WHEN verdict = 'UNKNOWN' THEN 1 ELSE 0 END), 0)
+                    AS screening_unknown,
+                COALESCE(SUM(CASE WHEN recommended_action = 'BLOCK' THEN 1 ELSE 0 END), 0)
+                    AS screening_block_recommended,
+                COALESCE(SUM(CASE WHEN applied_action <> 'ALLOW' THEN 1 ELSE 0 END), 0)
+                    AS screening_blocked
+            FROM screening_events
+            """
+        ).fetchone()
+        metrics = {key: int(row[key] if row else 0) for key in (
+            "incoming_calls",
+            "screened",
+            "timeouts",
+            "bridge_errors",
+            "high_risk",
+            "screening_allowed",
+            "screening_unknown",
+            "screening_block_recommended",
+            "screening_blocked",
+        )}
+        # Compatibility aliases for CLI/report consumers.
+        metrics["total"] = metrics["incoming_calls"]
+        metrics["block_recommended"] = metrics["screening_block_recommended"]
+        metrics["actually_rejected"] = metrics["screening_blocked"]
+        return metrics
 
     # ----- settings -------------------------------------------------------
     def get_setting(self, key: str) -> Optional[str]:

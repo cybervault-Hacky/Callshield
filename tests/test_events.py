@@ -19,7 +19,18 @@ class TestEventModel(unittest.TestCase):
 
     def test_invalid_type(self):
         with self.assertRaises(ValueError):
-            create_event("INCOMING_CALL", number="+919876543210")
+            create_event("UNSUPPORTED_EVENT", number="+919876543210")
+
+    def test_phase4_incoming_call_type(self):
+        from callshield.events.types import SOURCE_ANDROID
+
+        event = create_event(
+            "INCOMING_CALL",
+            number="+919876543210",
+            source=SOURCE_ANDROID,
+        )
+        self.assertEqual(event.event_type, "INCOMING_CALL")
+        self.assertEqual(event.source, "android_call_screening")
 
     def test_from_dict(self):
         data = {

@@ -1,27 +1,34 @@
-"""Event processor for CALLSHIELD Phase 3.
+"""Event processor for CALLSHIELD through Phase 4.
 
-Validates, normalizes, calls the Phase 2 detector, persists results,
-writes logs, and updates daemon metrics. Remains independent of daemon threading.
+The processor validates events, normalizes numbers, and delegates all fraud
+analysis to the existing Phase 2 ``analyze_number`` API.  Phase 4 adds only an
+advisory incoming-call result; it never applies a blocking action.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, Optional
 
 from ..config import Config
 from ..database import Database
 from ..detector import analyze_number
 from ..normalizer import normalize
-from ..utils import InvalidNumberError, iso_now, mask_number
+from ..utils import InvalidNumberError, mask_number
 from .models import Event
-from .types import VALID_EVENT_TYPES
+from .types import EVENT_TYPE_INCOMING_CALL, VALID_EVENT_TYPES
 
 
 class EventProcessor:
-    """Processes a single Event through the detection pipeline."""
+    """Process one event through the existing local detection pipeline."""
 
-    def __init__(self, cfg: Config, db_path: Optional[str] = None, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        db_path: Optional[str] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
         self.cfg = cfg
         self.db_path = db_path or cfg.database_path
         self.logger = logger
@@ -30,25 +37,14 @@ class EventProcessor:
         return Database(self.db_path)
 
     def process(self, event: Event) -> Dict[str, Any]:
-        """Process an event and return a result dict.
-
-        Steps:
-        1. validate event
-        2. normalize number when present
-        3. call Phase 2 detector
-        4. persist event/result
-        5. write security log
-        6. return structured result
-        """
         if not isinstance(event, Event):
             raise ValueError("event must be an Event instance")
-        # Revalidate at the processing boundary. This catches objects mutated
-        # after construction and applies the configured (possibly stricter)
-        # payload limit without trusting an IPC caller.
         event.validate(payload_limit=int(self.cfg.event_payload_limit))
         if event.event_type not in VALID_EVENT_TYPES:
             raise ValueError(f"Invalid event_type: {event.event_type}")
 
+        started = time.monotonic()
+        is_screening = event.event_type == EVENT_TYPE_INCOMING_CALL
         result: Dict[str, Any] = {
             "event_id": event.event_id,
             "event_type": event.event_type,
@@ -59,48 +55,57 @@ class EventProcessor:
             "detection": None,
         }
 
-        # For events without a number (SYSTEM, HEARTBEAT), just log and return
         if event.event_type in ("SYSTEM", "HEARTBEAT"):
-            result["status"] = "processed"
             result["detection"] = {"verdict": "SYSTEM", "action": "NONE"}
             self._log_event(event, result)
             return result
 
-        # Events that require a number
         number = event.number
+        if not number and isinstance(event.payload, dict):
+            number = event.payload.get("number")
         if not number:
-            # Try payload number
-            number = event.payload.get("number") if isinstance(event.payload, dict) else None
-
-        if not number:
-            result["status"] = "failed"
-            result["error"] = "Missing phone number"
+            if is_screening:
+                self._set_screening_fallback(result, "MISSING_NUMBER", started)
+            else:
+                result["status"] = "failed"
+                result["error"] = "Missing phone number"
             self._log_event(event, result)
             return result
 
-        # Normalize
         try:
-            norm = normalize(str(number), default_country=self.cfg.default_country)
-            normalized = norm.normalized
+            normalized = normalize(
+                str(number), default_country=self.cfg.default_country
+            ).normalized
         except InvalidNumberError as exc:
-            result["status"] = "failed"
-            result["error"] = str(exc.message) if hasattr(exc, 'message') else str(exc)
-            result["detection"] = {"verdict": "INVALID", "action": "ALLOW"}
+            if is_screening:
+                self._set_screening_fallback(result, "INVALID_NUMBER", started)
+            else:
+                result["status"] = "failed"
+                result["error"] = getattr(exc, "message", str(exc))
+                result["detection"] = {"verdict": "INVALID", "action": "ALLOW"}
             self._log_event(event, result)
             return result
         except Exception as exc:
-            result["status"] = "failed"
-            result["error"] = f"Normalization failed: {exc}"
+            if is_screening:
+                self._set_screening_fallback(result, "NORMALIZATION_ERROR", started)
+            else:
+                result["status"] = "failed"
+                result["error"] = f"Normalization failed: {exc}"
             self._log_event(event, result)
             return result
 
-        # Call detector (Phase 2)
+        database = None
         try:
-            db = self._get_db()
-            try:
-                analysis = analyze_number(normalized, db=db, cfg=self.cfg, record_event=True)
-            finally:
-                db.close()
+            database = self._get_db()
+            analysis = analyze_number(
+                normalized,
+                db=database,
+                cfg=self.cfg,
+                record_event=True,
+            )
+            recommendation = analysis.recommended_action
+            if is_screening and recommendation not in ("ALLOW", "BLOCK"):
+                recommendation = "UNKNOWN"
             result["detection"] = {
                 "number": analysis.normalized_number,
                 "risk_score": analysis.risk_score,
@@ -108,30 +113,101 @@ class EventProcessor:
                 "confidence": analysis.confidence,
                 "reputation": analysis.reputation,
                 "verdict": analysis.verdict,
-                "recommended_action": analysis.recommended_action,
+                "recommended_action": recommendation,
                 "reason": analysis.reason,
                 "signals": analysis.signals,
             }
-            # Update metrics-like fields in result
-            result["status"] = "processed"
-        except InvalidNumberError as exc:
-            result["status"] = "failed"
-            result["error"] = str(exc.message) if hasattr(exc, 'message') else str(exc)
+            if is_screening:
+                latency_ms = _elapsed_ms(started)
+                result["detection"].update(
+                    {
+                        "applied_action": "ALLOW",
+                        "mode": "DRY_RUN",
+                    }
+                )
+                result["screening"] = {
+                    "recommended_action": recommendation,
+                    "applied_action": "ALLOW",
+                    "mode": "DRY_RUN",
+                    "reason": "DRY_RUN" if recommendation == "BLOCK" else analysis.reason,
+                    "latency_ms": latency_ms,
+                }
+        except InvalidNumberError:
+            if is_screening:
+                self._set_screening_fallback(result, "INVALID_NUMBER", started)
+            else:
+                result["status"] = "failed"
+                result["error"] = "Invalid phone number"
         except Exception as exc:
             result["status"] = "failed"
             result["error"] = f"Detection failed: {exc}"
+            if is_screening:
+                self._set_screening_fallback(
+                    result, "ANALYSIS_ERROR", started, keep_failed=True
+                )
             if self.logger:
-                self.logger.exception(f"Failed to process event {event.event_id}: {exc}")
+                try:
+                    self.logger.exception(
+                        "Failed to process event %s: %s", event.event_id, exc
+                    )
+                except Exception:
+                    pass
+        finally:
+            if database is not None:
+                try:
+                    database.close()
+                except Exception:
+                    pass
 
         self._log_event(event, result)
         return result
 
+    @staticmethod
+    def _set_screening_fallback(
+        result: Dict[str, Any],
+        reason: str,
+        started: float,
+        keep_failed: bool = False,
+    ) -> None:
+        if not keep_failed:
+            result["status"] = "processed"
+            result["error"] = None
+        result["detection"] = {
+            "risk_score": 0,
+            "confidence": 0,
+            "verdict": "UNKNOWN",
+            "recommended_action": "ALLOW",
+            "applied_action": "ALLOW",
+            "mode": "DRY_RUN",
+            "reason": reason,
+        }
+        result["screening"] = {
+            "recommended_action": "ALLOW",
+            "applied_action": "ALLOW",
+            "mode": "DRY_RUN",
+            "reason": reason,
+            "latency_ms": _elapsed_ms(started),
+        }
+
     def _log_event(self, event: Event, result: Dict[str, Any]) -> None:
-        if self.logger:
-            try:
-                masked = mask_number(event.number) if event.number else "N/A"
-                self.logger.info(
-                    f"event {event.event_id} type={event.event_type} number={masked} status={result.get('status')} verdict={result.get('detection', {}).get('verdict') if result.get('detection') else 'N/A'}"
-                )
-            except Exception:
-                pass
+        if not self.logger:
+            return
+        try:
+            masked = mask_number(event.number) if event.number else "N/A"
+            detection = result.get("detection") or {}
+            self.logger.info(
+                "event %s type=%s number=%s status=%s verdict=%s recommended=%s applied=%s",
+                event.event_id,
+                event.event_type,
+                masked,
+                result.get("status"),
+                detection.get("verdict", "N/A"),
+                detection.get("recommended_action", detection.get("action", "N/A")),
+                detection.get("applied_action", "N/A"),
+            )
+        except Exception:
+            pass
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.monotonic() - started) * 1000))

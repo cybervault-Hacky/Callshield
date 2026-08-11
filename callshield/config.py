@@ -1,8 +1,7 @@
 """Persistent, validated configuration for CALLSHIELD.
 
-Configuration is stored as JSON in the local data directory.  Phase 3 adds
-only daemon, resource-control, heartbeat, and Unix-socket IPC settings while
-remaining backward compatible with Phase 1/2 configuration files.
+Configuration is stored as JSON in the local data directory. Phase 4 retains
+all Phase 1–3 settings and adds only DRY_RUN Android screening controls.
 """
 
 from __future__ import annotations
@@ -116,6 +115,11 @@ class Config:
         default_factory=lambda: str(_runtime_root() / "run" / "callshield.sock")
     )
 
+    # Phase 4 additions: the Android bridge is advisory and DRY_RUN-only.
+    screening_enabled: bool = True
+    screening_mode: str = "DRY_RUN"
+    screening_timeout_ms: int = 1500
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -134,6 +138,19 @@ class Config:
             setattr(base, key, value)
         if base.protection_mode in _LEGACY_MODE_MAP:
             base.protection_mode = _LEGACY_MODE_MAP[base.protection_mode]
+
+        # Screening configuration fails safe. A malformed Phase 4 value never
+        # enables enforcement or prevents the rest of CALLSHIELD from loading.
+        if not isinstance(base.screening_enabled, bool):
+            base.screening_enabled = False
+        base.screening_mode = "DRY_RUN"
+        if (
+            isinstance(base.screening_timeout_ms, bool)
+            or not isinstance(base.screening_timeout_ms, int)
+            or not (200 <= base.screening_timeout_ms <= 5000)
+        ):
+            base.screening_timeout_ms = 1500
+
         base._apply_profile_defaults_if_needed()
         base._validate()
         return base
@@ -189,9 +206,12 @@ class Config:
                     f"Invalid signal weight for '{key}': must be an integer between -100 and 100."
                 )
 
-        for name in ("daemon_enabled", "ipc_enabled"):
+        for name in ("daemon_enabled", "ipc_enabled", "screening_enabled"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigError(f"{name} must be true or false.")
+        if self.screening_mode != "DRY_RUN":
+            raise ConfigError("screening_mode must be DRY_RUN in Phase 4.")
+        self._validate_int("screening_timeout_ms", 200, 5000)
         self._validate_int("heartbeat_interval", 5, 600)
         self._validate_int("event_queue_size", 16, 2048)
         self._validate_int("shutdown_timeout", 1, 60)
@@ -281,6 +301,13 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         if value.upper() == "PERMISSIVE":
             value = "RELAXED"
         return set_profile(cfg, value)
+    if key == "screening_mode":
+        normalized_mode = value.upper().replace("-", "_")
+        if normalized_mode != "DRY_RUN":
+            raise ConfigError("Phase 4 supports DRY_RUN only; automatic rejection is disabled.")
+        cfg.screening_mode = "DRY_RUN"
+        cfg._validate()
+        return cfg
     if not hasattr(cfg, key):
         raise ConfigError(f"Unknown configuration key: {key}")
 
@@ -303,6 +330,7 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         "shutdown_timeout",
         "status_refresh_interval",
         "event_payload_limit",
+        "screening_timeout_ms",
         "max_log_size",
         "max_log_files",
     }
@@ -312,6 +340,7 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         "quiet",
         "daemon_enabled",
         "ipc_enabled",
+        "screening_enabled",
     }
 
     if key in path_fields:

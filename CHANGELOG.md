@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0 — Phase 4: Android Screening Bridge
+
+### Added
+- Minimal Kotlin Android project under `android/` with `CallShieldScreeningService`, local `BridgeClient`, strict `Protocol`, immutable `ScreeningResult`, role-request activity, manifest, and unit-test sources.
+- Exact versioned `callshield/1` request contract: `protocol`, UUID `request_id`, `number`, and `source=android_call_screening` over the existing Unix socket.
+- Phase 4 `INCOMING_CALL` event and `SOURCE_ANDROID`, routed through the existing `EventProcessor` and Phase 2 `analyze_number()` engine.
+- Safe schema v2→v3 migration and `screening_events` audit table with number, masked number, SHA-256 hash, risk, confidence, verdict, recommendation, applied action, reason, latency, source, and event ID.
+- DRY_RUN-only settings: `screening_enabled`, fixed `screening_mode=DRY_RUN`, and bounded `screening_timeout_ms` (200–5000; default 1500).
+- `callshield screening status|enable|disable|mode|health|metrics` with honest device state (`Android: NOT VERIFIED`).
+- Screening health/metrics for incoming, screened, timeout, bridge-error, high-risk, allowed, unknown, block-recommended, and blocked counts.
+- Bounded concurrent Unix IPC handling for simultaneous screening requests while preserving Phase 3 queue and lifecycle behavior.
+- 26 Phase 4 Python tests (189 total) plus Kotlin test sources for protocol, fail-open bridge behavior, and immutable ALLOW results.
+
+### Safety
+- Every daemon response and Android call response applies `ALLOW`, including BLOCK recommendations, invalid input, timeout, unavailable daemon, malformed response, database failure, and internal error.
+- Database schema constrains persisted `applied_action` to `ALLOW` and `mode` to `DRY_RUN`; `screening_blocked` and `Actually Rejected` remain zero.
+- Android requests no camera, microphone, contacts, SMS, location, storage, accessibility, or Internet permission.
+- Local Unix IPC only; no network server, root requirement, shell execution, active policy engine, emergency-off feature, or automatic rejection.
+
+### Verification notes
+- Python/Termux suite: 189 passed.
+- Android build and device test were not verified because Gradle, Java/JDK, Android SDK, emulator, and physical device were unavailable.
+- Direct app access to Termux's private 0600 socket is commonly blocked by Android UID/SELinux isolation and is documented without an insecure fallback.
+- Phase 5 active protection has not started.
+
 ## 0.3.0 — Phase 3: Background Engine
 
 ### Added

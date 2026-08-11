@@ -1,4 +1,4 @@
-"""Thread-safe health and metrics monitoring for CALLSHIELD Phase 3."""
+"""Thread-safe health and metrics monitoring through CALLSHIELD Phase 4."""
 
 from __future__ import annotations
 
@@ -30,6 +30,18 @@ class HealthMonitor:
         self.high_risk_count = 0
         self.blocked_recommendations = 0
         self.analysis_count = 0
+        # Phase 4 screening counters. screening_blocked is an invariant and
+        # has no increment method because every applied action is ALLOW.
+        self.incoming_calls = 0
+        self.screened = 0
+        self.screening_timeouts = 0
+        self.bridge_errors = 0
+        self.screening_high_risk = 0
+        self.screening_allowed = 0
+        self.screening_unknown = 0
+        self.screening_block_recommended = 0
+        self.screening_blocked = 0
+        self.last_screening = None  # type: Optional[str]
         self.last_event = None  # type: Optional[str]
         self.last_heartbeat = None  # type: Optional[float]
         self.last_error = None  # type: Optional[str]
@@ -77,6 +89,54 @@ class HealthMonitor:
     def inc_dropped(self) -> None:
         with self._lock:
             self.dropped += 1
+
+    def inc_incoming_call(self) -> None:
+        with self._lock:
+            self.incoming_calls += 1
+            self.last_screening = _utc_text()
+
+    def record_screening(
+        self,
+        *,
+        verdict: str,
+        recommended_action: str,
+        reason: str,
+        bridge_error: bool = False,
+    ) -> None:
+        """Record one fail-open screening response."""
+
+        with self._lock:
+            self.screened += 1
+            self.screening_allowed += 1
+            self.last_screening = _utc_text()
+            if reason == "SCREENING_TIMEOUT":
+                self.screening_timeouts += 1
+            if bridge_error:
+                self.bridge_errors += 1
+            if verdict in ("HIGH_RISK", "MALICIOUS"):
+                self.screening_high_risk += 1
+            if verdict == "UNKNOWN":
+                self.screening_unknown += 1
+            if recommended_action == "BLOCK":
+                self.screening_block_recommended += 1
+            # screening_blocked intentionally remains zero.
+
+    def inc_bridge_error(self) -> None:
+        with self._lock:
+            self.bridge_errors += 1
+
+    # Compatibility aliases retained for historical Phase 4 consumers.
+    def inc_screening(self) -> None:
+        self.inc_incoming_call()
+
+    def inc_screening_processed(self) -> None:
+        with self._lock:
+            self.screened += 1
+            self.screening_allowed += 1
+
+    def inc_screening_timeout(self) -> None:
+        with self._lock:
+            self.screening_timeouts += 1
 
     def set_heartbeat(self, timestamp: Optional[float] = None) -> None:
         with self._lock:
@@ -139,6 +199,16 @@ class HealthMonitor:
                     "analysis_count": self.analysis_count,
                     "high_risk_count": self.high_risk_count,
                     "blocked_recommendations": self.blocked_recommendations,
+                    "incoming_calls": self.incoming_calls,
+                    "screened": self.screened,
+                    "screening_timeouts": self.screening_timeouts,
+                    "bridge_errors": self.bridge_errors,
+                    "screening_high_risk": self.screening_high_risk,
+                    "screening_allowed": self.screening_allowed,
+                    "screening_unknown": self.screening_unknown,
+                    "screening_block_recommended": self.screening_block_recommended,
+                    "screening_blocked": 0,
+                    "last_screening": self.last_screening,
                     "last_event": self.last_event,
                     "last_heartbeat": self.last_heartbeat,
                     "last_error": self.last_error,
@@ -186,6 +256,15 @@ class HealthMonitor:
                 "failed": 0,
                 "received": 0,
                 "dropped": 0,
+                "incoming_calls": 0,
+                "screened": 0,
+                "screening_timeouts": 0,
+                "bridge_errors": 0,
+                "screening_high_risk": 0,
+                "screening_allowed": 0,
+                "screening_unknown": 0,
+                "screening_block_recommended": 0,
+                "screening_blocked": 0,
                 "last_error": f"health snapshot unavailable: {exc}",
                 "db_status": "UNKNOWN",
                 "heartbeat_stale": True,

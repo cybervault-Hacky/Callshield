@@ -1,8 +1,8 @@
-"""Persistent CALLSHIELD Phase 3 background service.
+"""Persistent CALLSHIELD service through Phase 4.
 
-The service composes the bounded event queue, Phase 2 detector pipeline,
-heartbeat, health monitor, safe signals/recovery, and owner-only Unix IPC.
-It intentionally has no phone-call interception or active blocking behavior.
+Phase 4 reuses the hardened Phase 3 daemon and owner-only Unix IPC to provide
+an advisory Android screening bridge. Recommendations may be BLOCK, but every
+applied action returned by this service is ALLOW.
 """
 
 from __future__ import annotations
@@ -16,12 +16,14 @@ import time
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 from ..config import Config, load_config
+from ..database import Database
 from ..events import EventQueue, EventProcessor
 from ..events.models import Event
-from ..utils import iso_now, safe_write_text
+from ..events.types import EVENT_TYPE_INCOMING_CALL, SOURCE_ANDROID
+from ..utils import iso_now, mask_number, safe_write_text
 from .health import HealthMonitor
 from .heartbeat import Heartbeat
 from .process import _clear_pid, _clear_socket, _socket_path, _write_pid
@@ -36,6 +38,8 @@ _ALLOWED_IPC_COMMANDS = {
     "health",
     "daemon_info",
     "event",
+    "screening_status",
+    "screening_config",
     "stop",
     "ping",
 }
@@ -84,7 +88,7 @@ def _get_daemon_logger(cfg: Config) -> logging.Logger:
 
 
 class DaemonService:
-    """Real persistent daemon process for CALLSHIELD Phase 3."""
+    """Real persistent daemon process for CALLSHIELD through Phase 4."""
 
     def __init__(self, cfg: Optional[Config] = None) -> None:
         self.cfg = validate_startup(cfg or load_config())
@@ -101,6 +105,9 @@ class DaemonService:
         self._ipc_thread = None  # type: Optional[threading.Thread]
         self._processor_thread = None  # type: Optional[threading.Thread]
         self._ipc_socket = None  # type: Optional[socket.socket]
+        self._ipc_client_slots = threading.BoundedSemaphore(8)
+        self._ipc_clients = set()  # type: Set[threading.Thread]
+        self._ipc_clients_lock = threading.Lock()
         self._signal_handler = None  # type: Optional[SignalHandler]
         self._cleanup_lock = threading.Lock()
         self._cleanup_complete = False
@@ -281,8 +288,33 @@ class DaemonService:
                 continue
             except OSError:
                 break
-            # Handle serially to keep local connection resource usage bounded.
+            # Screening requests may arrive concurrently. Keep handling
+            # bounded to eight daemon threads so Phase 3 resource guarantees
+            # remain intact.
+            if not self._ipc_client_slots.acquire(blocking=False):
+                self._send_ipc_response(
+                    connection,
+                    {"status": "error", "error": "IPC busy"},
+                )
+                connection.close()
+                continue
+            worker = threading.Thread(
+                target=self._run_ipc_client,
+                args=(connection,),
+                name="callshield-ipc-client",
+                daemon=True,
+            )
+            with self._ipc_clients_lock:
+                self._ipc_clients.add(worker)
+            worker.start()
+
+    def _run_ipc_client(self, connection: socket.socket) -> None:
+        try:
             self._handle_ipc_conn(connection)
+        finally:
+            with self._ipc_clients_lock:
+                self._ipc_clients.discard(threading.current_thread())
+            self._ipc_client_slots.release()
 
     def _handle_ipc_conn(self, connection: socket.socket) -> None:
         with connection:
@@ -343,6 +375,13 @@ class DaemonService:
     def _validate_and_dispatch(self, request: Any) -> Dict[str, Any]:
         if not isinstance(request, dict):
             return {"status": "error", "error": "Request must be a JSON object"}
+
+        # The Android wire contract is deliberately commandless and versioned:
+        # protocol, request_id, number, source. It shares this same Unix socket
+        # and does not introduce a second IPC mechanism.
+        if "protocol" in request or request.get("source") == SOURCE_ANDROID:
+            return self._handle_screening_request(request)
+
         command = request.get("command")
         if not isinstance(command, str) or not command:
             return {"status": "error", "error": "Invalid request: missing command"}
@@ -352,7 +391,42 @@ class DaemonService:
 
     def _snapshot(self) -> Dict[str, Any]:
         self._sync_runtime_metrics()
-        return self.health.snapshot()
+        snapshot = self.health.snapshot()
+        persisted = self._database_screening_metrics()
+        for key in (
+            "incoming_calls",
+            "screened",
+            "screening_timeouts",
+            "bridge_errors",
+            "screening_high_risk",
+            "screening_allowed",
+            "screening_unknown",
+            "screening_block_recommended",
+        ):
+            persisted_key = "timeouts" if key == "screening_timeouts" else key
+            if key == "screening_high_risk":
+                persisted_key = "high_risk"
+            snapshot[key] = max(
+                int(snapshot.get(key, 0)), int(persisted.get(persisted_key, 0))
+            )
+        snapshot["screening_blocked"] = 0
+        snapshot["screening_mode"] = "DRY_RUN"
+        snapshot["screening_enabled"] = bool(self.cfg.screening_enabled)
+        return snapshot
+
+    def _database_screening_metrics(self) -> Dict[str, int]:
+        database = None
+        try:
+            database = Database(self.cfg.database_path)
+            return database.screening_metrics()
+        except Exception:
+            return {}
+        finally:
+            if database is not None:
+                try:
+                    database.close()
+                except Exception:
+                    pass
 
     def _handle_ipc_command(
         self, command: str, request: Dict[str, Any]
@@ -363,7 +437,8 @@ class DaemonService:
             if command == "status":
                 snapshot = self._snapshot()
                 snapshot["ipc"] = "ENABLED"
-                snapshot["call_screening"] = "NOT CONNECTED"
+                snapshot["call_screening"] = "DRY_RUN"
+                snapshot["android_verified"] = False
                 return {"status": "ok", "data": snapshot}
             if command == "metrics":
                 return {"status": "ok", "data": self._snapshot()}
@@ -394,6 +469,39 @@ class DaemonService:
                         "database": snapshot.get("db_status"),
                     },
                 }
+            if command == "screening_status":
+                metrics = self._database_screening_metrics()
+                return {
+                    "status": "ok",
+                    "data": {
+                        "bridge": "CONNECTED",
+                        "daemon": "RUNNING",
+                        "android": "NOT VERIFIED",
+                        "mode": "DRY_RUN",
+                        "timeout_ms": int(self.cfg.screening_timeout_ms),
+                        "live_screening": (
+                            "IPC READY" if self.cfg.screening_enabled else "DISABLED"
+                        ),
+                        "auto_reject": "DISABLED",
+                        "actually_rejected": 0,
+                        "screening_enabled": bool(self.cfg.screening_enabled),
+                        "screened": int(metrics.get("screened", 0)),
+                    },
+                }
+            if command == "screening_config":
+                enabled = request.get("enabled")
+                if not isinstance(enabled, bool):
+                    return {
+                        "status": "error",
+                        "error": "enabled must be a boolean",
+                    }
+                self.cfg.screening_enabled = enabled
+                self.processor.cfg.screening_enabled = enabled
+                return {
+                    "status": "ok",
+                    "screening_enabled": enabled,
+                    "mode": "DRY_RUN",
+                }
             if command == "event":
                 return self._accept_event(request)
             if command == "stop":
@@ -406,6 +514,273 @@ class DaemonService:
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
         return {"status": "error", "error": "Unhandled command"}
+
+    def _handle_screening_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Process the exact callshield/1 Android request and always apply ALLOW."""
+
+        started = time.monotonic()
+        self.health.inc_incoming_call()
+        self.health.inc_received()
+
+        raw_request_id = request.get("request_id")
+        request_id = (
+            raw_request_id
+            if isinstance(raw_request_id, str) and _is_uuid(raw_request_id)
+            else str(uuid.uuid4())
+        )
+        number = request.get("number")
+        stored_number = str(number) if isinstance(number, str) else ""
+
+        unknown_fields = sorted(
+            set(request) - {"protocol", "request_id", "number", "source"}
+        )
+        if unknown_fields:
+            return self._finalize_screening(
+                self._screening_fallback(
+                    request_id, "INVALID_REQUEST", _elapsed_ms(started)
+                ),
+                stored_number,
+                failed=True,
+                bridge_error=True,
+            )
+        if request.get("protocol") != "callshield/1":
+            return self._finalize_screening(
+                self._screening_fallback(
+                    request_id, "INVALID_PROTOCOL", _elapsed_ms(started)
+                ),
+                stored_number,
+                failed=True,
+                bridge_error=True,
+            )
+        if not isinstance(raw_request_id, str) or not _is_uuid(raw_request_id):
+            return self._finalize_screening(
+                self._screening_fallback(
+                    request_id, "INVALID_REQUEST_ID", _elapsed_ms(started)
+                ),
+                stored_number,
+                failed=True,
+                bridge_error=True,
+            )
+        if request.get("source") != SOURCE_ANDROID:
+            return self._finalize_screening(
+                self._screening_fallback(
+                    request_id, "INVALID_SOURCE", _elapsed_ms(started)
+                ),
+                stored_number,
+                failed=True,
+                bridge_error=True,
+            )
+        if not isinstance(number, str) or not number.strip() or len(number) > 128:
+            return self._finalize_screening(
+                self._screening_fallback(
+                    request_id, "INVALID_NUMBER", _elapsed_ms(started)
+                ),
+                stored_number,
+                failed=True,
+            )
+        if not self.cfg.screening_enabled:
+            return self._finalize_screening(
+                self._screening_fallback(
+                    request_id, "SCREENING_DISABLED", _elapsed_ms(started)
+                ),
+                number,
+            )
+
+        event = Event(
+            event_id=request_id,
+            event_type=EVENT_TYPE_INCOMING_CALL,
+            timestamp=iso_now(),
+            source=SOURCE_ANDROID,
+            number=number,
+            payload={"protocol": "callshield/1"},
+        )
+        result_holder = {}  # type: Dict[str, Any]
+        error_holder = {}  # type: Dict[str, BaseException]
+        completed = threading.Event()
+
+        def analyze() -> None:
+            try:
+                result_holder["result"] = self.processor.process(event)
+            except BaseException as exc:
+                error_holder["error"] = exc
+            finally:
+                completed.set()
+
+        worker = threading.Thread(
+            target=analyze,
+            name="callshield-screening-analysis",
+            daemon=True,
+        )
+        worker.start()
+        # Reserve a small portion of the configured budget for response
+        # serialization and best-effort audit persistence.
+        timeout_seconds = max(
+            0.05, (int(self.cfg.screening_timeout_ms) - 100) / 1000.0
+        )
+        if not completed.wait(timeout_seconds):
+            return self._finalize_screening(
+                self._screening_fallback(
+                    request_id, "SCREENING_TIMEOUT", _elapsed_ms(started)
+                ),
+                number,
+                failed=True,
+            )
+        if error_holder:
+            return self._finalize_screening(
+                self._screening_fallback(
+                    request_id, "INTERNAL_ERROR", _elapsed_ms(started)
+                ),
+                number,
+                failed=True,
+                bridge_error=True,
+            )
+
+        processed = result_holder.get("result")
+        if not isinstance(processed, dict):
+            return self._finalize_screening(
+                self._screening_fallback(
+                    request_id, "ANALYSIS_ERROR", _elapsed_ms(started)
+                ),
+                number,
+                failed=True,
+                bridge_error=True,
+            )
+        detection = processed.get("detection") or {}
+        screening = processed.get("screening") or {}
+        if processed.get("status") != "processed":
+            reason = str(detection.get("reason") or "ANALYSIS_ERROR")
+            return self._finalize_screening(
+                self._screening_fallback(
+                    request_id, reason, _elapsed_ms(started)
+                ),
+                number,
+                failed=True,
+                bridge_error=True,
+            )
+
+        recommendation = str(detection.get("recommended_action") or "UNKNOWN")
+        if recommendation not in ("ALLOW", "BLOCK", "UNKNOWN"):
+            recommendation = "UNKNOWN"
+        verdict = str(detection.get("verdict") or "UNKNOWN")
+        if verdict not in ("SAFE", "UNKNOWN", "SUSPICIOUS", "HIGH_RISK", "MALICIOUS"):
+            verdict = "UNKNOWN"
+        reason = str(
+            screening.get("reason") or detection.get("reason") or "DRY_RUN"
+        )[:500]
+        response = {
+            "protocol": "callshield/1",
+            "request_id": request_id,
+            "risk_score": max(0, min(100, int(detection.get("risk_score", 0)))),
+            "confidence": max(0, min(100, int(detection.get("confidence", 0)))),
+            "verdict": verdict,
+            "recommended_action": recommendation,
+            "applied_action": "ALLOW",
+            "mode": "DRY_RUN",
+            "reason": "DRY_RUN" if recommendation == "BLOCK" else reason,
+            "latency_ms": _elapsed_ms(started),
+        }
+        normalized_number = str(detection.get("number") or number)
+        return self._finalize_screening(response, normalized_number)
+
+    @staticmethod
+    def _screening_fallback(
+        request_id: str, reason: str, latency_ms: int
+    ) -> Dict[str, Any]:
+        return {
+            "protocol": "callshield/1",
+            "request_id": request_id,
+            "risk_score": 0,
+            "confidence": 0,
+            "verdict": "UNKNOWN",
+            "recommended_action": "ALLOW",
+            "applied_action": "ALLOW",
+            "mode": "DRY_RUN",
+            "reason": str(reason)[:500],
+            "latency_ms": max(0, int(latency_ms)),
+        }
+
+    def _finalize_screening(
+        self,
+        response: Dict[str, Any],
+        number: str,
+        *,
+        failed: bool = False,
+        bridge_error: bool = False,
+    ) -> Dict[str, Any]:
+        # Enforce the Phase 4 invariant again at the final response boundary.
+        response["applied_action"] = "ALLOW"
+        response["mode"] = "DRY_RUN"
+        persisted = self._persist_screening_result(number, response)
+        if not persisted:
+            bridge_error = True
+        self.health.record_screening(
+            verdict=str(response.get("verdict", "UNKNOWN")),
+            recommended_action=str(response.get("recommended_action", "ALLOW")),
+            reason=str(response.get("reason", "UNKNOWN")),
+            bridge_error=bridge_error,
+        )
+        if failed:
+            self.health.inc_failed(error=str(response.get("reason", "SCREENING_ERROR")))
+        else:
+            self.health.inc_processed(
+                verdict=str(response.get("verdict", "UNKNOWN")),
+                action=str(response.get("recommended_action", "ALLOW")),
+            )
+        try:
+            self.logger.info(
+                "screening request=%s number=%s verdict=%s recommended=%s applied=ALLOW reason=%s latency=%sms",
+                response.get("request_id"),
+                mask_number(number),
+                response.get("verdict"),
+                response.get("recommended_action"),
+                response.get("reason"),
+                response.get("latency_ms"),
+            )
+        except Exception:
+            pass
+        return response
+
+    def _persist_screening_result(
+        self, number: str, response: Dict[str, Any]
+    ) -> bool:
+        database = None
+        try:
+            # Persistence must never extend an Android call indefinitely. A
+            # contended database is treated as a bridge error and the ALLOW
+            # response is still returned.
+            database = Database(self.cfg.database_path, timeout=0.05)
+            database.add_screening_event(
+                timestamp=iso_now(),
+                number=number,
+                risk_score=int(response.get("risk_score", 0)),
+                confidence=int(response.get("confidence", 0)),
+                verdict=str(response.get("verdict", "UNKNOWN")),
+                recommended_action=str(
+                    response.get("recommended_action", "ALLOW")
+                ),
+                applied_action="ALLOW",
+                reason=str(response.get("reason", "UNKNOWN")),
+                latency_ms=int(response.get("latency_ms", 0)),
+                source=SOURCE_ANDROID,
+                event_id=str(response.get("request_id", "")),
+            )
+            return True
+        except Exception as exc:
+            try:
+                self.logger.error(
+                    "Unable to persist screening result for %s: %s",
+                    mask_number(number),
+                    exc,
+                )
+            except Exception:
+                pass
+            return False
+        finally:
+            if database is not None:
+                try:
+                    database.close()
+                except Exception:
+                    pass
 
     def _accept_event(self, request: Dict[str, Any]) -> Dict[str, Any]:
         raw = request.get("event", request.get("data"))
@@ -499,6 +874,17 @@ class DaemonService:
         ):
             self._ipc_thread.join(timeout=1.0)
 
+        ipc_deadline = time.monotonic() + float(self.cfg.shutdown_timeout)
+        with self._ipc_clients_lock:
+            ipc_clients = list(self._ipc_clients)
+        for client in ipc_clients:
+            if client is threading.current_thread():
+                continue
+            remaining = ipc_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            client.join(timeout=remaining)
+
         # The worker loop deliberately continues until every accepted queue
         # task has completed. Use a finite configured timeout for crash safety.
         drained = self.queue.wait_until_done(float(self.cfg.shutdown_timeout))
@@ -546,6 +932,18 @@ class DaemonService:
             )
         except Exception:
             pass
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.monotonic() - started) * 1000))
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 def run_foreground(cfg: Optional[Config] = None) -> int:

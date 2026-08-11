@@ -1,5 +1,6 @@
 """Tests for IPC (Phase 3)."""
 
+import concurrent.futures
 import json
 import os
 import socket
@@ -97,6 +98,100 @@ class TestIPC(unittest.TestCase):
         self.assertTrue(accepted.get("event_id"))
         rejected = self._req({"command": "event", "event": {"source": "TEST"}})
         self.assertEqual(rejected.get("status"), "error")
+
+    def test_exact_android_bridge_request_contract(self):
+        import uuid
+
+        request_id = str(uuid.uuid4())
+        response = self._req(
+            {
+                "protocol": "callshield/1",
+                "request_id": request_id,
+                "number": "+919876543210",
+                "source": "android_call_screening",
+            }
+        )
+        self.assertEqual(response["protocol"], "callshield/1")
+        self.assertEqual(response["request_id"], request_id)
+        self.assertEqual(response["applied_action"], "ALLOW")
+        self.assertEqual(response["mode"], "DRY_RUN")
+
+    def test_android_high_risk_block_recommendation_applies_allow(self):
+        import uuid
+        from callshield.database import Database
+
+        number = "+919999900200"
+        database = Database(self.cfg.database_path)
+        try:
+            database.upsert_list_entry(
+                number,
+                "blacklist",
+                "ipc test",
+                "2026-08-11T00:00:00+00:00",
+            )
+        finally:
+            database.close()
+        response = self._req(
+            {
+                "protocol": "callshield/1",
+                "request_id": str(uuid.uuid4()),
+                "number": number,
+                "source": "android_call_screening",
+            }
+        )
+        self.assertEqual(response["recommended_action"], "BLOCK")
+        self.assertEqual(response["applied_action"], "ALLOW")
+
+    def test_android_invalid_request_fails_open(self):
+        import uuid
+
+        for request in (
+            {
+                "protocol": "callshield/1",
+                "request_id": str(uuid.uuid4()),
+                "number": "invalid",
+                "source": "android_call_screening",
+            },
+            {
+                "protocol": "wrong/1",
+                "request_id": str(uuid.uuid4()),
+                "number": "+919876543210",
+                "source": "android_call_screening",
+            },
+        ):
+            response = self._req(request)
+            self.assertEqual(response["verdict"], "UNKNOWN")
+            self.assertEqual(response["applied_action"], "ALLOW")
+
+    def test_concurrent_android_requests(self):
+        import uuid
+
+        def request(index):
+            return self._req(
+                {
+                    "protocol": "callshield/1",
+                    "request_id": str(uuid.uuid4()),
+                    "number": f"+91987654{index:04d}",
+                    "source": "android_call_screening",
+                }
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            responses = list(executor.map(request, range(6)))
+        self.assertTrue(all(item["applied_action"] == "ALLOW" for item in responses))
+
+    def test_screening_status_is_honest_about_device(self):
+        response = self._req({"command": "screening_status"})
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["bridge"], "CONNECTED")
+        self.assertEqual(response["data"]["android"], "NOT VERIFIED")
+        self.assertEqual(response["data"]["actually_rejected"], 0)
+        disabled = self._req({"command": "screening_config", "enabled": False})
+        self.assertEqual(disabled["status"], "ok")
+        self.assertFalse(disabled["screening_enabled"])
+        enabled = self._req({"command": "screening_config", "enabled": True})
+        self.assertEqual(enabled["status"], "ok")
+        self.assertTrue(enabled["screening_enabled"])
 
     def test_malformed_json_returns_error_and_daemon_survives(self):
         response = self._raw(b"{not-json}\n")

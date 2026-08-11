@@ -15,6 +15,7 @@ from .config import Config, config_integrity
 from .daemon.process import _clear_pid, _clear_socket, status as daemon_status
 from .database import Database, SCHEMA_VERSION
 from .policy import is_emergency_off, thresholds_for_config
+from .reputation import ReputationStorage
 from .utils import safe_unlink
 
 
@@ -109,9 +110,45 @@ def run_doctor(
             )
         )
         checks.append(DoctorCheck("Schema", HEALTHY, f"version {SCHEMA_VERSION}"))
+        reputation_storage = ReputationStorage(database, cfg)
+        reputation_ok = reputation_storage.integrity_check()
+        profile_count = int(
+            database._conn.execute(
+                "SELECT COUNT(*) FROM reputation_profiles"
+            ).fetchone()[0]
+        )
+        trust_count = int(
+            database._conn.execute(
+                "SELECT COUNT(*) FROM trusted_numbers"
+            ).fetchone()[0]
+        )
+        checks.append(
+            DoctorCheck(
+                "Reputation Database",
+                HEALTHY,
+                f"local profiles={profile_count}",
+            )
+        )
+        checks.append(
+            DoctorCheck("Reputation Schema", HEALTHY, "schema and indexes present")
+        )
+        checks.append(
+            DoctorCheck(
+                "Reputation Integrity",
+                HEALTHY if reputation_ok else ERROR,
+                "bounded profile JSON valid" if reputation_ok else "corrupt profile JSON",
+            )
+        )
+        checks.append(
+            DoctorCheck("Trust Database", HEALTHY, f"local trust records={trust_count}")
+        )
     except Exception as exc:
         checks.append(DoctorCheck("Database", ERROR, str(exc)))
         checks.append(DoctorCheck("Schema", ERROR, "not validated"))
+        checks.append(DoctorCheck("Reputation Database", ERROR, "not available"))
+        checks.append(DoctorCheck("Reputation Schema", ERROR, "not validated"))
+        checks.append(DoctorCheck("Reputation Integrity", ERROR, "not validated"))
+        checks.append(DoctorCheck("Trust Database", ERROR, "not available"))
     finally:
         if database is not None:
             try:

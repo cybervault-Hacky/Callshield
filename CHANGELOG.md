@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.7.0 — Phase 7: Reputation & Explainable Intelligence
+
+### Added
+- Dedicated `callshield/reputation/` package while preserving the legacy Phase 1 `ReputationSignals` import API.
+- Deterministic, bounded local reputation profiles with masked number/hash, observations, allowed/rejected counts, block recommendations, reports, score, separate confidence, and measured trend.
+- Structured explanations where every reason maps to a measured local signal or actual historical trend.
+- Bounded trend detection (`IMPROVING`, `STABLE`, `WORSENING`, `UNKNOWN`) requiring at least three observations.
+- Schema version 6 with privacy-preserving `reputation_profiles`, bounded `reputation_history`, and `trusted_numbers` tables plus indexed lookups and screening-time reputation snapshots.
+- `callshield reputation`, `callshield reputation <number>`, `--json`, and `reputation list` with masked output and no plaintext/hash in public JSON.
+- Explicit reversible local trust through `callshield trust`, `callshield untrust`, and bounded temporary durations such as `--for 24h`.
+- Reputation context integrated into incoming-call policy as a safety veto/trust override only; reputation alone never raises detector risk or forces BLOCK.
+- Doctor checks for Reputation Database, Reputation Schema, Reputation Integrity, and Trust Database.
+- Optional reputation score/confidence/trend/reasons in masked block inspection.
+- Reproducible bounded lookup benchmark in `scripts/benchmark_phase7.py` and `PERFORMANCE_PHASE7.md`.
+- 61 Phase 7 Python tests (332 total) covering scoring, history, trends, confidence, explanations, CLI/JSON, trust/expiry, policy fail-open, schema/privacy, doctor, retention, block inspection, and concurrent lookup.
+
+### Privacy and safety
+- No cloud reputation service, remote lookup, telemetry, analytics, accounts, advertising, DNS/HTTP request, or network listener.
+- New profile/history/trust tables store only canonical SHA-256 hashes and masked identifiers; no plaintext number column is added.
+- Reputation failure/corruption/database unavailability produces UNKNOWN / ALLOW.
+- Whitelist, explicit trust, emergency-off, config integrity, replay protection, IPC bounds, and all Phase 1–6 fail-open guarantees remain absolute.
+- History is capped per number, profiles/trust have global bounds, and all event/detail queries are indexed and bounded.
+
+### Verification
+- Python suite: 332 passed; all 271 Phase 1–6 tests preserved.
+- Android build/device remain NOT VERIFIED; no device result is claimed.
+- Phase 8 has not started.
+
 ## 0.6.0 — Phase 6: Hardening & Reliability
 
 ### Added

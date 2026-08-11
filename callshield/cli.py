@@ -41,6 +41,12 @@ from .intelligence import analyze_behavior, number_intelligence
 from .intelligence.profiles import PROFILES, get_profile
 from .logger import log_error, log_info
 from .normalizer import normalize
+from .reputation import (
+    ReputationEngine,
+    ReputationStorage,
+    number_fingerprint,
+    trust_expiry,
+)
 from .policy import (
     DEFAULT_POLICIES,
     PolicyEngine,
@@ -69,7 +75,7 @@ from .utils import (
 
 _BANNER = "CALLSHIELD"
 _TAGLINE = "Fraud Protection Engine"
-_PHASE = "Phase 6 — Hardening & Reliability"
+_PHASE = "Phase 7 — Reputation & Explainable Intelligence"
 _PHASE_COMPAT = "Phase 1 — Foundation"
 
 
@@ -378,8 +384,15 @@ def build_parser() -> argparse.ArgumentParser:
     s_rep = sub.add_parser(
         "reputation", help="Show local reputation information for a number."
     )
-    s_rep.add_argument("number")
+    s_rep.add_argument("number", nargs="?", help="Number or 'list'.")
     s_rep.add_argument("--json", action="store_true")
+
+    s_trust = sub.add_parser("trust", help="Locally trust a normalized number.")
+    s_trust.add_argument("number")
+    s_trust.add_argument("--for", dest="duration", default=None, help="Temporary duration such as 24h or 7d.")
+    s_trust.add_argument("--reason", default=None)
+    s_untrust = sub.add_parser("untrust", help="Remove local trust.")
+    s_untrust.add_argument("number")
 
     s_hist = sub.add_parser("history", help="Show local event history for a number.")
     s_hist.add_argument("number")
@@ -887,68 +900,165 @@ def _list_table(ui: _UI, cfg: Config, list_type: str) -> int:
 
 
 def _cmd_reputation(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    requested = getattr(args, "number", None)
+    as_json = bool(getattr(args, "json", False))
+    if requested is None or requested.lower() == "list":
+        database = None
+        try:
+            database = open_database(cfg)
+            rows = ReputationStorage(database, cfg).recent_profiles(limit=50)
+        except Exception as exc:
+            _print_error(ui, f"Reputation storage unavailable: {exc}")
+            return EXIT_DATABASE
+        finally:
+            if database is not None:
+                database.close()
+        if as_json:
+            _print_json({"profiles": rows, "count": len(rows)})
+            return EXIT_OK
+        _header(ui, "CALLSHIELD REPUTATION")
+        if not rows:
+            print("No reputation profiles recorded.")
+            return EXIT_OK
+        print(f"{'NUMBER':<20} {'RISK':<10} {'SCORE':>5} {'CONF':>5} TREND")
+        for row in rows:
+            print(
+                f"{row['number_masked']:<20} {row['risk']:<10} "
+                f"{row['risk_score']:>5} {row['confidence']:>4}% {row['trend']}"
+            )
+        return EXIT_OK
+
     n = _normalize_or_error(
-        ui, args.number, cfg, usage_hint="callshield reputation <number>"
+        ui, requested, cfg, usage_hint="callshield reputation <number>"
     )
     if n is None:
         return EXIT_INVALID_NUMBER
-    as_json = getattr(args, "json", False)
-    db = open_database(cfg)
+    database = None
     try:
-        result = analyze_number(
-            n.normalized, db=db, cfg=cfg, record_event=False
+        database = open_database(cfg)
+        analysis = analyze_number(
+            n.normalized, db=database, cfg=cfg, record_event=False
         )
-        reports = db.count_reports(n.normalized)
-        first_seen = db.get_first_seen(n.normalized)
-        last_seen = db.get_last_seen(n.normalized)
-        bl = db.get_list_entry(n.normalized, "blacklist")
-        wl = db.get_list_entry(n.normalized, "whitelist")
+        profile = ReputationEngine(database, cfg).calculate(
+            n.normalized, analysis=analysis, persist=True
+        )
+    except Exception as exc:
+        profile = None
+        error = str(exc)
     finally:
-        db.close()
+        if database is not None:
+            database.close()
 
+    if profile is None:
+        if as_json:
+            _print_json(
+                {
+                    "number_masked": mask_number(n.normalized),
+                    "risk": "UNKNOWN",
+                    "score": 0,
+                    "confidence": 0,
+                    "trend": "UNKNOWN",
+                    "signals": [],
+                    "reasons": ["Reputation unavailable; fail-open ALLOW"],
+                    "history": {},
+                    "recommendation": "ALLOW",
+                    "available": False,
+                    "error": error[:200],
+                }
+            )
+        else:
+            _header(ui, "CALLSHIELD REPUTATION")
+            print(f"Number:              {mask_number(n.normalized)}")
+            print("Risk:                UNKNOWN")
+            print("Recommendation:      ALLOW")
+            print("Reason:              reputation unavailable (fail-open)")
+        return EXIT_OK
+
+    public = profile.to_public_dict()
     if as_json:
-        _print_json(
-            {
-                "number": result.normalized_number,
-                "reputation": result.reputation,
-                "risk_score": result.risk_score,
-                "risk_level": result.risk_level,
-                "confidence": result.confidence,
-                "verdict": result.verdict,
-                "recommended_action": result.recommended_action,
-                "reports": reports,
-                "first_seen": first_seen,
-                "last_seen": last_seen,
-                "blacklisted": bl is not None,
-                "whitelisted": wl is not None,
-                "behavior": result.behavior,
-                "signals": result.signals,
-            }
-        )
+        _print_json(public)
         return EXIT_OK
 
     _header(ui, "CALLSHIELD REPUTATION")
-    print(f"Number          {result.normalized_number}")
-    print(f"Reputation      {_color_for_verdict(ui, result.reputation)}{result.reputation}{ui.reset}")
-    print(f"Risk Score      {result.risk_score}/100")
-    print(f"Confidence      {result.confidence}%")
-    print(f"Verdict         {result.verdict}")
-    print(f"Action          {result.recommended_action}")
-    print(f"Reports         {reports}")
-    print(f"Suspicious evs  {result.behavior.get('suspicious_events', 0)}")
-    print(f"Blocked evs     {result.behavior.get('blocked_events', 0)}")
-    if first_seen:
-        print(f"First seen      {first_seen}")
-    if last_seen:
-        print(f"Last seen       {last_seen}")
-    if bl or wl:
-        print()
-        if wl:
-            print(ui.green + "  • Present on whitelist" + ui.reset)
-        if bl:
-            print(ui.red + "  • Present on blacklist" + ui.reset)
+    print(f"Number:              {profile.number_masked}")
+    print(f"Risk:                {profile.risk}")
+    print(f"Score:               {profile.risk_score}/100")
+    print(f"Confidence:          {profile.confidence}%")
+    print(f"Trend:               {profile.trend}")
+    print(f"Trusted:             {'YES' if profile.trusted else 'NO'}")
+    if profile.trusted_until:
+        print(f"Trusted Until:       {profile.trusted_until}")
+    print()
+    print("History:")
+    print(f"  Calls Seen:          {profile.calls_seen}")
+    print(f"  Answered:            {profile.calls_answered}")
+    print(f"  Allowed:             {profile.calls_allowed}")
+    print(f"  Block Recommended:   {profile.block_recommendations}")
+    print(f"  Actually Rejected:   {profile.calls_rejected}")
+    print(f"  Reports:             {profile.user_reports}")
+    if profile.first_seen:
+        print(f"  First Seen:          {profile.first_seen}")
+    if profile.last_seen:
+        print(f"  Last Seen:           {profile.last_seen}")
+    print()
+    print("Reasons:")
+    if profile.reasons:
+        for reason in profile.reasons:
+            print(f"  • {reason}")
+    else:
+        print("  • No measured risk signals")
     return EXIT_OK
 
+
+def _cmd_trust(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    n = _normalize_or_error(ui, args.number, cfg, usage_hint="callshield trust <number>")
+    if n is None:
+        return EXIT_INVALID_NUMBER
+    try:
+        expires_at = (
+            trust_expiry(args.duration, cfg.trust_max_seconds)
+            if args.duration
+            else None
+        )
+        database = open_database(cfg)
+        try:
+            record = ReputationStorage(database, cfg).set_trust(
+                number_fingerprint(n.normalized),
+                mask_number(n.normalized),
+                expires_at=expires_at,
+                note=args.reason,
+            )
+        finally:
+            database.close()
+    except Exception as exc:
+        _print_error(ui, f"Unable to trust number: {exc}")
+        return EXIT_DATABASE
+    _header(ui, "CALLSHIELD TRUST")
+    print(f"Number:              {record.number_masked}")
+    print("Trusted:             YES")
+    print(f"Expires:             {record.expires_at or 'never'}")
+    return EXIT_OK
+
+
+def _cmd_untrust(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    n = _normalize_or_error(ui, args.number, cfg, usage_hint="callshield untrust <number>")
+    if n is None:
+        return EXIT_INVALID_NUMBER
+    try:
+        database = open_database(cfg)
+        try:
+            removed = ReputationStorage(database, cfg).remove_trust(
+                number_fingerprint(n.normalized)
+            )
+        finally:
+            database.close()
+    except Exception as exc:
+        _print_error(ui, f"Unable to remove trust: {exc}")
+        return EXIT_DATABASE
+    _header(ui, "CALLSHIELD TRUST")
+    print(f"Number:              {mask_number(n.normalized)}")
+    print(f"Trusted:             {'REMOVED' if removed else 'NOT PRESENT'}")
+    return EXIT_OK
 
 def _cmd_history(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     n = _normalize_or_error(
@@ -1874,10 +1984,21 @@ def _cmd_blocks(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
             print(f"Number:              {row['number_masked']}")
             print(f"Risk:                {row['risk']}")
             print(f"Confidence:          {row['confidence']}")
+            if row.get("reputation_score") is not None:
+                print(f"Reputation Score:    {row['reputation_score']}")
+                print(f"Reputation Confidence:{row.get('reputation_confidence', 0):>4}")
+                print(f"Reputation Trend:    {row.get('reputation_trend') or 'UNKNOWN'}")
             print(f"Policy:              {row['policy_name']}")
             print(f"Recommendation:      {row['recommended_action']}")
             print(f"Applied Action:      {row['applied_action']}")
             print(f"Reason:              {row['policy_reason'] or row['reason'] or 'unknown'}")
+            if row.get("reputation_reasons"):
+                try:
+                    reputation_reasons = json.loads(row["reputation_reasons"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    reputation_reasons = []
+                for reputation_reason in reputation_reasons[:5]:
+                    print(f"Reputation Reason:   {str(reputation_reason)[:200]}")
             print(
                 f"Confirmation:        {'CONFIRMED' if row['actually_rejected'] else 'NOT CONFIRMED'}"
             )
@@ -1917,6 +2038,8 @@ _COMMANDS = {
     "unallow": _cmd_unallow,
     "report": _cmd_report,
     "reputation": _cmd_reputation,
+    "trust": _cmd_trust,
+    "untrust": _cmd_untrust,
     "history": _cmd_history,
     "signals": _cmd_signals,
     "blacklist": _cmd_blacklist,

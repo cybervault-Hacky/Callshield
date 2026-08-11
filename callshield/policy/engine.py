@@ -60,6 +60,7 @@ class PolicyEngine:
             if emergency_off is None
             else bool(emergency_off)
         )
+        reputation_error = _reputation_unavailable(detection)
 
         try:
             normalized_policy = normalize_policy_name(selected_name)
@@ -72,6 +73,18 @@ class PolicyEngine:
                 mode=str(selected_mode or "INVALID"),
                 reason="INVALID_POLICY_CONFIG",
                 whitelisted=whitelist_match,
+            )
+
+        if reputation_error:
+            return _safe_error_decision(
+                risk=risk,
+                confidence=confidence,
+                policy_name=normalized_policy,
+                mode=str(selected_mode or "INVALID"),
+                reason="REPUTATION_UNAVAILABLE",
+                whitelisted=whitelist_match,
+                threshold=thresholds.active_block,
+                confidence_threshold=thresholds.confidence,
             )
 
         if not isinstance(selected_mode, str) or selected_mode not in ("DRY_RUN", "ACTIVE"):
@@ -228,15 +241,29 @@ def _is_whitelisted(detection: Any) -> bool:
         signals = detection.get("signals") or []
         reputation = detection.get("reputation")
         reason = detection.get("reason")
+        trusted = bool(detection.get("trusted", False))
+        profile = detection.get("reputation_profile")
+        if isinstance(profile, Mapping):
+            trusted = trusted or bool(profile.get("trusted", False))
     else:
         signals = getattr(detection, "signals", []) or []
         reputation = getattr(detection, "reputation", None)
         reason = getattr(detection, "reason", None)
+        trusted = bool(getattr(detection, "trusted", False))
     for signal in signals:
         name = signal.get("name") if isinstance(signal, Mapping) else getattr(signal, "name", None)
         if name == "whitelist_match":
             return True
-    return reputation == "TRUSTED" or reason == "User whitelist"
+    return trusted or reputation == "TRUSTED" or reason == "User whitelist"
+
+
+def _reputation_unavailable(detection: Any) -> bool:
+    if isinstance(detection, Mapping):
+        if detection.get("reputation_error"):
+            return True
+        profile = detection.get("reputation_profile")
+        return isinstance(profile, Mapping) and profile.get("available") is False
+    return bool(getattr(detection, "reputation_error", False))
 
 
 def _safe_error_decision(

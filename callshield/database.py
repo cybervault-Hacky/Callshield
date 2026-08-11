@@ -4,12 +4,13 @@ All queries are parameterized. The schema is created automatically on first
 connect. The layer exposes small, purpose-built methods used by the rest of the
 engine — it is not a generic ORM.
 
-Schema is migrated automatically through Phase 5 on first open.
+Schema is migrated automatically through Phase 7 on first open.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -22,7 +23,7 @@ from . import DATA_DIR
 from .utils import DatabaseError, ensure_parent, mask_number
 
 DEFAULT_DB_PATH = DATA_DIR / "callshield.db"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 # ----- Schema --------------------------------------------------------------
@@ -110,8 +111,64 @@ CREATE TABLE IF NOT EXISTS screening_events (
     emergency_off        INTEGER NOT NULL DEFAULT 0 CHECK (emergency_off IN (0,1)),
     actually_rejected    INTEGER NOT NULL DEFAULT 0 CHECK (actually_rejected IN (0,1)),
     rejection_confirmed_at TEXT,
+    reputation_score      INTEGER CHECK (reputation_score BETWEEN 0 AND 100),
+    reputation_confidence INTEGER CHECK (reputation_confidence BETWEEN 0 AND 100),
+    reputation_trend      TEXT CHECK (reputation_trend IN ('IMPROVING','STABLE','WORSENING','UNKNOWN')),
+    reputation_reasons    TEXT,
     CHECK (applied_action = 'ALLOW' OR (mode = 'ACTIVE' AND policy_action = 'BLOCK'))
 );
+
+CREATE TABLE IF NOT EXISTS reputation_profiles (
+    number_hash          TEXT PRIMARY KEY,
+    number_masked        TEXT NOT NULL,
+    first_seen           TEXT,
+    last_seen            TEXT,
+    calls_seen           INTEGER NOT NULL DEFAULT 0,
+    calls_answered       INTEGER NOT NULL DEFAULT 0,
+    calls_rejected       INTEGER NOT NULL DEFAULT 0,
+    calls_allowed        INTEGER NOT NULL DEFAULT 0,
+    block_recommendations INTEGER NOT NULL DEFAULT 0,
+    user_reports         INTEGER NOT NULL DEFAULT 0,
+    risk_score           INTEGER NOT NULL DEFAULT 0 CHECK (risk_score BETWEEN 0 AND 100),
+    confidence           INTEGER NOT NULL DEFAULT 0 CHECK (confidence BETWEEN 0 AND 100),
+    risk                 TEXT NOT NULL DEFAULT 'UNKNOWN'
+                           CHECK (risk IN ('TRUSTED','LOW','MODERATE','HIGH','CRITICAL','UNKNOWN')),
+    trend                TEXT NOT NULL DEFAULT 'UNKNOWN'
+                           CHECK (trend IN ('IMPROVING','STABLE','WORSENING','UNKNOWN')),
+    signals_json         TEXT NOT NULL DEFAULT '[]',
+    reasons_json         TEXT NOT NULL DEFAULT '[]',
+    updated_at           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reputation_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    number_hash TEXT NOT NULL,
+    timestamp   TEXT NOT NULL,
+    old_score   INTEGER,
+    new_score   INTEGER NOT NULL CHECK (new_score BETWEEN 0 AND 100),
+    risk_before TEXT,
+    risk_after  TEXT NOT NULL,
+    trigger     TEXT NOT NULL,
+    FOREIGN KEY (number_hash) REFERENCES reputation_profiles(number_hash)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS trusted_numbers (
+    number_hash   TEXT PRIMARY KEY,
+    number_masked TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT,
+    note          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_reputation_updated
+    ON reputation_profiles(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reputation_risk
+    ON reputation_profiles(risk, risk_score DESC);
+CREATE INDEX IF NOT EXISTS idx_reputation_history_hash_time
+    ON reputation_history(number_hash, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_trusted_expiry
+    ON trusted_numbers(expires_at);
 
 CREATE INDEX IF NOT EXISTS idx_screening_timestamp
     ON screening_events(timestamp DESC);
@@ -220,6 +277,8 @@ class Database:
                 self._migrate_v3_to_v4()
             if current_version <= 4:
                 self._migrate_v4_to_v5()
+            if current_version <= 5:
+                self._migrate_v5_to_v6()
         except sqlite3.Error as exc:
             raise DatabaseError(f"Database migration to v{SCHEMA_VERSION} failed: {exc}") from exc
 
@@ -468,6 +527,34 @@ class Database:
                 "ON screening_events(policy_action, timestamp DESC)"
             )
 
+    def _migrate_v5_to_v6(self) -> None:
+        """Add bounded local reputation/trust storage and decision snapshots."""
+
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(screening_events)")
+        }
+        with self._conn:
+            if "reputation_score" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE screening_events ADD COLUMN reputation_score "
+                    "INTEGER CHECK (reputation_score BETWEEN 0 AND 100)"
+                )
+            if "reputation_confidence" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE screening_events ADD COLUMN reputation_confidence "
+                    "INTEGER CHECK (reputation_confidence BETWEEN 0 AND 100)"
+                )
+            if "reputation_trend" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE screening_events ADD COLUMN reputation_trend TEXT "
+                    "CHECK (reputation_trend IN ('IMPROVING','STABLE','WORSENING','UNKNOWN'))"
+                )
+            if "reputation_reasons" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE screening_events ADD COLUMN reputation_reasons TEXT"
+                )
+
+
     def integrity_check(self, *, quick: bool = False) -> bool:
         pragma = "quick_check" if quick else "integrity_check"
         try:
@@ -487,6 +574,9 @@ class Database:
             "reports",
             "settings",
             "screening_events",
+            "reputation_profiles",
+            "reputation_history",
+            "trusted_numbers",
         }
         tables = {
             str(row[0])
@@ -520,9 +610,46 @@ class Database:
             "applied_action",
             "event_id",
             "actually_rejected",
+            "reputation_score",
+            "reputation_confidence",
+            "reputation_trend",
+            "reputation_reasons",
         }
         if required_columns - screening_columns:
             raise DatabaseError("Database screening schema is incomplete")
+        reputation_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(reputation_profiles)"
+            ).fetchall()
+        }
+        if {
+            "number_hash",
+            "number_masked",
+            "risk_score",
+            "confidence",
+            "risk",
+            "trend",
+            "signals_json",
+            "reasons_json",
+        } - reputation_columns:
+            raise DatabaseError("Database reputation schema is incomplete")
+        history_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(reputation_history)"
+            ).fetchall()
+        }
+        if {"number_hash", "old_score", "new_score", "trigger"} - history_columns:
+            raise DatabaseError("Database reputation history schema is incomplete")
+        trust_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(trusted_numbers)"
+            ).fetchall()
+        }
+        if {"number_hash", "number_masked", "expires_at"} - trust_columns:
+            raise DatabaseError("Database trust schema is incomplete")
         screening_indexes = {
             str(row[1])
             for row in self._conn.execute(
@@ -538,6 +665,20 @@ class Database:
         }
         if required_indexes - screening_indexes:
             raise DatabaseError("Database screening indexes are incomplete")
+        all_indexes = {
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        reputation_indexes = {
+            "idx_reputation_updated",
+            "idx_reputation_risk",
+            "idx_reputation_history_hash_time",
+            "idx_trusted_expiry",
+        }
+        if reputation_indexes - all_indexes:
+            raise DatabaseError("Database reputation indexes are incomplete")
         foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()
         if not foreign_keys or int(foreign_keys[0]) != 1:
             raise DatabaseError("SQLite foreign_keys is not enabled")
@@ -832,6 +973,10 @@ class Database:
         confidence_threshold: int = 80,
         policy_reason: Optional[str] = None,
         emergency_off: bool = False,
+        reputation_score: Optional[int] = None,
+        reputation_confidence: Optional[int] = None,
+        reputation_trend: Optional[str] = None,
+        reputation_reasons: Optional[Sequence[str]] = None,
     ) -> int:
         """Persist one policy-screening result with privacy metadata."""
 
@@ -880,6 +1025,21 @@ class Database:
         clean_policy_reason = str(policy_reason or clean_reason or "")[:500] or None
         clean_source = str(source or "android_call_screening")[:64]
         clean_event_id = str(event_id)[:64]
+        rep_score = None if reputation_score is None else int(reputation_score)
+        rep_confidence = (
+            None if reputation_confidence is None else int(reputation_confidence)
+        )
+        if rep_score is not None and not (0 <= rep_score <= 100):
+            raise ValueError("Reputation score must be between 0 and 100")
+        if rep_confidence is not None and not (0 <= rep_confidence <= 100):
+            raise ValueError("Reputation confidence must be between 0 and 100")
+        rep_trend = reputation_trend or None
+        if rep_trend not in (None, "IMPROVING", "STABLE", "WORSENING", "UNKNOWN"):
+            raise ValueError("Invalid reputation trend")
+        reason_values = [str(item)[:200] for item in (reputation_reasons or [])[:20]]
+        rep_reasons_json = json.dumps(reason_values, separators=(",", ":"))
+        if len(rep_reasons_json.encode("utf-8")) > 4096:
+            raise ValueError("Reputation reasons are too large")
         with self.transaction():
             cursor = self._conn.execute(
                 """
@@ -888,8 +1048,9 @@ class Database:
                      confidence, verdict, recommended_action, applied_action,
                      reason, latency_ms, source, event_id, mode, policy_action,
                      policy_name, threshold, confidence_threshold, policy_reason,
-                     emergency_off, actually_rejected)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                     emergency_off, actually_rejected, reputation_score,
+                     reputation_confidence, reputation_trend, reputation_reasons)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                 """,
                 (
                     timestamp,
@@ -912,6 +1073,10 @@ class Database:
                     confidence_limit,
                     clean_policy_reason,
                     int(bool(emergency_off)),
+                    rep_score,
+                    rep_confidence,
+                    rep_trend,
+                    rep_reasons_json,
                 ),
             )
             return int(cursor.lastrowid)
@@ -1024,7 +1189,9 @@ class Database:
             SELECT id, timestamp, number_masked, risk, confidence, policy_name,
                    threshold, confidence_threshold, recommended_action,
                    applied_action, reason, policy_reason, emergency_off,
-                   actually_rejected, rejection_confirmed_at
+                   actually_rejected, rejection_confirmed_at,
+                   reputation_score, reputation_confidence, reputation_trend,
+                   reputation_reasons
               FROM screening_events
              WHERE id = ? AND applied_action = 'BLOCK'
              LIMIT 1

@@ -770,6 +770,7 @@ class DaemonService:
             )
 
         policy = processed.get("policy") or screening
+        reputation_profile = processed.get("reputation_profile") or {}
         recommendation = str(policy.get("recommended_action") or "ALLOW")
         if recommendation not in ("ALLOW", "BLOCK"):
             recommendation = "ALLOW"
@@ -797,6 +798,16 @@ class DaemonService:
             ),
             "emergency_off": bool(policy.get("emergency_off", False)),
             "policy_error": bool(policy.get("policy_error", False)),
+            "reputation_score": int(reputation_profile.get("score", 0)),
+            "reputation_confidence": int(
+                reputation_profile.get("confidence", 0)
+            ),
+            "reputation_trend": str(
+                reputation_profile.get("trend", "UNKNOWN")
+            ),
+            "reputation_reasons": list(
+                reputation_profile.get("reasons", [])[:20]
+            ),
         }
         normalized_number = str(detection.get("number") or number)
         return self._finalize_screening(response, normalized_number)
@@ -924,6 +935,18 @@ class DaemonService:
                 ),
                 policy_reason=str(response.get("reason", "UNKNOWN")),
                 emergency_off=bool(response.get("emergency_off", False)),
+                reputation_score=(
+                    int(response["reputation_score"])
+                    if "reputation_score" in response
+                    else None
+                ),
+                reputation_confidence=(
+                    int(response["reputation_confidence"])
+                    if "reputation_confidence" in response
+                    else None
+                ),
+                reputation_trend=response.get("reputation_trend"),
+                reputation_reasons=response.get("reputation_reasons", []),
             )
             return True
         except Exception as exc:

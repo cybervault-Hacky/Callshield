@@ -1,7 +1,7 @@
 """Persistent, validated configuration for CALLSHIELD.
 
-Configuration is stored as JSON in the local data directory. Phase 5 retains
-all Phase 1–4 settings and adds explicitly confirmed active-policy controls.
+Configuration is stored as JSON in the local data directory. Phase 7 retains
+all Phase 1–6 controls and adds bounded local reputation/trust retention.
 """
 
 from __future__ import annotations
@@ -111,6 +111,11 @@ class Config:
     event_payload_limit: int = 8 * 1024
     replay_window_seconds: int = 300
     replay_cache_size: int = 4096
+    reputation_query_limit: int = 100
+    reputation_history_limit: int = 100
+    reputation_profile_limit: int = 5000
+    trust_record_limit: int = 1000
+    trust_max_seconds: int = 365 * 24 * 60 * 60
     max_log_size: int = 2 * 1024 * 1024
     max_log_files: int = 3
     ipc_enabled: bool = True
@@ -272,6 +277,11 @@ class Config:
         self._validate_int("event_payload_limit", 256, 8 * 1024)
         self._validate_int("replay_window_seconds", 30, 900)
         self._validate_int("replay_cache_size", 128, 16384)
+        self._validate_int("reputation_query_limit", 10, 500)
+        self._validate_int("reputation_history_limit", 10, 500)
+        self._validate_int("reputation_profile_limit", 100, 10000)
+        self._validate_int("trust_record_limit", 10, 2000)
+        self._validate_int("trust_max_seconds", 60, 365 * 24 * 60 * 60)
         self._validate_int("max_log_size", 64 * 1024, 100 * 1024 * 1024)
         self._validate_int("max_log_files", 1, 10)
         if (
@@ -432,6 +442,11 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         "event_payload_limit",
         "replay_window_seconds",
         "replay_cache_size",
+        "reputation_query_limit",
+        "reputation_history_limit",
+        "reputation_profile_limit",
+        "trust_record_limit",
+        "trust_max_seconds",
         "screening_timeout_ms",
         "relaxed_active_block_threshold",
         "relaxed_confidence_threshold",

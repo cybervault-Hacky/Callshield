@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from .database import Database
+from ..database import Database
 
 
 REPUTATION_LEVELS = ("UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL")

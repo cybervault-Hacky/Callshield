@@ -1,4 +1,4 @@
-# CALLSHIELD Android Bridge — Phase 6
+# CALLSHIELD Android Bridge — Phase 7 Compatibility
 
 The Kotlin bridge connects Android `CallScreeningService` to the existing
 Termux daemon using a bounded filesystem `LocalSocket` only.
@@ -76,6 +76,13 @@ PHYSICAL DEVICE = NOT VERIFIED
 
 No APK or physical rejection result is claimed.
 
+## Phase 7 reputation context
+
+The daemon may include local reputation score, confidence, trend, and measured
+reasons as additional response fields. Android's ACTIVE safety decision remains
+based on the existing validated policy/action/mode/emergency fields; reputation
+alone cannot request rejection.
+
 ## Phase boundary
 
-Phase 7 has not started.
+Phase 8 has not started.

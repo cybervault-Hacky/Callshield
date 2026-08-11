@@ -16,6 +16,7 @@ from ..database import Database
 from ..detector import analyze_number
 from ..normalizer import normalize
 from ..policy import PolicyEngine
+from ..reputation import ReputationEngine
 from ..utils import InvalidNumberError, mask_number
 from .models import Event
 from .types import EVENT_TYPE_INCOMING_CALL, VALID_EVENT_TYPES
@@ -116,6 +117,23 @@ class EventProcessor:
                 "signals": analysis.signals,
             }
             if is_screening:
+                reputation_profile = ReputationEngine(database, self.cfg).calculate(
+                    normalized,
+                    analysis=analysis,
+                    persist=True,
+                )
+                reputation_data = reputation_profile.to_public_dict()
+                result["reputation_profile"] = reputation_data
+                result["detection"].update(
+                    {
+                        "trusted": reputation_profile.trusted,
+                        "reputation_profile": reputation_data,
+                        "reputation_error": not reputation_profile.available,
+                        "reputation_trend": reputation_profile.trend,
+                        "reputation_score": reputation_profile.risk_score,
+                        "reputation_confidence": reputation_profile.confidence,
+                    }
+                )
                 decision = PolicyEngine(self.cfg).decide(result["detection"])
                 decision_data = decision.to_dict()
                 latency_ms = _elapsed_ms(started)

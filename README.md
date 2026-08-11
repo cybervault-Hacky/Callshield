@@ -1,11 +1,11 @@
 # CALLSHIELD
 
-> **Hardened, local, explainable, fail-open call protection for Termux and Android.**
+> **Hardened, local-first reputation and explainable call intelligence for Termux and Android.**
 
-CALLSHIELD keeps analysis and persistence on-device. Phase 6 hardens the
-existing Phase 1–5 architecture against malformed IPC, replay, corrupt config
-or databases, stale runtime state, concurrent requests, resource exhaustion,
-and partial writes.
+CALLSHIELD keeps analysis, trust, history, and persistence on-device. Phase 7
+adds deterministic reputation profiles and measured explanations without cloud
+lookups, telemetry, accounts, advertising, or network reputation services.
+All Phase 6 hardening and Phase 1–5 call-protection behavior remains.
 
 ## Phase status
 
@@ -15,7 +15,8 @@ and partial writes.
 - Phase 4 — Android Screening Bridge: **COMPLETE**
 - Phase 5 — Active Call Protection: **COMPLETE**
 - Phase 6 — Hardening & Reliability: **COMPLETE**
-- Phase 7 — **NOT STARTED**
+- Phase 7 — Reputation & Explainable Intelligence: **COMPLETE**
+- Phase 8 — **NOT STARTED**
 
 ## Safety invariants
 
@@ -63,6 +64,68 @@ validated ALLOW/BLOCK → SQLite → health/metrics
 ```
 
 There is no TCP or HTTP server and no second IPC architecture.
+
+## Phase 7 reputation and explanations
+
+A dedicated `callshield/reputation/` layer reuses existing Phase 2 detector
+signals and bounded local history. It never performs a network lookup and never
+forces a BLOCK recommendation by itself.
+
+Profiles include:
+
+- masked number and canonical SHA-256 hash
+- first/last seen
+- calls seen, allowed, and confirmed rejected
+- block recommendations and local reports
+- deterministic score (0–100)
+- separate evidence confidence (0–100)
+- trend: `IMPROVING`, `STABLE`, `WORSENING`, or `UNKNOWN`
+- structured signals and reasons tied to actual measurements
+
+Risk labels are `TRUSTED`, `LOW`, `MODERATE`, `HIGH`, `CRITICAL`, and `UNKNOWN`.
+A single observation cannot establish a trend; at least three observations are
+required. CALLSHIELD does not claim short-call behavior because no call-duration
+telemetry exists.
+
+### Reputation CLI
+
+```bash
+callshield reputation
+callshield reputation +919876543210
+callshield reputation +919876543210 --json
+callshield reputation list
+```
+
+Human and JSON output expose masked identifiers only. Public JSON excludes the
+number hash and canonical plaintext number.
+
+### Local trust
+
+```bash
+callshield trust +919876543210
+callshield trust +919876543210 --for 24h
+callshield untrust +919876543210
+```
+
+Trust is explicit, local, reversible, bounded, and automatically expires.
+Trusted numbers are an ALLOW safety override and cannot be blocked by reputation
+alone. Whitelist and emergency-off remain higher-priority safety behavior.
+
+### Bounded storage
+
+Schema version 6 adds:
+
+- `reputation_profiles`
+- `reputation_history`
+- `trusted_numbers`
+
+These tables contain hashes and masked identifiers, not plaintext numbers.
+History defaults to 100 retained changes per number, recent calculations query
+at most 100 observations, profiles default to 5,000 retained entries, and trust
+defaults to 1,000 records with a maximum temporary duration of one year.
+
+If reputation storage is missing, corrupt, unavailable, or contradictory,
+policy receives `REPUTATION_UNAVAILABLE` and applies ALLOW.
 
 ## Phase 6 hardening
 
@@ -196,6 +259,8 @@ Checks:
 - Android Bridge
 - Screening
 - Policy
+- Reputation Database / Schema / Integrity
+- Trust Database
 - Storage
 
 Statuses are `HEALTHY`, `WARNING`, `ERROR`, and `NOT VERIFIED`.
@@ -217,8 +282,9 @@ callshield blocks inspect <id>
 ```
 
 Output contains only masked number, timestamp, risk, confidence, policy,
-recommendation, applied action, reason, and confirmation status. Plaintext
-numbers are not selected or displayed.
+recommendation, applied action, reason, and confirmation status. When captured
+at decision time it also shows reputation score, confidence, trend, and measured
+reasons. Plaintext numbers are not selected or displayed.
 
 ## Main CLI
 
@@ -229,6 +295,11 @@ callshield metrics
 callshield doctor
 callshield blocks
 callshield config show
+callshield reputation
+callshield reputation +919876543210 --json
+callshield reputation list
+callshield trust +919876543210 --for 24h
+callshield untrust +919876543210
 
 callshield daemon start
 callshield daemon status
@@ -279,23 +350,15 @@ is added. Physical integration remains deployment-specific and unverified.
 
 ```bash
 pytest -q
-# 271 passed
+# 332 passed
 ```
 
-All 220 Phase 1–5 tests remain. Fifty-one Phase 6 tests cover:
+All 271 Phase 1–6 tests remain. Sixty-one Phase 7 tests cover reputation
+scoring, explanations, bounded history, all trend states, separate confidence,
+CLI/JSON privacy, trust/expiry, policy fail-open behavior, schema/migration,
+retention limits, doctor integration, block snapshots, and concurrent lookups.
 
-- static security audit
-- strict IPC parsing and limits
-- replay and expiry
-- atomic config writes and SIGHUP fallback
-- database integrity/schema/lock/rollback behavior
-- resource bounds
-- policy fail-open safety
-- 5-request and 10-request concurrent IPC
-- doctor output/repair
-- masked block inspection
-
-See `SECURITY_AUDIT.md` for PASS versus NOT TESTED results.
+See `SECURITY_AUDIT.md` for Phase 6/7 PASS versus NOT TESTED results.
 
 ## Performance
 
@@ -310,6 +373,19 @@ A reproducible in-memory policy microbenchmark was run with 5,000 decisions and
 
 These are policy-only measurements, not Android, database, IPC, or physical
 call latency. See `PERFORMANCE_PHASE6.md` and `scripts/benchmark_phase6.py`.
+
+A separate bounded local reputation benchmark measured 1,000 lookups over 100
+indexed events:
+
+| Percentile | Latency |
+|---|---:|
+| p50 | 0.229418 ms |
+| p95 | 0.308114 ms |
+| p99 | 0.437614 ms |
+
+This is a sequential local SQLite/reputation lookup workload, not Android or
+end-to-end screening. See `PERFORMANCE_PHASE7.md` and
+`scripts/benchmark_phase7.py`.
 
 ## Installation
 
@@ -341,7 +417,7 @@ claimed.
 
 ## Phase boundary
 
-Phase 7 has not started. No Phase 7 functionality is included.
+Phase 8 has not started. No Phase 8 functionality is included.
 
 ## License
 

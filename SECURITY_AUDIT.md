@@ -1,7 +1,7 @@
 # CALLSHIELD Phase 6 Security Audit
 
 Date: 2026-08-11
-Scope: repository implementation through version 0.6.0
+Scope: repository implementation through version 0.7.0
 
 ## Results
 
@@ -25,6 +25,8 @@ Scope: repository implementation through version 0.6.0
 | Android decision validation | PASS | Source review/tests require valid ACTIVE + BLOCK + non-emergency + no policy error; all other states ALLOW |
 | Concurrent IPC | PASS | Automated 5-request, 10-request, and duplicate-race tests; daemon remains responsive |
 | Root requirement | PASS | Installation/runtime use user-owned paths and request no root operation |
+| Phase 7 reputation privacy | PASS | Package has no network imports; profile/history/trust storage uses masked identifiers and canonical SHA-256 hashes only |
+| Reputation fail-open | PASS | Unavailable/corrupt reputation marks policy unavailable and applies ALLOW; trust/whitelist remain overrides |
 
 ## Not tested
 

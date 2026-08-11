@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CALLSHIELD installer (Termux / Linux) — Phase 6.
+# CALLSHIELD installer (Termux / Linux) — Phase 7.
 #
 # - Verifies Python 3.8+
 # - Creates state directories under ~/.callshield (override with CALLSHIELD_HOME)
@@ -116,8 +116,10 @@ echo "  callshield screening status"
 echo "  callshield screening policy"
 echo "  callshield policy test"
 echo "  callshield doctor"
+echo "  callshield reputation +919876543210"
+echo "  callshield trust +919876543210 --for 24h"
 echo
 echo "Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls."
 echo "Phase 2 runs locally and offline. It does NOT intercept or reject"
 echo "live phone calls."
-echo "Phase 6 hardens IPC, replay protection, config/database integrity, diagnostics, and recovery. Safe defaults and fail-open behavior remain unchanged."
+echo "Phase 7 adds local reputation, measured explanations, bounded trends, and reversible trust. No cloud lookup, telemetry, or network service is used."

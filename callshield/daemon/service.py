@@ -1,8 +1,8 @@
 """Persistent CALLSHIELD service through Phase 4.
 
-Phase 4 reuses the hardened Phase 3 daemon and owner-only Unix IPC to provide
-an advisory Android screening bridge. Recommendations may be BLOCK, but every
-applied action returned by this service is ALLOW.
+Phase 5 reuses the hardened daemon and Unix IPC. It can return BLOCK only for
+an explicitly confirmed ACTIVE policy decision; every uncertainty and error
+still fails open to ALLOW.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from ..database import Database
 from ..events import EventQueue, EventProcessor
 from ..events.models import Event
 from ..events.types import EVENT_TYPE_INCOMING_CALL, SOURCE_ANDROID
+from ..policy import is_emergency_off, thresholds_for_config
 from ..utils import iso_now, mask_number, safe_write_text
 from .health import HealthMonitor
 from .heartbeat import Heartbeat
@@ -40,6 +41,7 @@ _ALLOWED_IPC_COMMANDS = {
     "event",
     "screening_status",
     "screening_config",
+    "screening_feedback",
     "stop",
     "ping",
 }
@@ -379,7 +381,9 @@ class DaemonService:
         # The Android wire contract is deliberately commandless and versioned:
         # protocol, request_id, number, source. It shares this same Unix socket
         # and does not introduce a second IPC mechanism.
-        if "protocol" in request or request.get("source") == SOURCE_ANDROID:
+        if "command" not in request and (
+            "protocol" in request or request.get("source") == SOURCE_ANDROID
+        ):
             return self._handle_screening_request(request)
 
         command = request.get("command")
@@ -393,25 +397,27 @@ class DaemonService:
         self._sync_runtime_metrics()
         snapshot = self.health.snapshot()
         persisted = self._database_screening_metrics()
-        for key in (
-            "incoming_calls",
-            "screened",
-            "screening_timeouts",
-            "bridge_errors",
-            "screening_high_risk",
-            "screening_allowed",
-            "screening_unknown",
-            "screening_block_recommended",
-        ):
-            persisted_key = "timeouts" if key == "screening_timeouts" else key
-            if key == "screening_high_risk":
-                persisted_key = "high_risk"
+        metric_keys = {
+            "incoming_calls": "incoming_calls",
+            "screened": "screened",
+            "screening_timeouts": "timeouts",
+            "bridge_errors": "bridge_errors",
+            "policy_errors": "policy_errors",
+            "screening_high_risk": "high_risk",
+            "screening_allowed": "screening_allowed",
+            "screening_unknown": "screening_unknown",
+            "screening_block_recommended": "screening_block_recommended",
+            "screening_blocked": "screening_blocked",
+            "actually_rejected": "actually_rejected",
+        }
+        for key, persisted_key in metric_keys.items():
             snapshot[key] = max(
                 int(snapshot.get(key, 0)), int(persisted.get(persisted_key, 0))
             )
-        snapshot["screening_blocked"] = 0
-        snapshot["screening_mode"] = "DRY_RUN"
+        snapshot["screening_mode"] = self.cfg.screening_mode
         snapshot["screening_enabled"] = bool(self.cfg.screening_enabled)
+        snapshot["screening_policy"] = self.cfg.screening_policy
+        snapshot["emergency_off"] = is_emergency_off(self.cfg)
         return snapshot
 
     def _database_screening_metrics(self) -> Dict[str, int]:
@@ -471,37 +477,68 @@ class DaemonService:
                 }
             if command == "screening_status":
                 metrics = self._database_screening_metrics()
+                thresholds = thresholds_for_config(self.cfg)
+                emergency = is_emergency_off(self.cfg)
+                auto_reject = (
+                    self.cfg.screening_enabled
+                    and self.cfg.screening_mode == "ACTIVE"
+                    and self.cfg.active_mode_confirmed
+                    and not emergency
+                )
                 return {
                     "status": "ok",
                     "data": {
                         "bridge": "CONNECTED",
                         "daemon": "RUNNING",
                         "android": "NOT VERIFIED",
-                        "mode": "DRY_RUN",
+                        "mode": self.cfg.screening_mode,
+                        "policy": self.cfg.screening_policy,
+                        "active_threshold": thresholds.active_block,
+                        "confidence_threshold": thresholds.confidence,
                         "timeout_ms": int(self.cfg.screening_timeout_ms),
                         "live_screening": (
                             "IPC READY" if self.cfg.screening_enabled else "DISABLED"
                         ),
-                        "auto_reject": "DISABLED",
-                        "actually_rejected": 0,
+                        "auto_reject": "ENABLED" if auto_reject else "DISABLED",
+                        "actually_rejected": int(metrics.get("actually_rejected", 0)),
+                        "applied_blocks": int(metrics.get("screening_blocked", 0)),
+                        "block_recommendations": int(
+                            metrics.get("screening_block_recommended", 0)
+                        ),
+                        "emergency_off": emergency,
                         "screening_enabled": bool(self.cfg.screening_enabled),
                         "screened": int(metrics.get("screened", 0)),
                     },
                 }
             if command == "screening_config":
-                enabled = request.get("enabled")
-                if not isinstance(enabled, bool):
-                    return {
-                        "status": "error",
-                        "error": "enabled must be a boolean",
-                    }
-                self.cfg.screening_enabled = enabled
-                self.processor.cfg.screening_enabled = enabled
+                self._reload_config()
                 return {
                     "status": "ok",
-                    "screening_enabled": enabled,
-                    "mode": "DRY_RUN",
+                    "screening_enabled": bool(self.cfg.screening_enabled),
+                    "mode": self.cfg.screening_mode,
+                    "policy": self.cfg.screening_policy,
+                    "emergency_off": is_emergency_off(self.cfg),
                 }
+            if command == "screening_feedback":
+                request_id = request.get("request_id")
+                if (
+                    request.get("protocol") != "callshield/1"
+                    or request.get("source") != SOURCE_ANDROID
+                    or request.get("result") != "REJECTED"
+                    or not isinstance(request_id, str)
+                    or not _is_uuid(request_id)
+                ):
+                    return {"status": "error", "error": "Invalid screening feedback"}
+                database = Database(self.cfg.database_path, timeout=0.2)
+                try:
+                    confirmed = database.confirm_screening_rejection(
+                        request_id, iso_now()
+                    )
+                finally:
+                    database.close()
+                if confirmed:
+                    self.health.confirm_actual_rejection()
+                return {"status": "ok", "confirmed": confirmed}
             if command == "event":
                 return self._accept_event(request)
             if command == "stop":
@@ -658,15 +695,16 @@ class DaemonService:
                 bridge_error=True,
             )
 
-        recommendation = str(detection.get("recommended_action") or "UNKNOWN")
-        if recommendation not in ("ALLOW", "BLOCK", "UNKNOWN"):
-            recommendation = "UNKNOWN"
+        policy = processed.get("policy") or screening
+        recommendation = str(policy.get("recommended_action") or "ALLOW")
+        if recommendation not in ("ALLOW", "BLOCK"):
+            recommendation = "ALLOW"
+        applied = str(policy.get("applied_action") or "ALLOW")
+        mode = str(policy.get("mode") or "DRY_RUN")
         verdict = str(detection.get("verdict") or "UNKNOWN")
         if verdict not in ("SAFE", "UNKNOWN", "SUSPICIOUS", "HIGH_RISK", "MALICIOUS"):
             verdict = "UNKNOWN"
-        reason = str(
-            screening.get("reason") or detection.get("reason") or "DRY_RUN"
-        )[:500]
+        reason = str(policy.get("reason") or "POLICY_ERROR")[:500]
         response = {
             "protocol": "callshield/1",
             "request_id": request_id,
@@ -674,10 +712,17 @@ class DaemonService:
             "confidence": max(0, min(100, int(detection.get("confidence", 0)))),
             "verdict": verdict,
             "recommended_action": recommendation,
-            "applied_action": "ALLOW",
-            "mode": "DRY_RUN",
-            "reason": "DRY_RUN" if recommendation == "BLOCK" else reason,
+            "applied_action": applied,
+            "mode": mode,
+            "reason": reason,
             "latency_ms": _elapsed_ms(started),
+            "policy_name": str(policy.get("policy_name") or "BALANCED"),
+            "threshold": int(policy.get("threshold", 100)),
+            "confidence_threshold": int(
+                policy.get("confidence_threshold", 100)
+            ),
+            "emergency_off": bool(policy.get("emergency_off", False)),
+            "policy_error": bool(policy.get("policy_error", False)),
         }
         normalized_number = str(detection.get("number") or number)
         return self._finalize_screening(response, normalized_number)
@@ -697,6 +742,11 @@ class DaemonService:
             "mode": "DRY_RUN",
             "reason": str(reason)[:500],
             "latency_ms": max(0, int(latency_ms)),
+            "policy_name": "BALANCED",
+            "threshold": 100,
+            "confidence_threshold": 100,
+            "emergency_off": True,
+            "policy_error": False,
         }
 
     def _finalize_screening(
@@ -707,17 +757,42 @@ class DaemonService:
         failed: bool = False,
         bridge_error: bool = False,
     ) -> Dict[str, Any]:
-        # Enforce the Phase 4 invariant again at the final response boundary.
-        response["applied_action"] = "ALLOW"
-        response["mode"] = "DRY_RUN"
+        # Revalidate active application at the final response boundary. Any
+        # mismatch or emergency state fails open even if an upstream object
+        # accidentally requested BLOCK.
+        applied = str(response.get("applied_action", "ALLOW"))
+        mode = str(response.get("mode", "DRY_RUN"))
+        recommendation = str(response.get("recommended_action", "ALLOW"))
+        emergency = is_emergency_off(self.cfg)
+        active_is_valid = (
+            applied == "BLOCK"
+            and recommendation == "BLOCK"
+            and mode == "ACTIVE"
+            and self.cfg.screening_enabled
+            and self.cfg.screening_mode == "ACTIVE"
+            and self.cfg.active_mode_confirmed
+            and not emergency
+        )
+        if applied == "BLOCK" and not active_is_valid:
+            response["applied_action"] = "ALLOW"
+            response["reason"] = "SAFETY_FALLBACK"
+            response["policy_error"] = True
+        elif applied not in ("ALLOW", "BLOCK") or mode not in ("DRY_RUN", "ACTIVE"):
+            response["applied_action"] = "ALLOW"
+            response["mode"] = "DRY_RUN"
+            response["reason"] = "INVALID_POLICY_DECISION"
+            response["policy_error"] = True
+        response["emergency_off"] = emergency
         persisted = self._persist_screening_result(number, response)
         if not persisted:
             bridge_error = True
         self.health.record_screening(
             verdict=str(response.get("verdict", "UNKNOWN")),
             recommended_action=str(response.get("recommended_action", "ALLOW")),
+            applied_action=str(response.get("applied_action", "ALLOW")),
             reason=str(response.get("reason", "UNKNOWN")),
             bridge_error=bridge_error,
+            policy_error=bool(response.get("policy_error", False)),
         )
         if failed:
             self.health.inc_failed(error=str(response.get("reason", "SCREENING_ERROR")))
@@ -728,11 +803,14 @@ class DaemonService:
             )
         try:
             self.logger.info(
-                "screening request=%s number=%s verdict=%s recommended=%s applied=ALLOW reason=%s latency=%sms",
+                "screening request=%s number=%s verdict=%s recommended=%s applied=%s mode=%s policy=%s reason=%s latency=%sms",
                 response.get("request_id"),
                 mask_number(number),
                 response.get("verdict"),
                 response.get("recommended_action"),
+                response.get("applied_action"),
+                response.get("mode"),
+                response.get("policy_name"),
                 response.get("reason"),
                 response.get("latency_ms"),
             )
@@ -758,11 +836,20 @@ class DaemonService:
                 recommended_action=str(
                     response.get("recommended_action", "ALLOW")
                 ),
-                applied_action="ALLOW",
+                applied_action=str(response.get("applied_action", "ALLOW")),
                 reason=str(response.get("reason", "UNKNOWN")),
                 latency_ms=int(response.get("latency_ms", 0)),
                 source=SOURCE_ANDROID,
                 event_id=str(response.get("request_id", "")),
+                mode=str(response.get("mode", "DRY_RUN")),
+                policy_action=str(response.get("recommended_action", "ALLOW")),
+                policy_name=str(response.get("policy_name", "BALANCED")),
+                threshold=int(response.get("threshold", 100)),
+                confidence_threshold=int(
+                    response.get("confidence_threshold", 100)
+                ),
+                policy_reason=str(response.get("reason", "UNKNOWN")),
+                emergency_off=bool(response.get("emergency_off", False)),
             )
             return True
         except Exception as exc:

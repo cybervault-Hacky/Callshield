@@ -39,6 +39,15 @@ from .intelligence import analyze_behavior, number_intelligence
 from .intelligence.profiles import PROFILES, get_profile
 from .logger import log_error, log_info
 from .normalizer import normalize
+from .policy import (
+    DEFAULT_POLICIES,
+    PolicyEngine,
+    PolicyError,
+    enable_emergency_off,
+    is_emergency_off,
+    reset_emergency_off,
+    thresholds_for_config,
+)
 from .utils import (
     EXIT_DAEMON,
     EXIT_DATABASE,
@@ -58,7 +67,7 @@ from .utils import (
 
 _BANNER = "CALLSHIELD"
 _TAGLINE = "Fraud Protection Engine"
-_PHASE = "Phase 4 — Android Screening Bridge"
+_PHASE = "Phase 5 — Active Call Protection"
 _PHASE_COMPAT = "Phase 1 — Foundation"
 
 
@@ -240,6 +249,8 @@ def _screening_database_metrics(cfg: Config) -> Dict[str, int]:
             "screening_unknown": 0,
             "screening_block_recommended": 0,
             "screening_blocked": 0,
+            "actually_rejected": 0,
+            "policy_errors": 0,
         }
     finally:
         if database is not None:
@@ -274,8 +285,9 @@ def build_parser() -> argparse.ArgumentParser:
             Phase 2 analyzes phone-number risk locally. It does NOT yet
             intercept or reject live phone calls.
             Phase 3 provides the persistent background infrastructure.
-            Phase 4 connects an Android screening bridge in DRY_RUN mode.
-            Recommendations may be BLOCK; the applied action is always ALLOW.
+            Phase 4 connects the Android screening bridge.
+            Phase 5 adds explicitly confirmed ACTIVE protection. Fresh installs
+            remain disabled and DRY_RUN; all uncertainty fails open to ALLOW.
             """
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -406,14 +418,32 @@ def build_parser() -> argparse.ArgumentParser:
     s_screening = sub.add_parser("screening", help="Android screening bridge.")
     s_screening_sub = s_screening.add_subparsers(dest="screening_cmd")
     s_screening_sub.add_parser("status", help="Show local bridge readiness.")
-    s_screening_sub.add_parser("enable", help="Enable dry-run screening.")
+    s_screening_sub.add_parser("enable", help="Enable screening in DRY_RUN mode.")
     s_screening_sub.add_parser("disable", help="Disable screening requests.")
     s_screening_mode = s_screening_sub.add_parser(
-        "mode", help="Show or request the screening mode."
+        "mode", help="Show or set DRY_RUN/ACTIVE mode."
     )
-    s_screening_mode.add_argument("mode", nargs="?", help="DRY_RUN only.")
+    s_screening_mode.add_argument("mode", nargs="?", help="dry-run or active")
     s_screening_sub.add_parser("health", help="Show screening health.")
     s_screening_sub.add_parser("metrics", help="Show screening metrics.")
+    s_screening_policy = s_screening_sub.add_parser(
+        "policy", help="Show or select the active policy."
+    )
+    s_screening_policy.add_argument("policy", nargs="?", help="RELAXED, BALANCED, or STRICT")
+
+    sub.add_parser("emergency-off", help="Immediately force all screening decisions to ALLOW.")
+    sub.add_parser("emergency-reset", help="Reset emergency-off without enabling ACTIVE mode.")
+
+    s_policy = sub.add_parser("policy", help="Safe policy simulation.")
+    s_policy_sub = s_policy.add_subparsers(dest="policy_cmd")
+    s_policy_test = s_policy_sub.add_parser("test", help="Simulate a policy decision only.")
+    s_policy_test.add_argument("--risk", type=int, default=95)
+    s_policy_test.add_argument("--confidence", type=int, default=95)
+    s_policy_test.add_argument("--mode", default="dry-run")
+    s_policy_test.add_argument("--policy", default=None)
+    s_policy_test.add_argument("--whitelist", action="store_true")
+    s_policy_test.add_argument("--emergency-off", action="store_true")
+    s_policy_test.add_argument("--disabled", action="store_true")
 
     return p
 
@@ -550,10 +580,13 @@ def _do_status_once(ui: _UI, cfg: Config) -> int:
     print()
     if ipc_data is not None:
         print("Screening:")
-        print("  Mode:               DRY_RUN")
-        print(f"  Incoming Calls:     {_safe_metric_int(ipc_data.get('incoming_calls'))}")
+        print(f"  Enabled:            {'YES' if ipc_data.get('screening_enabled') else 'NO'}")
+        print(f"  Mode:               {ipc_data.get('screening_mode', cfg.screening_mode)}")
+        print(f"  Policy:             {ipc_data.get('screening_policy', cfg.screening_policy)}")
+        print(f"  Emergency Off:      {'YES' if ipc_data.get('emergency_off') else 'NO'}")
         print(f"  Block Recommended:  {_safe_metric_int(ipc_data.get('screening_block_recommended'))}")
-        print("  Actually Rejected:  0")
+        print(f"  Applied Blocks:     {_safe_metric_int(ipc_data.get('screening_blocked'))}")
+        print(f"  Actually Rejected:  {_safe_metric_int(ipc_data.get('actually_rejected'))}")
         print(f"Call Screening: {ui.green}IPC READY{ui.reset} — DEVICE NOT VERIFIED")
     else:
         print(f"Call Screening: {ui.dim}NOT CONNECTED{ui.reset}")
@@ -1025,9 +1058,11 @@ def _cmd_config(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
             ("Socket", cfg.socket_path),
             ("Daemon Log", cfg.daemon_log_file),
             ("Screening", "ENABLED" if cfg.screening_enabled else "DISABLED"),
-            ("Screening Mode", "DRY_RUN"),
+            ("Screening Mode", cfg.screening_mode),
+            ("Screening Policy", cfg.screening_policy),
             ("Screening Timeout", f"{cfg.screening_timeout_ms}ms"),
-            ("Auto Reject", "DISABLED"),
+            ("Emergency Off", "YES" if is_emergency_off(cfg) else "NO"),
+            ("Auto Reject", "ENABLED" if (cfg.screening_enabled and cfg.screening_mode == "ACTIVE" and cfg.active_mode_confirmed and not is_emergency_off(cfg)) else "DISABLED"),
         ]
         label_w = max(len(k) for k, _ in rows)
         for k, v in rows:
@@ -1159,12 +1194,11 @@ def _cmd_start(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     print(f"Queue:     0/{cfg.event_queue_size}")
     print(f"Profile:   {cfg.protection_mode}")
     print()
-    print(f"Call Screening: {ui.green}IPC READY{ui.reset} (DRY_RUN; device not verified)")
-    print(
-        ui.dim
-        + "Screening recommendations are advisory. Every applied action is ALLOW; automatic rejection is disabled."
-        + ui.reset
-    )
+    print(f"Call Screening: {ui.green}IPC READY{ui.reset} ({cfg.screening_mode}; device not verified)")
+    if cfg.screening_mode == "ACTIVE" and cfg.screening_enabled:
+        print(ui.red + "ACTIVE PROTECTION — policy-qualified calls may be rejected." + ui.reset)
+    else:
+        print(ui.dim + "Active rejection is disabled unless explicitly confirmed." + ui.reset)
     return EXIT_OK
 
 def _cmd_stop(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
@@ -1256,7 +1290,9 @@ def _cmd_metrics(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
         print(f"Screening Allowed    {_safe_metric_int(data.get('screening_allowed'))}")
         print(f"Screening Unknown    {_safe_metric_int(data.get('screening_unknown'))}")
         print(f"Block Recommended    {_safe_metric_int(data.get('screening_block_recommended'))}")
-        print("Actually Rejected    0")
+        print(f"Screening Blocked    {_safe_metric_int(data.get('screening_blocked'))}")
+        print(f"Actually Rejected    {_safe_metric_int(data.get('actually_rejected'))}")
+        print(f"Policy Errors        {_safe_metric_int(data.get('policy_errors'))}")
     else:
         persisted = _database_metrics(cfg)
         saved = _saved_daemon_metrics(cfg)
@@ -1294,11 +1330,13 @@ def _cmd_metrics(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
         print(f"Screening Allowed    {max(_safe_metric_int(screening.get('screening_allowed')), _safe_metric_int(saved.get('screening_allowed')))}")
         print(f"Screening Unknown    {max(_safe_metric_int(screening.get('screening_unknown')), _safe_metric_int(saved.get('screening_unknown')))}")
         print(f"Block Recommended    {max(_safe_metric_int(screening.get('screening_block_recommended')), _safe_metric_int(saved.get('screening_block_recommended')))}")
-        print("Actually Rejected    0")
+        print(f"Screening Blocked    {max(_safe_metric_int(screening.get('screening_blocked')), _safe_metric_int(saved.get('screening_blocked')))}")
+        print(f"Actually Rejected    {max(_safe_metric_int(screening.get('actually_rejected')), _safe_metric_int(saved.get('actually_rejected')))}")
+        print(f"Policy Errors        {max(_safe_metric_int(screening.get('policy_errors')), _safe_metric_int(saved.get('policy_errors')))}")
         if state == "RUNNING":
             print("IPC                   unavailable (safe persisted fallback)")
     if state == "RUNNING" and response:
-        print(f"Call Screening:      {ui.green}IPC READY{ui.reset} (DRY_RUN)")
+        print(f"Call Screening:      {ui.green}IPC READY{ui.reset} ({cfg.screening_mode})")
     else:
         print(f"Call Screening:      {ui.dim}NOT CONNECTED{ui.reset}")
     return EXIT_OK
@@ -1350,7 +1388,7 @@ def _cmd_daemon_info(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
         print(f"Run Dir         {cfg.run_dir}")
     print()
     if state == "RUNNING":
-        print(f"Call Screening: {ui.green}IPC READY{ui.reset} (DRY_RUN; device not verified)")
+        print(f"Call Screening: {ui.green}IPC READY{ui.reset} ({cfg.screening_mode}; device not verified)")
     else:
         print(f"Call Screening: {ui.dim}NOT CONNECTED{ui.reset}")
     return EXIT_OK
@@ -1381,8 +1419,10 @@ def _cmd_daemon_health(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
         print(f"Memory          {data.get('memory_kb') or 'unknown'} kB")
         print(f"Screened        {_safe_metric_int(data.get('screened'))}")
         print(f"Screening Errors {_safe_metric_int(data.get('bridge_errors'))}")
-        print("Screening Blocked 0")
-        print(f"Call Screening: {ui.green}IPC READY{ui.reset} (DRY_RUN; device not verified)")
+        print(f"Policy Errors   {_safe_metric_int(data.get('policy_errors'))}")
+        print(f"Screening Blocked {_safe_metric_int(data.get('screening_blocked'))}")
+        print(f"Actually Rejected {_safe_metric_int(data.get('actually_rejected'))}")
+        print(f"Call Screening: {ui.green}IPC READY{ui.reset} ({cfg.screening_mode}; device not verified)")
     else:
         print(f"Daemon          RUNNING (IPC unavailable)")
         print(f"PID             {pid}")
@@ -1428,50 +1468,128 @@ def _cmd_event(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     return EXIT_USAGE
 
 
+def _notify_screening_reload(cfg: Config) -> None:
+    state, _ = daemon_status(cfg)
+    if state == "RUNNING":
+        _ipc_request(cfg, {"command": "screening_config"})
+
+
 def _cmd_screening(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     command = getattr(args, "screening_cmd", None)
     if command in (None, "status"):
         return _cmd_screening_status(ui, cfg)
-    if command in ("enable", "disable"):
-        enabled = command == "enable"
-        cfg.screening_enabled = enabled
+    if command == "enable":
+        # Generic enable is deliberately DRY_RUN. ACTIVE has a separate
+        # confirmation path and cannot be resumed accidentally.
+        cfg.screening_enabled = True
         cfg.screening_mode = "DRY_RUN"
+        cfg.active_mode_confirmed = False
         save_config(cfg)
-        state, _ = daemon_status(cfg)
-        if state == "RUNNING":
-            _ipc_request(
-                cfg,
-                {"command": "screening_config", "enabled": enabled},
-            )
+        _notify_screening_reload(cfg)
         _header(ui, "CALLSHIELD SCREENING")
-        print(f"Screening:           {'ENABLED' if enabled else 'DISABLED'}")
+        print("Screening Enabled:   YES")
         print("Mode:                DRY_RUN")
         print("Auto Reject:         DISABLED")
-        print("Actually Rejected:   0")
+        return EXIT_OK
+    if command == "disable":
+        cfg.screening_enabled = False
+        cfg.screening_mode = "DRY_RUN"
+        cfg.active_mode_confirmed = False
+        save_config(cfg)
+        _notify_screening_reload(cfg)
+        _header(ui, "CALLSHIELD SCREENING")
+        print("Screening Enabled:   NO")
+        print("Mode:                DRY_RUN")
+        print("Auto Reject:         DISABLED")
         return EXIT_OK
     if command == "mode":
         requested = getattr(args, "mode", None)
-        if requested is not None and requested.upper().replace("-", "_") != "DRY_RUN":
-            _print_error(
-                ui,
-                "Phase 4 supports DRY_RUN only; every applied action remains ALLOW.",
-            )
-            return EXIT_USAGE
-        cfg.screening_mode = "DRY_RUN"
-        if requested is not None:
+        if requested is None:
+            return _cmd_screening_mode(ui, cfg)
+        normalized = requested.upper().replace("-", "_")
+        if normalized == "DRY_RUN":
+            cfg.screening_mode = "DRY_RUN"
+            cfg.active_mode_confirmed = False
             save_config(cfg)
-        _header(ui, "CALLSHIELD SCREENING MODE")
-        print("Mode:                DRY_RUN")
-        print(f"Timeout:             {cfg.screening_timeout_ms} ms")
-        print("Auto Reject:         DISABLED")
-        print("Actually Rejected:   0")
+            _notify_screening_reload(cfg)
+            return _cmd_screening_mode(ui, cfg)
+        if normalized != "ACTIVE":
+            _print_error(ui, "Mode must be dry-run or active.")
+            return EXIT_USAGE
+        if is_emergency_off(cfg):
+            _print_error(ui, "Emergency-off is active. Reset it before requesting ACTIVE mode.")
+            return EXIT_USAGE
+        try:
+            answer = input("Enable ACTIVE call protection? [y/N] ")
+        except (EOFError, KeyboardInterrupt, OSError):
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            print("ACTIVE protection was not enabled.")
+            return EXIT_OK
+        cfg.screening_enabled = True
+        cfg.screening_mode = "ACTIVE"
+        cfg.active_mode_confirmed = True
+        save_config(cfg)
+        _notify_screening_reload(cfg)
+        _header(ui, "ACTIVE PROTECTION")
+        print(f"{ui.red}ACTIVE PROTECTION{ui.reset}")
+        print("Calls meeting the configured policy may be rejected.")
+        print(f"Policy:              {cfg.screening_policy}")
         return EXIT_OK
+    if command == "policy":
+        requested_policy = getattr(args, "policy", None)
+        if requested_policy is not None:
+            normalized_policy = requested_policy.upper()
+            if normalized_policy not in DEFAULT_POLICIES:
+                _print_error(ui, "Policy must be RELAXED, BALANCED, or STRICT.")
+                return EXIT_USAGE
+            cfg.screening_policy = normalized_policy
+            save_config(cfg)
+            _notify_screening_reload(cfg)
+        return _cmd_screening_policy(ui, cfg)
     if command == "health":
         return _cmd_screening_health(ui, cfg)
     if command == "metrics":
         return _cmd_screening_metrics(ui, cfg)
     _print_error(ui, "Unknown screening subcommand.")
     return EXIT_USAGE
+
+
+def _cmd_screening_mode(ui: _UI, cfg: Config) -> int:
+    _header(ui, "CALLSHIELD SCREENING MODE")
+    emergency = is_emergency_off(cfg)
+    auto_reject = (
+        cfg.screening_enabled
+        and cfg.screening_mode == "ACTIVE"
+        and cfg.active_mode_confirmed
+        and not emergency
+    )
+    print(f"Screening Enabled:   {'YES' if cfg.screening_enabled else 'NO'}")
+    print(f"Mode:                {cfg.screening_mode}")
+    print(f"Policy:              {cfg.screening_policy}")
+    print(f"Emergency Off:       {'YES' if emergency else 'NO'}")
+    print(f"Auto Reject:         {'ENABLED' if auto_reject else 'DISABLED'}")
+    if auto_reject:
+        print()
+        print(f"{ui.red}ACTIVE PROTECTION{ui.reset}")
+        print("Calls meeting the configured policy may be rejected.")
+    return EXIT_OK
+
+
+def _cmd_screening_policy(ui: _UI, cfg: Config) -> int:
+    _header(ui, "CALLSHIELD SCREENING POLICY")
+    for name in ("RELAXED", "BALANCED", "STRICT"):
+        defaults = DEFAULT_POLICIES[name]
+        selected = "  (CURRENT)" if name == cfg.screening_policy else ""
+        print(f"{name}{selected}")
+        print(
+            f"  active block: {getattr(cfg, name.lower() + '_active_block_threshold', defaults.active_block)}"
+        )
+        print(
+            f"  confidence:   {getattr(cfg, name.lower() + '_confidence_threshold', defaults.confidence)}"
+        )
+        print()
+    return EXIT_OK
 
 
 def _cmd_screening_status(ui: _UI, cfg: Config) -> int:
@@ -1484,25 +1602,60 @@ def _cmd_screening_status(ui: _UI, cfg: Config) -> int:
     )
     connected = bool(response and response.get("status") == "ok")
     data = response.get("data", {}) if connected else {}
+    persisted = _screening_database_metrics(cfg)
+    emergency = bool(data.get("emergency_off", is_emergency_off(cfg)))
     enabled = bool(data.get("screening_enabled", cfg.screening_enabled))
+    mode = str(data.get("mode", cfg.screening_mode))
+    policy = str(data.get("policy", cfg.screening_policy))
+    try:
+        thresholds = thresholds_for_config(cfg, policy)
+        active_threshold = int(data.get("active_threshold", thresholds.active_block))
+        confidence_threshold = int(
+            data.get("confidence_threshold", thresholds.confidence)
+        )
+    except Exception:
+        active_threshold = 100
+        confidence_threshold = 100
+    auto_reject = bool(
+        enabled
+        and mode == "ACTIVE"
+        and cfg.active_mode_confirmed
+        and not emergency
+        and connected
+    )
+    actual = max(
+        _safe_metric_int(data.get("actually_rejected")),
+        _safe_metric_int(persisted.get("actually_rejected")),
+    )
+    applied = max(
+        _safe_metric_int(data.get("applied_blocks")),
+        _safe_metric_int(persisted.get("screening_blocked")),
+    )
+    recommended = max(
+        _safe_metric_int(data.get("block_recommendations")),
+        _safe_metric_int(persisted.get("screening_block_recommended")),
+    )
     print(f"Bridge:              {'CONNECTED' if connected else 'NOT CONNECTED'}")
     print(f"Daemon:              {state}")
     print("Android:             NOT VERIFIED")
-    print("Mode:                DRY_RUN")
-    print(f"Timeout:             {cfg.screening_timeout_ms} ms")
-    if not enabled:
-        live = "DISABLED"
-    elif connected:
-        live = "IPC READY — DEVICE NOT VERIFIED"
-    else:
-        live = "NOT READY"
-    print(f"Live Screening:      {live}")
-    print("Auto Reject:         DISABLED")
-    print("Actually Rejected:   0")
+    print(f"Screening Enabled:   {'YES' if enabled else 'NO'}")
+    print(f"Mode:                {mode}")
+    print(f"Policy:              {policy}")
+    print(f"Active Threshold:    {active_threshold}")
+    print(f"Confidence Threshold:{confidence_threshold:>5}")
+    print(f"Emergency Off:       {'YES' if emergency else 'NO'}")
+    print(f"Block Recommended:   {recommended}")
+    print(f"Applied Blocks:      {applied}")
+    print(f"Actually Rejected:   {actual}")
+    print(f"Auto Reject:         {'ENABLED' if auto_reject else 'DISABLED'}")
+    if auto_reject:
+        print()
+        print(f"{ui.red}ACTIVE PROTECTION{ui.reset}")
+        print("Calls meeting the configured policy may be rejected.")
     print()
     print(
         ui.dim
-        + "CONNECTED means the local daemon Unix socket responded; it does not verify an Android device or granted screening role."
+        + "CONNECTED means local daemon IPC only; Android/device readiness is not verified."
         + ui.reset
     )
     return EXIT_OK
@@ -1519,13 +1672,16 @@ def _cmd_screening_health(ui: _UI, cfg: Config) -> int:
     print(f"Bridge:              {'CONNECTED' if connected else 'NOT CONNECTED'}")
     print(f"Daemon:              {state}")
     print("Android:             NOT VERIFIED")
-    print("Mode:                DRY_RUN")
-    print(f"Incoming Calls:      {_safe_metric_int(data.get('incoming_calls'))}")
-    print(f"Screened:            {_safe_metric_int(data.get('screened'))}")
+    print(f"Screening:           {'ENABLED' if cfg.screening_enabled else 'DISABLED'}")
+    print(f"Mode:                {cfg.screening_mode}")
+    print(f"Policy:              {cfg.screening_policy}")
+    print(f"Last Screening:      {data.get('last_screening') or 'unavailable'}")
+    print(f"Block Recommendations:{_safe_metric_int(data.get('screening_block_recommended')):>4}")
+    print(f"Applied Blocks:      {_safe_metric_int(data.get('screening_blocked'))}")
+    print(f"Actually Rejected:   {_safe_metric_int(data.get('actually_rejected'))}")
+    print(f"Policy Errors:       {_safe_metric_int(data.get('policy_errors'))}")
     print(f"Timeouts:            {_safe_metric_int(data.get('screening_timeouts'))}")
-    print(f"Bridge Errors:       {_safe_metric_int(data.get('bridge_errors'))}")
-    print("Screening Blocked:   0")
-    print("Auto Reject:         DISABLED")
+    print(f"Emergency Off:       {'YES' if is_emergency_off(cfg) else 'NO'}")
     return EXIT_OK
 
 
@@ -1550,18 +1706,106 @@ def _cmd_screening_metrics(ui: _UI, cfg: Config) -> int:
 
     print(f"Incoming Calls:      {value('incoming_calls', 'incoming_calls')}")
     print(f"Screened:            {value('screened', 'screened')}")
-    print(f"Timeouts:            {value('screening_timeouts', 'timeouts')}")
-    print(f"Bridge Errors:       {value('bridge_errors', 'bridge_errors')}")
-    print(f"High Risk:           {value('screening_high_risk', 'high_risk')}")
-    print(f"Screening Allowed:   {value('screening_allowed', 'screening_allowed')}")
-    print(f"Screening Unknown:   {value('screening_unknown', 'screening_unknown')}")
+    print(f"Allowed:             {value('screening_allowed', 'screening_allowed')}")
+    print(f"Unknown:             {value('screening_unknown', 'screening_unknown')}")
     print(
         f"Block Recommended:   {value('screening_block_recommended', 'screening_block_recommended')}"
     )
-    print("Screening Blocked:   0")
-    print("Actually Rejected:   0")
+    print(f"Screening Blocked:   {value('screening_blocked', 'screening_blocked')}")
+    print(f"Actually Rejected:   {value('actually_rejected', 'actually_rejected')}")
+    print(f"Policy Errors:       {value('policy_errors', 'policy_errors')}")
+    print(f"Timeouts:            {value('screening_timeouts', 'timeouts')}")
+    print(f"Bridge Errors:       {value('bridge_errors', 'bridge_errors')}")
+    print(f"Mode:                {cfg.screening_mode}")
+    print(f"Policy:              {cfg.screening_policy}")
+    print(f"Emergency Off:       {'YES' if is_emergency_off(cfg) else 'NO'}")
+    return EXIT_OK
+
+
+def _cmd_emergency_off(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    try:
+        created = enable_emergency_off(cfg)
+        # Persist a disabled DRY_RUN state so emergency-reset never resumes
+        # active protection as a side effect.
+        cfg.screening_enabled = False
+        cfg.screening_mode = "DRY_RUN"
+        cfg.active_mode_confirmed = False
+        save_config(cfg)
+        _notify_screening_reload(cfg)
+    except (PolicyError, OSError) as exc:
+        _print_error(ui, str(exc))
+        return EXIT_GENERAL
+    _header(ui, "CALLSHIELD EMERGENCY OFF")
+    print("Emergency Off:       ENABLED")
+    print("All calls will be allowed.")
+    print("Screening Enabled:   NO")
     print("Mode:                DRY_RUN")
-    print("Auto Reject:         DISABLED")
+    print("State:               created" if created else "State:               already enabled")
+    return EXIT_OK
+
+
+def _cmd_emergency_reset(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    try:
+        removed = reset_emergency_off(cfg)
+        cfg.screening_enabled = False
+        cfg.screening_mode = "DRY_RUN"
+        cfg.active_mode_confirmed = False
+        save_config(cfg)
+        _notify_screening_reload(cfg)
+    except (PolicyError, OSError) as exc:
+        _print_error(ui, str(exc))
+        return EXIT_GENERAL
+    _header(ui, "CALLSHIELD EMERGENCY RESET")
+    print("Emergency Off:       RESET")
+    print(f"State:               {'removed' if removed else 'already reset'}")
+    print(f"Screening Enabled:   {'YES' if cfg.screening_enabled else 'NO'}")
+    print(f"Mode:                {cfg.screening_mode}")
+    print("ACTIVE protection was not enabled by this command.")
+    return EXIT_OK
+
+
+def _cmd_policy(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    if getattr(args, "policy_cmd", None) != "test":
+        _print_error(ui, "Use `callshield policy test`.")
+        return EXIT_USAGE
+    risk = getattr(args, "risk", 95)
+    confidence = getattr(args, "confidence", 95)
+    if not (0 <= risk <= 100 and 0 <= confidence <= 100):
+        _print_error(ui, "Risk and confidence must be between 0 and 100.")
+        return EXIT_USAGE
+    mode = str(getattr(args, "mode", "dry-run")).upper().replace("-", "_")
+    policy_name = getattr(args, "policy", None) or cfg.screening_policy
+    whitelisted = bool(getattr(args, "whitelist", False))
+    emergency = bool(getattr(args, "emergency_off", False))
+    enabled = not bool(getattr(args, "disabled", False))
+    detection = {
+        "risk_score": risk,
+        "confidence": confidence,
+        "verdict": "HIGH_RISK" if risk >= 60 else "UNKNOWN",
+        "reputation": "TRUSTED" if whitelisted else "UNKNOWN",
+        "signals": [{"name": "whitelist_match"}] if whitelisted else [],
+    }
+    decision = PolicyEngine(cfg).decide(
+        detection,
+        mode=mode,
+        screening_enabled=enabled,
+        active_confirmed=(mode == "ACTIVE"),
+        policy_name=policy_name,
+        emergency_off=emergency,
+    )
+    _header(ui, "CALLSHIELD POLICY TEST")
+    print("SIMULATION ONLY — no real call action is performed.")
+    print(f"Risk:                {decision.risk}")
+    print(f"Confidence:          {decision.confidence}")
+    print(f"Mode:                {decision.mode}")
+    print(f"Policy:              {decision.policy_name}")
+    print(f"Active Threshold:    {decision.threshold}")
+    print(f"Confidence Threshold:{decision.confidence_threshold:>5}")
+    print(f"Whitelist:           {'YES' if decision.whitelisted else 'NO'}")
+    print(f"Emergency Off:       {'YES' if decision.emergency_off else 'NO'}")
+    print(f"Recommended:         {decision.recommended_action}")
+    print(f"Applied:             {decision.applied_action}")
+    print(f"Reason:              {decision.reason}")
     return EXIT_OK
 
 
@@ -1587,6 +1831,9 @@ _COMMANDS = {
     "daemon": _cmd_daemon,
     "event": _cmd_event,
     "screening": _cmd_screening,
+    "emergency-off": _cmd_emergency_off,
+    "emergency-reset": _cmd_emergency_reset,
+    "policy": _cmd_policy,
     "_run-fg": _cmd_run_fg,
 }
 

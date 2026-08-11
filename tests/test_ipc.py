@@ -15,7 +15,13 @@ from tests._common import IsolatedEnv
 class TestIPC(unittest.TestCase):
     def setUp(self):
         self.env = IsolatedEnv().start()
-        self.cfg = self.env.make_config(ipc_timeout=0.25)
+        # Phase 4 regression requests explicitly run enabled DRY_RUN. Phase 5
+        # fresh-install defaults remain disabled.
+        self.cfg = self.env.make_config(
+            ipc_timeout=0.25,
+            screening_enabled=True,
+            screening_mode="DRY_RUN",
+        )
         # Start daemon
         import subprocess, sys, pathlib
         self.env_vars = os.environ.copy()
@@ -186,12 +192,63 @@ class TestIPC(unittest.TestCase):
         self.assertEqual(response["data"]["bridge"], "CONNECTED")
         self.assertEqual(response["data"]["android"], "NOT VERIFIED")
         self.assertEqual(response["data"]["actually_rejected"], 0)
-        disabled = self._req({"command": "screening_config", "enabled": False})
+        from callshield import config as config_module
+        from callshield.config import save_config
+
+        self.cfg.screening_enabled = False
+        save_config(self.cfg, config_module.CONFIG_PATH)
+        disabled = self._req({"command": "screening_config"})
         self.assertEqual(disabled["status"], "ok")
         self.assertFalse(disabled["screening_enabled"])
-        enabled = self._req({"command": "screening_config", "enabled": True})
+        self.cfg.screening_enabled = True
+        save_config(self.cfg, config_module.CONFIG_PATH)
+        enabled = self._req({"command": "screening_config"})
         self.assertEqual(enabled["status"], "ok")
         self.assertTrue(enabled["screening_enabled"])
+
+    def test_active_block_and_rejection_feedback_contract(self):
+        import uuid
+        from callshield import config as config_module
+        from callshield.config import save_config
+        from callshield.database import Database
+
+        self.cfg.screening_enabled = True
+        self.cfg.screening_mode = "ACTIVE"
+        self.cfg.active_mode_confirmed = True
+        save_config(self.cfg, config_module.CONFIG_PATH)
+        reloaded = self._req({"command": "screening_config"})
+        self.assertEqual(reloaded["mode"], "ACTIVE")
+        number = "+919999900299"
+        database = Database(self.cfg.database_path)
+        try:
+            database.upsert_list_entry(
+                number, "blacklist", "active IPC test", "2026-08-11T00:00:00+00:00"
+            )
+        finally:
+            database.close()
+        request_id = str(uuid.uuid4())
+        response = self._req(
+            {
+                "protocol": "callshield/1",
+                "request_id": request_id,
+                "number": number,
+                "source": "android_call_screening",
+            }
+        )
+        self.assertEqual(response["applied_action"], "BLOCK")
+        self.assertEqual(response["mode"], "ACTIVE")
+        feedback_response = self._req(
+            {
+                "command": "screening_feedback",
+                "protocol": "callshield/1",
+                "request_id": request_id,
+                "source": "android_call_screening",
+                "result": "REJECTED",
+            }
+        )
+        self.assertTrue(feedback_response["confirmed"])
+        metrics = self._req({"command": "metrics"})["data"]
+        self.assertEqual(metrics["actually_rejected"], 1)
 
     def test_malformed_json_returns_error_and_daemon_survives(self):
         response = self._raw(b"{not-json}\n")

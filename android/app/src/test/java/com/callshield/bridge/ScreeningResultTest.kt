@@ -2,40 +2,63 @@ package com.callshield.bridge
 
 import org.junit.Assert.*
 import org.junit.Test
+import java.util.UUID
 
 class ScreeningResultTest {
     @Test
-    fun blockRecommendationStillAppliesAllow() {
-        val result = ScreeningResult(
-            riskScore = 95,
-            confidence = 98,
+    fun activeBlockCanRequestRejection() {
+        val result = result(applied = "BLOCK", mode = "ACTIVE")
+        assertTrue(result.shouldApplyBlock())
+    }
+
+    @Test
+    fun activeAllowDoesNotRequestRejection() {
+        assertFalse(result(applied = "ALLOW", mode = "ACTIVE").shouldApplyBlock())
+    }
+
+    @Test
+    fun dryRunNeverRequestsRejection() {
+        assertFalse(result(applied = "ALLOW", mode = "DRY_RUN").shouldApplyBlock())
+    }
+
+    @Test
+    fun emergencyNeverRequestsRejection() {
+        val value = ScreeningResult(
+            requestId = UUID.randomUUID().toString(),
+            riskScore = 100,
+            confidence = 100,
             verdict = "MALICIOUS",
             recommendedAction = "BLOCK",
-            reason = "DRY_RUN",
-            latencyMs = 8
+            appliedAction = "BLOCK",
+            mode = "ACTIVE",
+            reason = "EMERGENCY_OFF",
+            latencyMs = 1,
+            policyName = "BALANCED",
+            emergencyOff = true
         )
-        assertEquals("BLOCK", result.recommendedAction)
-        assertEquals("ALLOW", result.appliedAction)
-        assertEquals("DRY_RUN", result.mode)
-        assertFalse(result.shouldApplyBlock())
+        assertFalse(value.shouldApplyBlock())
     }
 
     @Test
     fun unknownFallbackAllows() {
-        val result = ScreeningResult.unknown("DAEMON_UNAVAILABLE")
-        assertEquals("UNKNOWN", result.verdict)
-        assertEquals("ALLOW", result.recommendedAction)
-        assertEquals("ALLOW", result.appliedAction)
+        val value = ScreeningResult.unknown("DAEMON_UNAVAILABLE")
+        assertEquals("ALLOW", value.appliedAction)
+        assertFalse(value.shouldApplyBlock())
     }
 
-    @Test
-    fun protocolConversionCannotChangeAppliedAction() {
-        val response = Protocol.ScreeningResponse.fallback(
-            java.util.UUID.randomUUID().toString(),
-            "SCREENING_TIMEOUT"
+    private fun result(applied: String, mode: String): ScreeningResult {
+        return ScreeningResult(
+            requestId = UUID.randomUUID().toString(),
+            riskScore = 95,
+            confidence = 95,
+            verdict = "MALICIOUS",
+            recommendedAction = "BLOCK",
+            appliedAction = applied,
+            mode = mode,
+            reason = "test",
+            latencyMs = 1,
+            policyName = "BALANCED",
+            emergencyOff = false
         )
-        val result = ScreeningResult.fromProtocolResponse(response)
-        assertEquals("ALLOW", result.appliedAction)
-        assertEquals("DRY_RUN", result.mode)
     }
 }

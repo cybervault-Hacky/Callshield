@@ -1,8 +1,8 @@
 """Event processor for CALLSHIELD through Phase 4.
 
 The processor validates events, normalizes numbers, and delegates all fraud
-analysis to the existing Phase 2 ``analyze_number`` API.  Phase 4 adds only an
-advisory incoming-call result; it never applies a blocking action.
+analysis to the existing Phase 2 ``analyze_number`` API. Phase 5 then passes
+incoming-call detections to the separate decision-only policy engine.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from ..config import Config
 from ..database import Database
 from ..detector import analyze_number
 from ..normalizer import normalize
+from ..policy import PolicyEngine
 from ..utils import InvalidNumberError, mask_number
 from .models import Event
 from .types import EVENT_TYPE_INCOMING_CALL, VALID_EVENT_TYPES
@@ -103,9 +104,6 @@ class EventProcessor:
                 cfg=self.cfg,
                 record_event=True,
             )
-            recommendation = analysis.recommended_action
-            if is_screening and recommendation not in ("ALLOW", "BLOCK"):
-                recommendation = "UNKNOWN"
             result["detection"] = {
                 "number": analysis.normalized_number,
                 "risk_score": analysis.risk_score,
@@ -113,23 +111,29 @@ class EventProcessor:
                 "confidence": analysis.confidence,
                 "reputation": analysis.reputation,
                 "verdict": analysis.verdict,
-                "recommended_action": recommendation,
+                "recommended_action": analysis.recommended_action,
                 "reason": analysis.reason,
                 "signals": analysis.signals,
             }
             if is_screening:
+                decision = PolicyEngine(self.cfg).decide(result["detection"])
+                decision_data = decision.to_dict()
                 latency_ms = _elapsed_ms(started)
+                result["policy"] = decision_data
                 result["detection"].update(
                     {
-                        "applied_action": "ALLOW",
-                        "mode": "DRY_RUN",
+                        "detector_recommendation": analysis.recommended_action,
+                        "recommended_action": decision.recommended_action,
+                        "applied_action": decision.applied_action,
+                        "mode": decision.mode,
+                        "policy_name": decision.policy_name,
+                        "threshold": decision.threshold,
+                        "confidence_threshold": decision.confidence_threshold,
+                        "emergency_off": decision.emergency_off,
                     }
                 )
                 result["screening"] = {
-                    "recommended_action": recommendation,
-                    "applied_action": "ALLOW",
-                    "mode": "DRY_RUN",
-                    "reason": "DRY_RUN" if recommendation == "BLOCK" else analysis.reason,
+                    **decision_data,
                     "latency_ms": latency_ms,
                 }
         except InvalidNumberError:
@@ -162,8 +166,8 @@ class EventProcessor:
         self._log_event(event, result)
         return result
 
-    @staticmethod
     def _set_screening_fallback(
+        self,
         result: Dict[str, Any],
         reason: str,
         started: float,
@@ -181,11 +185,23 @@ class EventProcessor:
             "mode": "DRY_RUN",
             "reason": reason,
         }
-        result["screening"] = {
+        result["policy"] = {
             "recommended_action": "ALLOW",
             "applied_action": "ALLOW",
-            "mode": "DRY_RUN",
+            "risk": 0,
+            "confidence": 0,
+            "threshold": 100,
+            "confidence_threshold": 100,
             "reason": reason,
+            "policy_name": str(getattr(self.cfg, "screening_policy", "BALANCED")),
+            "mode": "DRY_RUN",
+            "screening_enabled": False,
+            "emergency_off": True,
+            "whitelisted": False,
+            "policy_error": True,
+        }
+        result["screening"] = {
+            **result["policy"],
             "latency_ms": _elapsed_ms(started),
         }
 

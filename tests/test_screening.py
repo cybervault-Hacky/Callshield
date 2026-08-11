@@ -32,7 +32,7 @@ def android_request(number="+919876543210", **overrides):
 class TestScreeningProcessor(unittest.TestCase):
     def setUp(self):
         self.env = IsolatedEnv().start()
-        self.cfg = self.env.make_config()
+        self.cfg = self.env.make_config(screening_enabled=True)
         self.db = Database(self.cfg.database_path)
 
     def tearDown(self):
@@ -86,7 +86,7 @@ class TestScreeningProcessor(unittest.TestCase):
 class TestScreeningService(unittest.TestCase):
     def setUp(self):
         self.env = IsolatedEnv().start()
-        self.cfg = self.env.make_config()
+        self.cfg = self.env.make_config(screening_enabled=True)
         self.db = Database(self.cfg.database_path)
         self.service = DaemonService(self.cfg)
 
@@ -200,7 +200,7 @@ class TestScreeningService(unittest.TestCase):
 class TestScreeningConcurrency(unittest.TestCase):
     def setUp(self):
         self.env = IsolatedEnv().start()
-        self.cfg = self.env.make_config()
+        self.cfg = self.env.make_config(screening_enabled=True)
         self.service = DaemonService(self.cfg)
 
     def tearDown(self):
@@ -249,7 +249,7 @@ class TestScreeningDatabase(unittest.TestCase):
             version = database._conn.execute(
                 "SELECT version FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 3)
+            self.assertEqual(version, 4)
             self.assertEqual(database.get_setting("preserved"), "yes")
             self.assertEqual(database.count_screening_events(), 0)
         finally:
@@ -287,8 +287,9 @@ class TestScreeningConfigAndCLI(unittest.TestCase):
 
     def test_defaults_and_timeout_validation(self):
         cfg = Config()
-        self.assertTrue(cfg.screening_enabled)
+        self.assertFalse(cfg.screening_enabled)
         self.assertEqual(cfg.screening_mode, "DRY_RUN")
+        self.assertFalse(cfg.active_mode_confirmed)
         self.assertEqual(cfg.screening_timeout_ms, 1500)
         with self.assertRaises(ConfigError):
             set_value(cfg, "screening_timeout_ms", "100")
@@ -315,20 +316,22 @@ class TestScreeningConfigAndCLI(unittest.TestCase):
         for arguments, expected in (
             (("screening", "status"), "Android:             NOT VERIFIED"),
             (("screening", "mode"), "DRY_RUN"),
-            (("screening", "health"), "Screening Blocked:   0"),
+            (("screening", "health"), "Applied Blocks:      0"),
             (("screening", "metrics"), "Actually Rejected:   0"),
-            (("screening", "disable"), "DISABLED"),
-            (("screening", "enable"), "ENABLED"),
+            (("screening", "disable"), "Screening Enabled:   NO"),
+            (("screening", "enable"), "Screening Enabled:   YES"),
         ):
             with self.subTest(arguments=arguments):
                 code, output = run_cli(self.cfg, *arguments)
                 self.assertEqual(code, 0)
                 self.assertIn(expected, output)
 
-    def test_screening_cli_rejects_active_mode(self):
+    def test_screening_cli_defaults_active_confirmation_to_no(self):
         code, output = run_cli(self.cfg, "screening", "mode", "ACTIVE")
-        self.assertNotEqual(code, 0)
-        self.assertIn("DRY_RUN only", output)
+        self.assertEqual(code, 0)
+        self.assertIn("was not enabled", output)
+        self.assertEqual(self.cfg.screening_mode, "DRY_RUN")
+        self.assertFalse(self.cfg.screening_enabled)
 
 
 if __name__ == "__main__":

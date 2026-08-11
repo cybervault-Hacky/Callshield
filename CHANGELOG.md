@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.0 — Phase 5: Active Call Protection
+
+### Added
+- Isolated `callshield/policy/` decision layer with structured policy results; it never invokes Android or rejects calls directly.
+- Configurable RELAXED (92/90), BALANCED (85/80), and STRICT (80/75) active-block/confidence thresholds, each validated from 0 to 100.
+- Explicit `ACTIVE` mode requiring interactive confirmation. Fresh installs default to `screening_enabled=false`, `screening_mode=DRY_RUN`, and no active confirmation marker.
+- Owner-only `~/.callshield/state/emergency_off` switch plus idempotent `callshield emergency-off` and `callshield emergency-reset` commands. Emergency activation also persists disabled DRY_RUN state so reset cannot resume active protection.
+- `callshield screening policy` display/selection and safe `callshield policy test` simulation.
+- Schema v3→v4 migration adding policy action/name/threshold/reason, emergency state, active applied action, and Android-confirmed rejection fields while preserving Phase 4 rows.
+- Versioned `screening_feedback` IPC acknowledgement. `Actually Rejected` increments only after Android confirms delivery of a valid ACTIVE BLOCK response.
+- Phase 5 health/metrics for policy errors, block recommendations, applied blocks, actual rejections, emergency state, and last screening.
+- Android bridge validation requiring the exact `applied_action=BLOCK` and `mode=ACTIVE` pair before requesting rejection; all other responses remain ALLOW.
+- 31 Phase 5 Python tests (220 total) plus updated Kotlin test sources for active/dry-run/error/emergency decisions.
+
+### Safety
+- Whitelist remains an absolute ALLOW override in every mode.
+- Invalid policy, threshold, activation state, mode, input, response, timeout, database state, bridge state, or emergency state fails open to ALLOW.
+- General `screening enable` always enables DRY_RUN; ACTIVE cannot be selected through generic config editing.
+- Emergency reset never enables screening or ACTIVE mode.
+- Applied blocks and confirmed rejections are distinct metrics; no device rejection is claimed without feedback.
+- Unix IPC only; no TCP/HTTP server, root requirement, dynamic execution, replay protection, doctor command, or Phase 6 diagnostics.
+
+### Verification notes
+- Python/Termux suite: 220 passed.
+- Android build/device verification remains unavailable because JDK, Gradle, Android SDK, emulator, and physical device are absent.
+- Performance benchmark was not independently verified.
+- Phase 6 has not started.
+
 ## 0.4.0 — Phase 4: Android Screening Bridge
 
 ### Added

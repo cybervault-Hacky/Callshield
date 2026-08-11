@@ -1,7 +1,7 @@
 """Persistent, validated configuration for CALLSHIELD.
 
-Configuration is stored as JSON in the local data directory. Phase 4 retains
-all Phase 1–3 settings and adds only DRY_RUN Android screening controls.
+Configuration is stored as JSON in the local data directory. Phase 5 retains
+all Phase 1–4 settings and adds explicitly confirmed active-policy controls.
 """
 
 from __future__ import annotations
@@ -52,6 +52,11 @@ def _runtime_root() -> Path:
     directory, retain the historical ``<override>/run`` behavior.
     """
 
+    # An explicit data-directory override is the most specific runtime scope
+    # (and is how tests/alternate installs isolate state).
+    if os.environ.get("CALLSHIELD_DATA_DIR"):
+        data_dir = _configured_data_dir()
+        return data_dir.parent if data_dir.name == "data" else data_dir
     explicit_home = os.environ.get("CALLSHIELD_HOME")
     if explicit_home:
         return Path(explicit_home).expanduser()
@@ -115,10 +120,21 @@ class Config:
         default_factory=lambda: str(_runtime_root() / "run" / "callshield.sock")
     )
 
-    # Phase 4 additions: the Android bridge is advisory and DRY_RUN-only.
-    screening_enabled: bool = True
+    # Phase 4/5 screening controls. Fresh installs are disabled and DRY_RUN.
+    screening_enabled: bool = False
     screening_mode: str = "DRY_RUN"
     screening_timeout_ms: int = 1500
+    active_mode_confirmed: bool = False
+    screening_policy: str = "BALANCED"
+    relaxed_active_block_threshold: int = 92
+    relaxed_confidence_threshold: int = 90
+    balanced_active_block_threshold: int = 85
+    balanced_confidence_threshold: int = 80
+    strict_active_block_threshold: int = 80
+    strict_confidence_threshold: int = 75
+    emergency_off_file: str = field(
+        default_factory=lambda: str(_runtime_root() / "state" / "emergency_off")
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -139,11 +155,26 @@ class Config:
         if base.protection_mode in _LEGACY_MODE_MAP:
             base.protection_mode = _LEGACY_MODE_MAP[base.protection_mode]
 
-        # Screening configuration fails safe. A malformed Phase 4 value never
-        # enables enforcement or prevents the rest of CALLSHIELD from loading.
+        # Activation state fails safe. An ACTIVE value without the separate
+        # confirmation marker is downgraded and disabled during load, so an
+        # upgrade can never silently activate blocking.
         if not isinstance(base.screening_enabled, bool):
             base.screening_enabled = False
-        base.screening_mode = "DRY_RUN"
+        if not isinstance(base.active_mode_confirmed, bool):
+            base.active_mode_confirmed = False
+        if isinstance(base.screening_mode, str):
+            base.screening_mode = base.screening_mode.upper().replace("-", "_")
+        if base.screening_mode not in ("DRY_RUN", "ACTIVE"):
+            base.screening_mode = "DRY_RUN"
+            base.screening_enabled = False
+            base.active_mode_confirmed = False
+        if base.screening_mode == "ACTIVE" and not base.active_mode_confirmed:
+            base.screening_mode = "DRY_RUN"
+            base.screening_enabled = False
+        if base.screening_mode == "DRY_RUN":
+            base.active_mode_confirmed = False
+        if isinstance(base.screening_policy, str):
+            base.screening_policy = base.screening_policy.upper()
         if (
             isinstance(base.screening_timeout_ms, bool)
             or not isinstance(base.screening_timeout_ms, int)
@@ -206,12 +237,32 @@ class Config:
                     f"Invalid signal weight for '{key}': must be an integer between -100 and 100."
                 )
 
-        for name in ("daemon_enabled", "ipc_enabled", "screening_enabled"):
+        for name in (
+            "daemon_enabled",
+            "ipc_enabled",
+            "screening_enabled",
+            "active_mode_confirmed",
+        ):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigError(f"{name} must be true or false.")
-        if self.screening_mode != "DRY_RUN":
-            raise ConfigError("screening_mode must be DRY_RUN in Phase 4.")
+        if self.screening_mode not in ("DRY_RUN", "ACTIVE"):
+            raise ConfigError("screening_mode must be DRY_RUN or ACTIVE.")
+        if self.screening_mode == "ACTIVE" and not self.active_mode_confirmed:
+            raise ConfigError("ACTIVE mode requires explicit confirmation.")
+        if self.screening_mode == "DRY_RUN" and self.active_mode_confirmed:
+            raise ConfigError("DRY_RUN cannot carry an active confirmation marker.")
+        if self.screening_policy not in ("RELAXED", "BALANCED", "STRICT"):
+            raise ConfigError("screening_policy must be RELAXED, BALANCED, or STRICT.")
         self._validate_int("screening_timeout_ms", 200, 5000)
+        for threshold_name in (
+            "relaxed_active_block_threshold",
+            "relaxed_confidence_threshold",
+            "balanced_active_block_threshold",
+            "balanced_confidence_threshold",
+            "strict_active_block_threshold",
+            "strict_confidence_threshold",
+        ):
+            self._validate_int(threshold_name, 0, 100)
         self._validate_int("heartbeat_interval", 5, 600)
         self._validate_int("event_queue_size", 16, 2048)
         self._validate_int("shutdown_timeout", 1, 60)
@@ -233,6 +284,7 @@ class Config:
             "pid_file",
             "database_path",
             "log_file",
+            "emergency_off_file",
         ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip() or "\x00" in value:
@@ -304,10 +356,25 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
     if key == "screening_mode":
         normalized_mode = value.upper().replace("-", "_")
         if normalized_mode != "DRY_RUN":
-            raise ConfigError("Phase 4 supports DRY_RUN only; automatic rejection is disabled.")
+            raise ConfigError(
+                "ACTIVE mode can only be enabled by `callshield screening mode active` confirmation."
+            )
         cfg.screening_mode = "DRY_RUN"
+        cfg.active_mode_confirmed = False
         cfg._validate()
         return cfg
+    if key == "screening_policy":
+        normalized_policy = value.upper()
+        if normalized_policy not in ("RELAXED", "BALANCED", "STRICT"):
+            raise ConfigError("screening_policy must be RELAXED, BALANCED, or STRICT.")
+        cfg.screening_policy = normalized_policy
+        cfg._validate()
+        return cfg
+    if key == "screening_enabled" and value.lower() in bool_true:
+        if cfg.screening_mode == "ACTIVE":
+            raise ConfigError(
+                "Use `callshield screening mode active` to confirm active protection."
+            )
     if not hasattr(cfg, key):
         raise ConfigError(f"Unknown configuration key: {key}")
 
@@ -320,6 +387,7 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         "run_dir",
         "daemon_log_file",
         "socket_path",
+        "emergency_off_file",
     }
     int_fields = {
         "risk_threshold",
@@ -331,6 +399,12 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         "status_refresh_interval",
         "event_payload_limit",
         "screening_timeout_ms",
+        "relaxed_active_block_threshold",
+        "relaxed_confidence_threshold",
+        "balanced_active_block_threshold",
+        "balanced_confidence_threshold",
+        "strict_active_block_threshold",
+        "strict_confidence_threshold",
         "max_log_size",
         "max_log_files",
     }

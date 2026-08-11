@@ -4,7 +4,7 @@ All queries are parameterized. The schema is created automatically on first
 connect. The layer exposes small, purpose-built methods used by the rest of the
 engine — it is not a generic ORM.
 
-Schema is migrated automatically through Phase 4 on first open.
+Schema is migrated automatically through Phase 5 on first open.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from . import DATA_DIR
 from .utils import DatabaseError, ensure_parent, mask_number
 
 DEFAULT_DB_PATH = DATA_DIR / "callshield.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 # ----- Schema --------------------------------------------------------------
@@ -81,23 +81,36 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 CREATE TABLE IF NOT EXISTS screening_events (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp          TEXT NOT NULL,
-    number             TEXT NOT NULL,
-    number_masked      TEXT NOT NULL,
-    number_hash        TEXT NOT NULL,
-    risk               INTEGER NOT NULL CHECK (risk BETWEEN 0 AND 100),
-    confidence         INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
-    verdict            TEXT NOT NULL,
-    recommended_action TEXT NOT NULL
-                         CHECK (recommended_action IN ('ALLOW','BLOCK','UNKNOWN')),
-    applied_action     TEXT NOT NULL DEFAULT 'ALLOW'
-                         CHECK (applied_action = 'ALLOW'),
-    reason             TEXT,
-    latency_ms         INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
-    source             TEXT NOT NULL,
-    event_id           TEXT NOT NULL,
-    mode               TEXT NOT NULL DEFAULT 'DRY_RUN' CHECK (mode = 'DRY_RUN')
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp            TEXT NOT NULL,
+    number               TEXT NOT NULL,
+    number_masked        TEXT NOT NULL,
+    number_hash          TEXT NOT NULL,
+    risk                 INTEGER NOT NULL CHECK (risk BETWEEN 0 AND 100),
+    confidence           INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    verdict              TEXT NOT NULL,
+    recommended_action   TEXT NOT NULL
+                           CHECK (recommended_action IN ('ALLOW','BLOCK')),
+    applied_action       TEXT NOT NULL DEFAULT 'ALLOW'
+                           CHECK (applied_action IN ('ALLOW','BLOCK')),
+    reason               TEXT,
+    latency_ms           INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+    source               TEXT NOT NULL,
+    event_id             TEXT NOT NULL,
+    mode                 TEXT NOT NULL DEFAULT 'DRY_RUN'
+                           CHECK (mode IN ('DRY_RUN','ACTIVE')),
+    policy_action        TEXT NOT NULL DEFAULT 'ALLOW'
+                           CHECK (policy_action IN ('ALLOW','BLOCK')),
+    policy_name          TEXT NOT NULL DEFAULT 'BALANCED'
+                           CHECK (policy_name IN ('RELAXED','BALANCED','STRICT')),
+    threshold            INTEGER NOT NULL DEFAULT 85 CHECK (threshold BETWEEN 0 AND 100),
+    confidence_threshold INTEGER NOT NULL DEFAULT 80
+                           CHECK (confidence_threshold BETWEEN 0 AND 100),
+    policy_reason        TEXT,
+    emergency_off        INTEGER NOT NULL DEFAULT 0 CHECK (emergency_off IN (0,1)),
+    actually_rejected    INTEGER NOT NULL DEFAULT 0 CHECK (actually_rejected IN (0,1)),
+    rejection_confirmed_at TEXT,
+    CHECK (applied_action = 'ALLOW' OR (mode = 'ACTIVE' AND policy_action = 'BLOCK'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_screening_timestamp
@@ -193,6 +206,8 @@ class Database:
                 self._migrate_v1_to_v2()
             if current_version <= 2:
                 self._migrate_v2_to_v3()
+            if current_version <= 3:
+                self._migrate_v3_to_v4()
         except sqlite3.Error as exc:
             raise DatabaseError(f"Database migration to v{SCHEMA_VERSION} failed: {exc}") from exc
 
@@ -335,6 +350,82 @@ class Database:
                                          CHECK (mode = 'DRY_RUN')
                 )
                 """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_timestamp "
+                "ON screening_events(timestamp DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_hash "
+                "ON screening_events(number_hash)"
+            )
+
+    def _migrate_v3_to_v4(self) -> None:
+        """Rebuild Phase 4 screening rows with Phase 5 policy fields."""
+
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(screening_events)")
+        }
+        if "policy_name" in columns and "actually_rejected" in columns:
+            return
+        with self._conn:
+            self._conn.execute("DROP TABLE IF EXISTS screening_events_v4")
+            self._conn.execute(
+                """
+                CREATE TABLE screening_events_v4 (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp            TEXT NOT NULL,
+                    number               TEXT NOT NULL,
+                    number_masked        TEXT NOT NULL,
+                    number_hash          TEXT NOT NULL,
+                    risk                 INTEGER NOT NULL CHECK (risk BETWEEN 0 AND 100),
+                    confidence           INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+                    verdict              TEXT NOT NULL,
+                    recommended_action   TEXT NOT NULL
+                                             CHECK (recommended_action IN ('ALLOW','BLOCK')),
+                    applied_action       TEXT NOT NULL DEFAULT 'ALLOW'
+                                             CHECK (applied_action IN ('ALLOW','BLOCK')),
+                    reason               TEXT,
+                    latency_ms           INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+                    source               TEXT NOT NULL,
+                    event_id             TEXT NOT NULL,
+                    mode                 TEXT NOT NULL DEFAULT 'DRY_RUN'
+                                             CHECK (mode IN ('DRY_RUN','ACTIVE')),
+                    policy_action        TEXT NOT NULL DEFAULT 'ALLOW'
+                                             CHECK (policy_action IN ('ALLOW','BLOCK')),
+                    policy_name          TEXT NOT NULL DEFAULT 'BALANCED'
+                                             CHECK (policy_name IN ('RELAXED','BALANCED','STRICT')),
+                    threshold            INTEGER NOT NULL DEFAULT 85 CHECK (threshold BETWEEN 0 AND 100),
+                    confidence_threshold INTEGER NOT NULL DEFAULT 80
+                                             CHECK (confidence_threshold BETWEEN 0 AND 100),
+                    policy_reason        TEXT,
+                    emergency_off        INTEGER NOT NULL DEFAULT 0 CHECK (emergency_off IN (0,1)),
+                    actually_rejected    INTEGER NOT NULL DEFAULT 0 CHECK (actually_rejected IN (0,1)),
+                    rejection_confirmed_at TEXT,
+                    CHECK (applied_action = 'ALLOW' OR (mode = 'ACTIVE' AND policy_action = 'BLOCK'))
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                INSERT INTO screening_events_v4
+                    (id, timestamp, number, number_masked, number_hash, risk,
+                     confidence, verdict, recommended_action, applied_action,
+                     reason, latency_ms, source, event_id, mode, policy_action,
+                     policy_name, threshold, confidence_threshold, policy_reason,
+                     emergency_off, actually_rejected)
+                SELECT id, timestamp, number, number_masked, number_hash, risk,
+                       confidence, verdict,
+                       CASE WHEN recommended_action = 'BLOCK' THEN 'BLOCK' ELSE 'ALLOW' END,
+                       'ALLOW', reason, latency_ms, source, event_id, 'DRY_RUN',
+                       CASE WHEN recommended_action = 'BLOCK' THEN 'BLOCK' ELSE 'ALLOW' END,
+                       'BALANCED', 85, 80, reason, 0, 0
+                  FROM screening_events
+                """
+            )
+            self._conn.execute("DROP TABLE screening_events")
+            self._conn.execute(
+                "ALTER TABLE screening_events_v4 RENAME TO screening_events"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_screening_timestamp "
@@ -622,24 +713,59 @@ class Database:
         latency_ms: int = 0,
         source: str = "android_call_screening",
         event_id: str,
+        mode: str = "DRY_RUN",
+        policy_action: Optional[str] = None,
+        policy_name: str = "BALANCED",
+        threshold: int = 85,
+        confidence_threshold: int = 80,
+        policy_reason: Optional[str] = None,
+        emergency_off: bool = False,
     ) -> int:
-        """Persist one dry-run screening result with privacy metadata."""
+        """Persist one policy-screening result with privacy metadata."""
 
-        if applied_action != "ALLOW":
-            raise ValueError("Phase 4 screening events may only apply ALLOW")
-        if recommended_action not in ("ALLOW", "BLOCK", "UNKNOWN"):
+        recommendation = str(recommended_action)
+        applied = str(applied_action)
+        selected_mode = str(mode)
+        selected_policy = str(policy_name)
+        policy_recommendation = str(policy_action or recommendation)
+        if recommendation not in ("ALLOW", "BLOCK"):
             raise ValueError("Invalid screening recommendation")
+        if policy_recommendation not in ("ALLOW", "BLOCK"):
+            raise ValueError("Invalid policy action")
+        if applied not in ("ALLOW", "BLOCK"):
+            raise ValueError("Invalid applied screening action")
+        if selected_mode not in ("DRY_RUN", "ACTIVE"):
+            raise ValueError("Invalid screening mode")
+        if applied == "BLOCK" and selected_mode != "ACTIVE":
+            raise ValueError("BLOCK may only be persisted in ACTIVE mode")
+        if applied == "BLOCK" and (
+            recommendation != "BLOCK" or policy_recommendation != "BLOCK"
+        ):
+            raise ValueError("Applied BLOCK requires a policy BLOCK recommendation")
+        if applied == "BLOCK" and emergency_off:
+            raise ValueError("Emergency-off cannot persist a BLOCK action")
+        if selected_policy not in ("RELAXED", "BALANCED", "STRICT"):
+            raise ValueError("Invalid policy name")
         risk = int(risk_score)
         conf = int(confidence)
         latency = int(latency_ms)
-        if not (0 <= risk <= 100) or not (0 <= conf <= 100):
-            raise ValueError("Screening risk and confidence must be between 0 and 100")
+        active_threshold = int(threshold)
+        confidence_limit = int(confidence_threshold)
+        for value, label in (
+            (risk, "risk"),
+            (conf, "confidence"),
+            (active_threshold, "threshold"),
+            (confidence_limit, "confidence threshold"),
+        ):
+            if not (0 <= value <= 100):
+                raise ValueError(f"Screening {label} must be between 0 and 100")
         if latency < 0:
             raise ValueError("Screening latency cannot be negative")
         raw_number = str(number or "")[:128]
         masked = mask_number(raw_number)
         number_hash = hashlib.sha256(raw_number.encode("utf-8")).hexdigest()
         clean_reason = str(reason or "")[:500] or None
+        clean_policy_reason = str(policy_reason or clean_reason or "")[:500] or None
         clean_source = str(source or "android_call_screening")[:64]
         clean_event_id = str(event_id)[:64]
         with self.transaction():
@@ -648,8 +774,10 @@ class Database:
                 INSERT INTO screening_events
                     (timestamp, number, number_masked, number_hash, risk,
                      confidence, verdict, recommended_action, applied_action,
-                     reason, latency_ms, source, event_id, mode)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ALLOW', ?, ?, ?, ?, 'DRY_RUN')
+                     reason, latency_ms, source, event_id, mode, policy_action,
+                     policy_name, threshold, confidence_threshold, policy_reason,
+                     emergency_off, actually_rejected)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
                     timestamp,
@@ -659,11 +787,19 @@ class Database:
                     risk,
                     conf,
                     str(verdict or "UNKNOWN")[:32],
-                    recommended_action,
+                    recommendation,
+                    applied,
                     clean_reason,
                     latency,
                     clean_source,
                     clean_event_id,
+                    selected_mode,
+                    policy_recommendation,
+                    selected_policy,
+                    active_threshold,
+                    confidence_limit,
+                    clean_policy_reason,
+                    int(bool(emergency_off)),
                 ),
             )
             return int(cursor.lastrowid)
@@ -682,6 +818,26 @@ class Database:
         ).fetchone()
         return int(row["count"] if row else 0)
 
+    def confirm_screening_rejection(
+        self, event_id: str, confirmed_at: str
+    ) -> bool:
+        """Mark actual rejection only for a persisted ACTIVE applied block."""
+
+        with self.transaction():
+            cursor = self._conn.execute(
+                """
+                UPDATE screening_events
+                   SET actually_rejected = 1,
+                       rejection_confirmed_at = ?
+                 WHERE event_id = ?
+                   AND applied_action = 'BLOCK'
+                   AND mode = 'ACTIVE'
+                   AND actually_rejected = 0
+                """,
+                (confirmed_at, str(event_id)[:64]),
+            )
+            return cursor.rowcount == 1
+
     def screening_metrics(self) -> Dict[str, int]:
         row = self._conn.execute(
             """
@@ -690,6 +846,9 @@ class Database:
                 COUNT(*) AS screened,
                 COALESCE(SUM(CASE WHEN reason = 'SCREENING_TIMEOUT' THEN 1 ELSE 0 END), 0)
                     AS timeouts,
+                COALESCE(SUM(CASE WHEN policy_reason IN
+                    ('INVALID_POLICY_CONFIG','INVALID_SCREENING_MODE','INVALID_ACTIVATION_STATE')
+                    THEN 1 ELSE 0 END), 0) AS policy_errors,
                 COALESCE(SUM(CASE WHEN reason IN ('ANALYSIS_ERROR','INTERNAL_ERROR') THEN 1 ELSE 0 END), 0)
                     AS bridge_errors,
                 COALESCE(SUM(CASE WHEN verdict IN ('HIGH_RISK','MALICIOUS') THEN 1 ELSE 0 END), 0)
@@ -698,28 +857,30 @@ class Database:
                     AS screening_allowed,
                 COALESCE(SUM(CASE WHEN verdict = 'UNKNOWN' THEN 1 ELSE 0 END), 0)
                     AS screening_unknown,
-                COALESCE(SUM(CASE WHEN recommended_action = 'BLOCK' THEN 1 ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN policy_action = 'BLOCK' THEN 1 ELSE 0 END), 0)
                     AS screening_block_recommended,
-                COALESCE(SUM(CASE WHEN applied_action <> 'ALLOW' THEN 1 ELSE 0 END), 0)
-                    AS screening_blocked
+                COALESCE(SUM(CASE WHEN applied_action = 'BLOCK' THEN 1 ELSE 0 END), 0)
+                    AS screening_blocked,
+                COALESCE(SUM(actually_rejected), 0) AS actually_rejected
             FROM screening_events
             """
         ).fetchone()
-        metrics = {key: int(row[key] if row else 0) for key in (
+        keys = (
             "incoming_calls",
             "screened",
             "timeouts",
+            "policy_errors",
             "bridge_errors",
             "high_risk",
             "screening_allowed",
             "screening_unknown",
             "screening_block_recommended",
             "screening_blocked",
-        )}
-        # Compatibility aliases for CLI/report consumers.
+            "actually_rejected",
+        )
+        metrics = {key: int(row[key] if row else 0) for key in keys}
         metrics["total"] = metrics["incoming_calls"]
         metrics["block_recommended"] = metrics["screening_block_recommended"]
-        metrics["actually_rejected"] = metrics["screening_blocked"]
         return metrics
 
     # ----- settings -------------------------------------------------------

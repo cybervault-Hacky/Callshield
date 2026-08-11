@@ -32,6 +32,21 @@ object Protocol {
         }.toString()
     }
 
+    data class ScreeningFeedback(
+        val requestId: String,
+        val result: String = "REJECTED"
+    ) {
+        fun validate(): Boolean = Protocol.isUuid(requestId) && result == "REJECTED"
+
+        fun toJsonString(): String = JSONObject().apply {
+            put("command", "screening_feedback")
+            put("protocol", VERSION)
+            put("request_id", requestId)
+            put("source", SOURCE_ANDROID)
+            put("result", result)
+        }.toString()
+    }
+
     data class ScreeningResponse(
         val protocol: String,
         val requestId: String,
@@ -42,17 +57,34 @@ object Protocol {
         val appliedAction: String,
         val mode: String,
         val reason: String,
-        val latencyMs: Int
+        val latencyMs: Int,
+        val policyName: String,
+        val threshold: Int,
+        val confidenceThreshold: Int,
+        val emergencyOff: Boolean,
+        val policyError: Boolean
     ) {
         fun isValid(): Boolean {
+            val actionIsValid = appliedAction in setOf("ALLOW", "BLOCK")
+            val modeIsValid = mode in setOf("DRY_RUN", "ACTIVE")
+            val activeBlockIsValid = appliedAction != "BLOCK" || (
+                mode == "ACTIVE" &&
+                    recommendedAction == "BLOCK" &&
+                    !emergencyOff &&
+                    !policyError
+                )
             return protocol == VERSION &&
                 Protocol.isUuid(requestId) &&
                 riskScore in 0..100 &&
                 confidence in 0..100 &&
                 verdict in setOf("SAFE", "UNKNOWN", "SUSPICIOUS", "HIGH_RISK", "MALICIOUS") &&
-                recommendedAction in setOf("ALLOW", "BLOCK", "UNKNOWN") &&
-                appliedAction == "ALLOW" &&
-                mode == "DRY_RUN" &&
+                recommendedAction in setOf("ALLOW", "BLOCK") &&
+                actionIsValid &&
+                modeIsValid &&
+                activeBlockIsValid &&
+                policyName in setOf("RELAXED", "BALANCED", "STRICT") &&
+                threshold in 0..100 &&
+                confidenceThreshold in 0..100 &&
                 reason.length <= 500 &&
                 latencyMs >= 0
         }
@@ -62,16 +94,10 @@ object Protocol {
                 return try {
                     val value = JSONObject(json)
                     val required = listOf(
-                        "protocol",
-                        "request_id",
-                        "risk_score",
-                        "confidence",
-                        "verdict",
-                        "recommended_action",
-                        "applied_action",
-                        "mode",
-                        "reason",
-                        "latency_ms"
+                        "protocol", "request_id", "risk_score", "confidence",
+                        "verdict", "recommended_action", "applied_action", "mode",
+                        "reason", "latency_ms", "policy_name", "threshold",
+                        "confidence_threshold", "emergency_off", "policy_error"
                     )
                     if (required.any { !value.has(it) }) return null
                     ScreeningResponse(
@@ -84,7 +110,12 @@ object Protocol {
                         appliedAction = value.getString("applied_action"),
                         mode = value.getString("mode"),
                         reason = value.getString("reason"),
-                        latencyMs = value.getInt("latency_ms")
+                        latencyMs = value.getInt("latency_ms"),
+                        policyName = value.getString("policy_name"),
+                        threshold = value.getInt("threshold"),
+                        confidenceThreshold = value.getInt("confidence_threshold"),
+                        emergencyOff = value.getBoolean("emergency_off"),
+                        policyError = value.getBoolean("policy_error")
                     ).takeIf { it.isValid() }
                 } catch (_: Exception) {
                     null
@@ -103,7 +134,12 @@ object Protocol {
                     appliedAction = "ALLOW",
                     mode = "DRY_RUN",
                     reason = reason.take(500),
-                    latencyMs = 0
+                    latencyMs = 0,
+                    policyName = "BALANCED",
+                    threshold = 100,
+                    confidenceThreshold = 100,
+                    emergencyOff = true,
+                    policyError = false
                 )
             }
         }

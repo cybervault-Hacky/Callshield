@@ -5,6 +5,7 @@ import android.net.LocalSocketAddress
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
@@ -73,6 +74,21 @@ class BridgeClient(
         } ?: false
     }
 
+    /** Confirm rejection only after Android accepted an ACTIVE block response. */
+    suspend fun confirmRejection(requestId: String): Boolean {
+        val feedback = Protocol.ScreeningFeedback(requestId)
+        if (!feedback.validate()) return false
+        val encoded = (feedback.toJsonString() + "\n").toByteArray(StandardCharsets.UTF_8)
+        return withContext(Dispatchers.IO) {
+            withTimeoutOrNull(500L) {
+                for (path in socketPaths) {
+                    if (feedbackOnSocket(path, encoded)) return@withTimeoutOrNull true
+                }
+                false
+            } ?: false
+        }
+    }
+
     private fun requestOnSocket(
         path: String,
         request: ByteArray,
@@ -101,6 +117,31 @@ class BridgeClient(
                 socket?.close()
             } catch (_: Exception) {
                 // Fail-open result is returned by the caller.
+            }
+        }
+    }
+
+    private fun feedbackOnSocket(path: String, request: ByteArray): Boolean {
+        var socket: LocalSocket? = null
+        return try {
+            socket = LocalSocket()
+            socket.soTimeout = 500
+            socket.connect(
+                LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM)
+            )
+            socket.soTimeout = 500
+            socket.outputStream.write(request)
+            socket.outputStream.flush()
+            val response = readBoundedLine(socket, 4096) ?: return false
+            val json = JSONObject(response)
+            json.optString("status") == "ok" && json.optBoolean("confirmed", false)
+        } catch (_: Exception) {
+            false
+        } finally {
+            try {
+                socket?.close()
+            } catch (_: Exception) {
+                // Confirmation failure must not change the call decision.
             }
         }
     }

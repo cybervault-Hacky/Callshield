@@ -10,7 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
-/** Android call-screening entry point. Phase 4 is strictly advisory. */
+/** Android call-screening entry point with fail-open Phase 5 ACTIVE support. */
 class CallShieldScreeningService : CallScreeningService() {
     companion object {
         private const val TAG = "CallShieldScreening"
@@ -22,18 +22,18 @@ class CallShieldScreeningService : CallScreeningService() {
 
     override fun onScreenCall(callDetails: Call.Details) {
         if (callDetails.callDirection != Call.Details.DIRECTION_INCOMING) {
-            respondAllow(callDetails, ScreeningResult.unknown("OUTGOING_CALL"))
+            respondWithDecision(callDetails, ScreeningResult.unknown("OUTGOING_CALL"))
             return
         }
 
         val handle = callDetails.handle
         if (handle == null || !handle.scheme.equals(PhoneAccount.SCHEME_TEL, ignoreCase = true)) {
-            respondAllow(callDetails, ScreeningResult.unknown("INVALID_HANDLE"))
+            respondWithDecision(callDetails, ScreeningResult.unknown("INVALID_HANDLE"))
             return
         }
         val number = Protocol.normalizeTelNumber(handle.schemeSpecificPart)
         if (number == null) {
-            respondAllow(callDetails, ScreeningResult.unknown("INVALID_NUMBER"))
+            respondWithDecision(callDetails, ScreeningResult.unknown("INVALID_NUMBER"))
             return
         }
 
@@ -53,26 +53,35 @@ class CallShieldScreeningService : CallScreeningService() {
                         "recommended=${result.recommendedAction} applied=${result.appliedAction} " +
                         "mode=${result.mode} reason=${result.reason} latency=${result.latencyMs}ms"
                 )
-                respondAllow(callDetails, result)
+                val delivered = respondWithDecision(callDetails, result)
+                if (delivered && result.shouldApplyBlock()) {
+                    bridgeClient.confirmRejection(result.requestId)
+                }
             }
         }
     }
 
-    private fun respondAllow(callDetails: Call.Details, result: ScreeningResult) {
+    private fun respondWithDecision(
+        callDetails: Call.Details,
+        result: ScreeningResult
+    ): Boolean {
+        val reject = result.shouldApplyBlock()
         val response = CallResponse.Builder()
-            .setDisallowCall(false)
-            .setRejectCall(false)
+            .setDisallowCall(reject)
+            .setRejectCall(reject)
             .setSkipCallLog(false)
             .setSkipNotification(false)
             .build()
-        try {
+        return try {
             respondToCall(callDetails, response)
+            true
         } catch (exception: Exception) {
             Log.w(
                 TAG,
-                "Unable to deliver ALLOW response (${result.reason}): " +
+                "Unable to deliver fail-open response (${result.reason}): " +
                     exception.javaClass.simpleName
             )
+            false
         }
     }
 

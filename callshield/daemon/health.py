@@ -1,4 +1,4 @@
-"""Thread-safe health and metrics monitoring through CALLSHIELD Phase 4."""
+"""Thread-safe health and metrics monitoring through CALLSHIELD Phase 5."""
 
 from __future__ import annotations
 
@@ -30,17 +30,19 @@ class HealthMonitor:
         self.high_risk_count = 0
         self.blocked_recommendations = 0
         self.analysis_count = 0
-        # Phase 4 screening counters. screening_blocked is an invariant and
-        # has no increment method because every applied action is ALLOW.
+        # Screening/policy counters. Actual rejection is separate from a
+        # daemon-applied block and increments only after Android feedback.
         self.incoming_calls = 0
         self.screened = 0
         self.screening_timeouts = 0
         self.bridge_errors = 0
+        self.policy_errors = 0
         self.screening_high_risk = 0
         self.screening_allowed = 0
         self.screening_unknown = 0
         self.screening_block_recommended = 0
         self.screening_blocked = 0
+        self.actually_rejected = 0
         self.last_screening = None  # type: Optional[str]
         self.last_event = None  # type: Optional[str]
         self.last_heartbeat = None  # type: Optional[float]
@@ -100,26 +102,36 @@ class HealthMonitor:
         *,
         verdict: str,
         recommended_action: str,
+        applied_action: str,
         reason: str,
         bridge_error: bool = False,
+        policy_error: bool = False,
     ) -> None:
-        """Record one fail-open screening response."""
+        """Record one screening response without implying device rejection."""
 
         with self._lock:
             self.screened += 1
-            self.screening_allowed += 1
             self.last_screening = _utc_text()
+            if applied_action == "BLOCK":
+                self.screening_blocked += 1
+            else:
+                self.screening_allowed += 1
             if reason == "SCREENING_TIMEOUT":
                 self.screening_timeouts += 1
             if bridge_error:
                 self.bridge_errors += 1
+            if policy_error:
+                self.policy_errors += 1
             if verdict in ("HIGH_RISK", "MALICIOUS"):
                 self.screening_high_risk += 1
             if verdict == "UNKNOWN":
                 self.screening_unknown += 1
             if recommended_action == "BLOCK":
                 self.screening_block_recommended += 1
-            # screening_blocked intentionally remains zero.
+
+    def confirm_actual_rejection(self) -> None:
+        with self._lock:
+            self.actually_rejected += 1
 
     def inc_bridge_error(self) -> None:
         with self._lock:
@@ -203,11 +215,13 @@ class HealthMonitor:
                     "screened": self.screened,
                     "screening_timeouts": self.screening_timeouts,
                     "bridge_errors": self.bridge_errors,
+                    "policy_errors": self.policy_errors,
                     "screening_high_risk": self.screening_high_risk,
                     "screening_allowed": self.screening_allowed,
                     "screening_unknown": self.screening_unknown,
                     "screening_block_recommended": self.screening_block_recommended,
-                    "screening_blocked": 0,
+                    "screening_blocked": self.screening_blocked,
+                    "actually_rejected": self.actually_rejected,
                     "last_screening": self.last_screening,
                     "last_event": self.last_event,
                     "last_heartbeat": self.last_heartbeat,
@@ -260,11 +274,13 @@ class HealthMonitor:
                 "screened": 0,
                 "screening_timeouts": 0,
                 "bridge_errors": 0,
+                "policy_errors": 0,
                 "screening_high_risk": 0,
                 "screening_allowed": 0,
                 "screening_unknown": 0,
                 "screening_block_recommended": 0,
                 "screening_blocked": 0,
+                "actually_rejected": 0,
                 "last_error": f"health snapshot unavailable: {exc}",
                 "db_status": "UNKNOWN",
                 "heartbeat_stale": True,

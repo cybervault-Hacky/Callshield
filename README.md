@@ -1,58 +1,110 @@
 # CALLSHIELD
 
-> **Local, explainable fraud-number analysis with a persistent Termux daemon
-> and a Phase 4 Android screening bridge.**
+> **Local, explainable, fail-open call protection for Termux and Android.**
 
-CALLSHIELD keeps its database on-device and reuses one deterministic Python
-analyzer for CLI scans, daemon events, and Android screening requests.
+CALLSHIELD keeps analysis and persistence on-device. Phase 5 adds an explicit
+active policy layer to the existing Phase 4 Android screening bridge without
+duplicating the Phase 2 detector or replacing Phase 3 Unix IPC.
 
 ## Phase status
 
-- **Phase 1 — Foundation:** CLI, normalization, SQLite, local lists
-- **Phase 2 — Advanced Intelligence:** signals, reputation, confidence, profiles
-- **Phase 3 — Background Engine:** persistent daemon, bounded events, health,
-  heartbeat, recovery, and owner-only Unix IPC
-- **Phase 4 — Android Screening Bridge:** Kotlin `CallScreeningService` bridge,
-  versioned local protocol, screening persistence, health, and metrics
+- Phase 1 — Foundation: **COMPLETE**
+- Phase 2 — Advanced Intelligence: **COMPLETE**
+- Phase 3 — Background Engine: **COMPLETE**
+- Phase 4 — Android Screening Bridge: **COMPLETE**
+- Phase 5 — Active Call Protection: **COMPLETE**
+- Phase 6 — **NOT STARTED**
 
-> **Phase 4 is DRY_RUN only. A recommendation may be BLOCK, but the applied
-> action is always ALLOW. Automatic call rejection is disabled and not
-> implemented. Actually Rejected is always 0.**
+## Safe defaults
 
-## Phase 4 scope
-
-Implemented:
-
-- minimal Kotlin Android project under `android/`
-- incoming-call service with safe `tel:` handle extraction
-- local Android `LocalSocket` bridge to the existing daemon socket
-- strict `callshield/1` JSON protocol and 1500 ms timeout
-- fail-open behavior for all errors
-- `INCOMING_CALL` event using the existing `EventProcessor` and
-  `analyze_number()` engine
-- schema v3 `screening_events` audit records
-- screening CLI, health, and metrics
-
-Not implemented:
-
-- active call blocking
-- automatic rejection
-- active policy package or blocking thresholds
-- emergency-off control
-- network server or HTTP API
-- root integration
-- Phase 5 or Phase 6 functionality
-
-## Safety invariant
+Fresh installations always start with:
 
 ```text
-RECOMMEND BLOCK → APPLY ALLOW
-ACTUALLY REJECTED = 0
+screening_enabled = false
+screening_mode = DRY_RUN
+active_mode_confirmed = false
+screening_policy = BALANCED
 ```
 
-Android always builds an explicit allow response with disallow/reject flags set
-to `false`. The Python response boundary and SQLite schema independently enforce
-`applied_action = ALLOW` and `mode = DRY_RUN`.
+Installing or upgrading CALLSHIELD never silently activates rejection.
+
+```text
+DRY_RUN: recommend BLOCK → apply ALLOW
+ACTIVE:  policy-qualified BLOCK → apply BLOCK
+ERROR / TIMEOUT / UNCERTAINTY / EMERGENCY: apply ALLOW
+```
+
+ACTIVE requires an explicit user confirmation:
+
+```bash
+callshield screening mode active
+# Enable ACTIVE call protection? [y/N]
+```
+
+The default answer is no. `callshield screening enable` is intentionally a
+DRY_RUN-only enable path.
+
+## Policy engine
+
+The decision-only policy package is:
+
+```text
+callshield/policy/
+├── __init__.py
+├── engine.py
+├── models.py
+└── thresholds.py
+```
+
+It receives the existing detection result and returns a structured decision.
+It never calls Android and cannot reject a call itself.
+
+Default policies:
+
+| Policy | Active block | Confidence |
+|---|---:|---:|
+| RELAXED | 92 | 90 |
+| BALANCED | 85 | 80 |
+| STRICT | 80 | 75 |
+
+All thresholds are configurable and restricted to 0–100. Invalid thresholds or
+policy names fail open to ALLOW.
+
+An ACTIVE block requires all of the following:
+
+1. `screening_enabled = true`
+2. `screening_mode = ACTIVE`
+3. explicit confirmation marker present in validated configuration
+4. risk at or above the selected active threshold
+5. confidence at or above the selected confidence threshold
+6. no whitelist match
+7. emergency-off inactive
+8. valid policy result and IPC response
+
+Everything else applies ALLOW.
+
+## Whitelist precedence
+
+The existing whitelist is absolute. A whitelisted number is ALLOW even if its
+risk/confidence values are 100, the mode is ACTIVE, or it is also blacklisted.
+No policy threshold overrides the whitelist.
+
+## Emergency off
+
+```bash
+callshield emergency-off
+callshield emergency-reset
+```
+
+The marker is owner-only:
+
+```text
+~/.callshield/state/emergency_off  (0600)
+```
+
+While it exists, every screening decision applies ALLOW. `emergency-off` is
+idempotent and also persists disabled DRY_RUN state. `emergency-reset` only
+removes the marker; it does not enable screening or ACTIVE mode.
 
 ## Architecture
 
@@ -60,74 +112,176 @@ to `false`. The Python response boundary and SQLite schema independently enforce
 Incoming Android call
         │
         ▼
-CallShieldScreeningService (Kotlin)
+CallShieldScreeningService
         │
         ▼
-BridgeClient / Protocol callshield/1
+BridgeClient / callshield/1
         │
         ▼
 ~/.callshield/run/callshield.sock (AF_UNIX, 0600)
         │
         ▼
-DaemonService
+DaemonService → INCOMING_CALL → EventProcessor
         │
         ▼
-INCOMING_CALL Event → EventProcessor
+analyze_number()  (existing Phase 2 detector)
         │
         ▼
-Existing Phase 2 analyze_number()
+PolicyEngine
         │
-        ▼
-Screening result + SQLite + health metrics
-        │
-        ▼
-Recommended action / Applied ALLOW
+        ├── fail-open ALLOW
+        └── validated ACTIVE BLOCK
+                │
+                ▼
+Android response
+                │
+                ▼
+screening_feedback only after rejection response delivery
 ```
 
-There is one local IPC architecture. Phase 4 does not add a second server,
-network listener, or duplicated detector.
+There is one local IPC architecture. CALLSHIELD has no TCP or HTTP server.
 
-## Repository layout
+## CLI
+
+```bash
+callshield version
+callshield daemon start
+callshield status
+callshield metrics
+
+callshield screening status
+callshield screening mode
+callshield screening mode dry-run
+callshield screening mode active
+callshield screening enable
+callshield screening disable
+callshield screening policy
+callshield screening policy strict
+callshield screening health
+callshield screening metrics
+
+callshield policy test
+callshield policy test --risk 95 --confidence 95 --mode active
+callshield policy test --risk 100 --confidence 100 --mode active --whitelist
+callshield policy test --risk 100 --confidence 100 --mode active --emergency-off
+
+callshield emergency-off
+callshield emergency-reset
+```
+
+Policy simulation is explicitly labeled `SIMULATION ONLY` and never invokes a
+real Android call action.
+
+## Screening status
+
+Status shows activation and policy state separately from device readiness:
 
 ```text
-callshield/
-├── callshield/
-│   ├── cli.py
-│   ├── config.py
-│   ├── database.py
-│   ├── detector.py
-│   ├── daemon/
-│   │   ├── service.py
-│   │   ├── process.py
-│   │   ├── heartbeat.py
-│   │   ├── health.py
-│   │   ├── signals.py
-│   │   └── recovery.py
-│   ├── events/
-│   │   ├── models.py
-│   │   ├── queue.py
-│   │   ├── processor.py
-│   │   └── types.py
-│   ├── intelligence/
-│   └── rules/
-├── android/
-│   ├── app/src/main/AndroidManifest.xml
-│   ├── app/src/main/java/com/callshield/bridge/
-│   │   ├── CallShieldScreeningService.kt
-│   │   ├── BridgeClient.kt
-│   │   ├── Protocol.kt
-│   │   ├── ScreeningResult.kt
-│   │   └── BridgeSetupActivity.kt
-│   └── README.md
-├── tests/
-├── scripts/
-├── VERSION
-└── PHASE4_REPORT_FINAL.md
+Screening Enabled:   YES/NO
+Mode:                DRY_RUN/ACTIVE
+Policy:              BALANCED
+Active Threshold:    85
+Confidence Threshold: 80
+Auto Reject:         ENABLED/DISABLED
+Block Recommended:   n
+Applied Blocks:      n
+Actually Rejected:   n
+Emergency Off:       YES/NO
+Android:             NOT VERIFIED
 ```
 
-## Termux installation
+`Bridge: CONNECTED` means only that the local daemon Unix socket answered. It
+does not verify an Android device, role grant, or physical call.
 
-Requirements: Python 3.8+, POSIX shell, no root.
+## IPC and fail-open behavior
+
+The existing `callshield/1` screening request remains:
+
+```json
+{
+  "protocol": "callshield/1",
+  "request_id": "uuid",
+  "number": "+919876543210",
+  "source": "android_call_screening"
+}
+```
+
+Phase 5 responses add policy context:
+
+```json
+{
+  "protocol": "callshield/1",
+  "request_id": "uuid",
+  "risk_score": 90,
+  "confidence": 89,
+  "verdict": "MALICIOUS",
+  "recommended_action": "BLOCK",
+  "applied_action": "BLOCK",
+  "mode": "ACTIVE",
+  "reason": "ACTIVE_POLICY_BLOCK",
+  "policy_name": "BALANCED",
+  "threshold": 85,
+  "confidence_threshold": 80,
+  "emergency_off": false,
+  "policy_error": false,
+  "latency_ms": 4
+}
+```
+
+Android permits rejection only for the exact valid pair:
+
+```text
+applied_action = BLOCK
+mode = ACTIVE
+```
+
+Unexpected action, mode, protocol, missing fields, malformed JSON, timeout,
+unavailable daemon/socket, database error, emergency state, or internal error
+produces ALLOW.
+
+## Persistence and metrics
+
+Schema version 4 rebuilds the existing `screening_events` table without losing
+Phase 4 rows. New fields include:
+
+- policy action and policy name
+- active and confidence thresholds
+- policy reason
+- emergency state
+- applied ALLOW/BLOCK
+- Android-confirmed rejection state and timestamp
+
+Existing number, masked number, SHA-256 hash, risk, confidence, verdict, reason,
+latency, source, event ID, and mode fields remain.
+
+Metrics distinguish:
+
+- **Block Recommended** — policy selected BLOCK
+- **Screening Blocked** — daemon applied BLOCK
+- **Actually Rejected** — Android sent successful rejection feedback
+
+DRY_RUN may have recommendations but always has zero applied blocks. Actual
+rejection is never inferred from a daemon decision.
+
+## Android bridge
+
+The Kotlin bridge validates protocol, action, mode, policy fields, emergency
+state, and timeout. It requests rejection only for a valid ACTIVE BLOCK result.
+After delivering that response, it sends bounded local `screening_feedback` so
+the daemon may increment `Actually Rejected`.
+
+The manifest requests no camera, microphone, contacts, SMS, location, storage,
+accessibility, or Internet permission.
+
+### Android/Termux isolation limitation
+
+Android and Termux normally use different application UIDs. Filesystem
+permissions and SELinux commonly prevent a separately installed bridge from
+opening Termux's private 0600 socket. No public or network fallback is added.
+A secure shared Unix endpoint or same-UID/companion deployment remains required
+for physical use. Device connectivity is not claimed by CLI IPC status.
+
+## Installation
 
 ```bash
 pkg update
@@ -137,247 +291,58 @@ cd Callshield
 bash scripts/install.sh
 ```
 
-The installer creates owner-only state under:
+The installer creates `~/.callshield/{data,logs,run,state}` with owner-only
+permissions, preserves existing data, runs without root, and leaves active
+protection disabled.
 
-```text
-~/.callshield/
-├── data/
-│   ├── callshield.db
-│   └── config.json
-├── logs/
-├── run/
-│   ├── callshield.pid
-│   ├── callshield.sock
-│   └── heartbeat.json
-└── state/daemon_metrics.json
-```
+## Security properties
 
-It is idempotent and preserves existing data.
-
-## CLI quick start
-
-```bash
-callshield version
-callshield daemon start
-callshield status
-callshield metrics
-callshield event test +919876543210
-
-callshield screening status
-callshield screening health
-callshield screening metrics
-callshield screening enable
-callshield screening disable
-callshield screening mode
-
-callshield scan +919876543210
-callshield reputation +919876543210
-callshield history +919876543210
-callshield signals +919876543210
-callshield report +919876543210 --reason "suspected scam"
-callshield block +919876543210
-callshield allow +919876543210
-```
-
-`callshield event test` remains clearly labeled as a test event and does not
-represent a physical call.
-
-### Screening status meaning
-
-Example:
-
-```text
-CALLSHIELD SCREENING
-
-Bridge:              CONNECTED
-Daemon:              RUNNING
-Android:             NOT VERIFIED
-Mode:                DRY_RUN
-Timeout:             1500 ms
-Live Screening:      IPC READY — DEVICE NOT VERIFIED
-Auto Reject:         DISABLED
-Actually Rejected:   0
-```
-
-`Bridge: CONNECTED` means only that the CLI reached the daemon's local Unix
-socket. It does not claim that an Android device is attached, that the Android
-role is granted, or that a physical incoming call was tested.
-
-## Android/Termux socket limitation
-
-The Android bridge defaults to:
-
-```text
-/data/data/com.termux/files/home/.callshield/run/callshield.sock
-```
-
-Termux and a separately installed Android bridge normally have different app
-UIDs. Android filesystem permissions and SELinux commonly prevent the bridge
-from traversing Termux's private home or opening its 0600 socket. No physical
-connection was available in this environment, and CALLSHIELD does not replace
-this with a public or network endpoint.
-
-A production deployment needs a separately designed, user-approved shared Unix
-endpoint or same-UID/companion integration. Until then, inaccessible socket,
-unavailable Termux, timeout, or malformed response all fail open to
-`UNKNOWN / ALLOW`. See `android/README.md`.
-
-## IPC protocol
-
-Exact Android request (one UTF-8 JSON line, maximum 16 KiB):
-
-```json
-{
-  "protocol": "callshield/1",
-  "request_id": "24fd51e1-f576-4f23-b097-b05d500d6f16",
-  "number": "+919876543210",
-  "source": "android_call_screening"
-}
-```
-
-Dry-run response (maximum 64 KiB):
-
-```json
-{
-  "protocol": "callshield/1",
-  "request_id": "24fd51e1-f576-4f23-b097-b05d500d6f16",
-  "risk_score": 92,
-  "confidence": 95,
-  "verdict": "MALICIOUS",
-  "recommended_action": "BLOCK",
-  "applied_action": "ALLOW",
-  "mode": "DRY_RUN",
-  "reason": "DRY_RUN",
-  "latency_ms": 14
-}
-```
-
-The daemon continues to support all Phase 3 IPC commands (`ping`, `status`,
-`metrics`, `health`, `daemon_info`, `event`, and `stop`) on the same socket.
-
-## Database
-
-SQLite schema version 3 preserves Phase 1–3 data and adds
-`screening_events`:
-
-- timestamp and event UUID
-- number, masked number, and SHA-256 hash
-- risk and confidence
-- verdict and recommendation
-- applied action and mode
-- reason and latency
-- source
-
-The database is local, parameterized, WAL-backed, and owner-only. A schema
-constraint prevents a screening row from recording a non-ALLOW applied action.
-Plaintext numbers are never written to daemon or Android logs.
-
-## Configuration
-
-Phase 4 adds only:
-
-| Key | Default | Validation |
-|---|---:|---|
-| `screening_enabled` | `true` | boolean |
-| `screening_mode` | `DRY_RUN` | DRY_RUN only |
-| `screening_timeout_ms` | `1500` | 200–5000 ms |
-
-Invalid loaded screening values fail safe: mode becomes `DRY_RUN`, timeout
-becomes 1500 ms, and a malformed enable flag disables screening. Attempts to
-select another mode are rejected.
-
-All Phase 3 resource settings remain intact, including the 256-event queue,
-8 KiB event payload bound, IPC bounds/timeouts, heartbeat, and graceful
-shutdown timeout.
-
-## Screening metrics
-
-`callshield screening metrics` reports:
-
-- incoming calls
-- screened
-- timeouts
-- bridge errors
-- high risk
-- screening allowed
-- screening unknown
-- block recommended
-- screening blocked
-- actually rejected
-
-For version 0.4.0:
-
-```text
-Screening Blocked: 0
-Actually Rejected: 0
-```
-
-## Fail-open matrix
-
-| Condition | Verdict | Recommendation | Applied |
-|---|---|---|---|
-| low risk | detector result | ALLOW | ALLOW |
-| high risk | detector result | BLOCK | ALLOW |
-| invalid number | UNKNOWN | ALLOW | ALLOW |
-| screening disabled | UNKNOWN | ALLOW | ALLOW |
-| timeout | UNKNOWN | ALLOW | ALLOW |
-| daemon/socket unavailable | UNKNOWN | ALLOW | ALLOW |
-| invalid protocol/response | UNKNOWN | ALLOW | ALLOW |
-| database/internal error | UNKNOWN | ALLOW | ALLOW |
-
-## Permissions and security
-
-The Android manifest requests no camera, microphone, contacts, SMS, location,
-storage, accessibility, or Internet permission. The user must grant Android's
-Call Screening role through the system role dialog.
-
-Implementation checks confirm:
-
-- Unix-domain sockets only
-- no network listener or HTTP server
+- fail-open on uncertainty and errors
+- owner-only local Unix IPC
+- no TCP/HTTP listener
 - no root requirement
-- no shell execution
-- bounded IPC and timeout
-- masked logging
-- explicit ALLOW response on every Android path
-- no active policy package, emergency-off, or automatic rejection
+- no arbitrary or dynamic code execution
+- no plaintext phone numbers in logs
+- bounded queue, payloads, responses, and timeouts
+- strict PID ownership and stale-state recovery retained from Phase 3
+- no doctor command, replay protection, or Phase 6 diagnostics
 
 ## Tests
 
 ```bash
 pytest -q
-# 189 passed
+# 220 passed
 ```
 
-The 163 verified Phase 3 tests remain, with 26 Phase 4 Python tests covering
-protocol compatibility, safe/high-risk/invalid/null inputs, timeout, unavailable
-persistence, internal failure, concurrency, migration, CLI, health, metrics,
-and the invariant `BLOCK recommendation → ALLOW applied`.
+The suite preserves all Phase 3 and Phase 4 tests and adds Phase 5 coverage for
+policy thresholds, ACTIVE/DRY_RUN decisions, whitelist override, emergency
+state, invalid configuration, explicit CLI confirmation, simulation,
+persistence migration, feedback metrics, concurrency, and fail-open behavior.
 
-Kotlin unit-test sources cover the exact JSON request, strict response parsing,
-invalid data, unavailable daemon, and immutable ALLOW result.
+Kotlin unit-test sources cover valid ACTIVE rejection, DRY_RUN/ALLOW behavior,
+emergency state, invalid actions/modes, unavailable daemon, and feedback.
 
-## Android build/device verification
+## Android, device, and performance verification
 
-The implementation environment had no Java/JDK, Gradle, Android SDK, emulator,
-or physical device. Therefore:
+The implementation environment does not include a JDK, Gradle, Android SDK,
+emulator, or physical device:
 
 ```text
 ANDROID BUILD = NOT VERIFIED
 DEVICE TEST = NOT VERIFIED
+PERFORMANCE BENCHMARK = NOT INDEPENDENTLY VERIFIED
 ```
 
-No build or device success is claimed.
+No APK, physical rejection, device readiness, or benchmark result is claimed.
 
-## Roadmap and limitations
+## Known limitations
 
-- Phase 4 does not automatically reject calls.
-- Physical Android-to-Termux socket access remains device/deployment-specific
-  and was not verified.
-- Daemon startup remains user-managed; boot integration is not installed.
-- Memory reporting depends on platform support.
-- Phase 5 is reserved for future active protection after separate consent,
-  policy, and safety design. **Phase 5 has not started.**
+- Physical Android-to-Termux socket integration is deployment-specific and
+  unverified.
+- `Actually Rejected` requires bridge feedback; without a verified device it
+  remains zero during manual Termux simulation.
+- Daemon startup remains user-managed.
+- Phase 6 is not implemented and has not started.
 
 ## License
 

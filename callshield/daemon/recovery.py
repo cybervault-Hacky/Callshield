@@ -1,72 +1,128 @@
-"""Crash recovery for CALLSHIELD daemon (Phase 3).
-
-Handles per-event exceptions without killing the daemon,
-and validates startup prerequisites.
-"""
+"""Crash-safe runtime validation and recovery for CALLSHIELD Phase 3."""
 
 from __future__ import annotations
 
 import logging
+import os
+import stat
 from pathlib import Path
 from typing import Optional
 
 from ..config import Config, load_config
 from ..database import Database
-from ..utils import ConfigError, DatabaseError
+from .process import (
+    DaemonError,
+    _clear_pid,
+    _clear_socket,
+    _is_owned_socket,
+    _socket_is_active,
+    _socket_path,
+    status,
+)
+
+
+def _secure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise RuntimeError(f"Runtime path is not a directory: {path}")
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
 
 
 def validate_startup(cfg: Optional[Config] = None) -> Config:
-    """Validate configuration, database, runtime directories, IPC endpoint.
+    """Validate configuration, database, and private runtime directories."""
 
-    Returns validated cfg or raises with useful error.
-    """
-    if cfg is None:
+    selected = cfg or load_config()
+    try:
+        selected._validate()
+    except Exception as exc:
+        raise RuntimeError(f"Configuration invalid: {exc}") from exc
+    if not selected.daemon_enabled:
+        raise RuntimeError("Daemon is disabled by configuration (daemon_enabled=false).")
+
+    database = None
+    try:
+        database = Database(selected.database_path, timeout=1.0)
+        database.integrity_check(quick=True)
+        database.get_setting("heartbeat")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Database unavailable at {selected.database_path}: {exc}"
+        ) from exc
+    finally:
+        if database is not None:
+            try:
+                database.close()
+            except Exception:
+                pass
+
+    try:
+        run_dir = Path(selected.run_dir).expanduser()
+        log_dir = Path(selected.daemon_log_file).expanduser().parent
+        state_dir = run_dir.parent / "state"
+        for directory in (run_dir, log_dir, state_dir):
+            _secure_directory(directory)
+    except Exception as exc:
+        raise RuntimeError(f"Cannot prepare private runtime directories: {exc}") from exc
+
+    if selected.ipc_enabled:
+        socket_path = _socket_path(selected)
         try:
-            cfg = load_config()
-        except ConfigError as exc:
-            raise RuntimeError(f"Configuration invalid: {exc}") from exc
-
-    # 1. validate configuration (already done in load_config)
-    # 2. validate database
-    try:
-        db = Database(cfg.database_path)
-        db.get_setting("heartbeat")
-        db.close()
-    except Exception as exc:
-        raise RuntimeError(f"Database unavailable at {cfg.database_path}: {exc}") from exc
-
-    # 3. runtime directory
-    try:
-        run_dir = Path(cfg.run_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        run_dir.chmod(0o700)
-    except Exception as exc:
-        raise RuntimeError(f"Cannot create run directory {cfg.run_dir}: {exc}") from exc
-
-    # 4. log directory
-    try:
-        log_dir = Path(cfg.daemon_log_file).parent
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:
-        raise RuntimeError(f"Cannot create log directory for {cfg.daemon_log_file}: {exc}") from exc
-
-    # 5. IPC endpoint - check if socket path is writable
-    if cfg.ipc_enabled:
-        try:
-            sp = Path(cfg.socket_path)
-            sp.parent.mkdir(parents=True, exist_ok=True)
-            # If socket exists and is stale, it will be cleaned on start
+            _secure_directory(socket_path.parent)
         except Exception as exc:
-            raise RuntimeError(f"IPC endpoint invalid {cfg.socket_path}: {exc}") from exc
+            raise RuntimeError(
+                f"IPC endpoint directory is unavailable for {socket_path}: {exc}"
+            ) from exc
+        if socket_path.exists() or socket_path.is_symlink():
+            try:
+                mode = socket_path.lstat().st_mode
+            except OSError as exc:
+                raise RuntimeError(f"Cannot inspect IPC endpoint {socket_path}: {exc}") from exc
+            if not stat.S_ISSOCK(mode):
+                raise RuntimeError(
+                    f"Refusing to replace non-socket runtime path: {socket_path}"
+                )
+    return selected
 
-    # 6. duplicate daemon check is done by caller (process.status)
-    # 7-10 are runtime (queue, workers, heartbeat, mark RUNNING) handled by service
 
-    return cfg
+def recover_runtime(cfg: Config) -> None:
+    """Recover only known stale CALLSHIELD PID/socket artifacts.
+
+    Active sockets, non-socket files, symlinks, and unowned endpoints are never
+    removed. An unrelated process referenced by a stale PID file is not
+    signalled.
+    """
+
+    state, pid = status(cfg)
+    if state == "RUNNING":
+        raise DaemonError(f"CALLSHIELD engine is already running (PID {pid}).")
+    if state == "STALE":
+        _clear_pid(cfg, expected_pid=pid)
+
+    socket_path = _socket_path(cfg)
+    if not (socket_path.exists() or socket_path.is_symlink()):
+        return
+    if not _is_owned_socket(socket_path):
+        raise RuntimeError(
+            f"Refusing to remove unowned or non-socket runtime path: {socket_path}"
+        )
+    if _socket_is_active(cfg, timeout=min(0.5, float(cfg.ipc_timeout))):
+        raise DaemonError(
+            f"An active Unix socket already exists at {socket_path}; startup aborted."
+        )
+    if not _clear_socket(cfg):
+        raise RuntimeError(f"Unable to remove stale Unix socket: {socket_path}")
 
 
-def handle_event_exception(event_id: str, exc: Exception, logger: Optional[logging.Logger] = None) -> None:
-    """Log per-event failure without crashing daemon."""
+def handle_event_exception(
+    event_id: str, exc: Exception, logger: Optional[logging.Logger] = None
+) -> None:
+    """Record a per-event failure without propagating it to the daemon loop."""
+
     if logger:
-        logger.exception(f"Event {event_id} failed: {exc}")
-    # Caller should increment failure metric and continue
+        try:
+            logger.exception("Event %s failed: %s", event_id, exc)
+        except Exception:
+            pass

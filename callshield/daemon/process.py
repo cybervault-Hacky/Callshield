@@ -1,285 +1,376 @@
-"""Process management for CALLSHIELD daemon (Phase 3).
-
-Handles PID file, socket path, run directory, stale detection,
-and verification that a PID belongs to CALLSHIELD.
-"""
+"""Safe PID and Unix-socket runtime management for CALLSHIELD Phase 3."""
 
 from __future__ import annotations
 
 import errno
 import os
 import signal
+import socket
+import stat
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from ..config import Config, load_config
 from ..utils import CallShieldError
 
 
 class DaemonError(CallShieldError):
-    pass
+    """Expected daemon lifecycle failure."""
 
 
 def _run_dir(cfg: Config) -> Path:
-    # Use configured run_dir, fallback to parent of pid_file
+    path = Path(cfg.run_dir).expanduser()
+    path.mkdir(parents=True, exist_ok=True)
     try:
-        p = Path(cfg.run_dir)
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-    except Exception:
-        return Path(cfg.pid_file).parent
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
 
 
 def _pid_path(cfg: Config) -> Path:
-    # Prefer explicit pid_file, but also handle legacy vs new run_dir
-    # If pid_file is inside data dir and run_dir exists, use run_dir/callshield.pid for new daemons
-    # For reading, check both locations
-    primary = Path(cfg.pid_file)
-    # New location is run_dir/callshield.pid
-    try:
-        new_path = _run_dir(cfg) / "callshield.pid"
-        if new_path != primary and new_path.exists() and not primary.exists():
-            return new_path
-    except Exception:
-        pass
-    return primary
+    return Path(cfg.pid_file).expanduser()
 
 
-def _all_pid_paths(cfg: Config) -> list[Path]:
-    """Return all possible pid file locations to check."""
-    paths = []
-    try:
-        p1 = Path(cfg.pid_file)
-        paths.append(p1)
-        p2 = _run_dir(cfg) / "callshield.pid"
-        if p2 != p1:
-            paths.append(p2)
-    except Exception:
-        pass
-    return paths
+def _all_pid_paths(cfg: Config) -> List[Path]:
+    """Known CALLSHIELD PID locations, canonical first.
+
+    The extra locations are only Phase 1/early-Phase-3 compatibility paths.
+    No path outside configured CALLSHIELD data/run directories is inferred.
+    """
+
+    candidates = [
+        _pid_path(cfg),
+        Path(cfg.run_dir).expanduser() / "callshield.pid",
+        Path(cfg.database_path).expanduser().parent / "callshield.pid",
+    ]
+    result = []  # type: List[Path]
+    for candidate in candidates:
+        if candidate not in result:
+            result.append(candidate)
+    return result
 
 
 def _socket_path(cfg: Config) -> Path:
+    return Path(cfg.socket_path).expanduser()
+
+
+def _is_owned_regular_file(path: Path) -> bool:
     try:
-        sp = Path(cfg.socket_path)
-        return sp
-    except Exception:
-        return _run_dir(cfg) / "callshield.sock"
+        info = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    getuid = getattr(os, "geteuid", None)
+    return getuid is None or info.st_uid == getuid()
+
+
+def _read_pid_from(path: Path) -> Optional[int]:
+    if not _is_owned_regular_file(path):
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8").strip().split()
+        if not raw:
+            return None
+        pid = int(raw[0])
+        return pid if pid > 1 else None
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _pid_record(cfg: Config) -> Tuple[Optional[Path], Optional[int]]:
+    for path in _all_pid_paths(cfg):
+        try:
+            exists = path.exists() or path.is_symlink()
+        except OSError:
+            exists = False
+        if exists:
+            return path, _read_pid_from(path)
+    return None, None
 
 
 def _read_pid(cfg: Config) -> Optional[int]:
-    for p in _all_pid_paths(cfg):
-        if p.exists():
-            try:
-                raw = p.read_text(encoding="utf-8").strip().split()[0]
-                return int(raw) if raw else None
-            except (OSError, ValueError):
-                continue
-    return None
+    return _pid_record(cfg)[1]
 
 
 def _pid_alive(pid: int) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
+        # It exists, but inability to inspect/signal is never treated as ours.
         return True
     except OSError as exc:
-        if exc.errno == errno.ESRCH:
-            return False
-        return True
+        return exc.errno != errno.ESRCH
     return True
 
 
-def _pid_is_callshield(pid: int) -> bool:
-    """Verify that pid belongs to CALLSHIELD by inspecting cmdline."""
+def _proc_cmdline(pid: int) -> Optional[List[str]]:
+    """Read Linux/Termux process arguments without invoking a shell."""
+
     try:
-        # Try /proc on Linux/Termux
-        cmdline_path = Path(f"/proc/{pid}/cmdline")
-        if cmdline_path.exists():
-            try:
-                data = cmdline_path.read_bytes()
-                # cmdline is null-separated
-                parts = data.replace(b"\x00", b" ").decode(errors="ignore").lower()
-                if "callshield" in parts or "daemon" in parts:
-                    return True
-                # If we can't find callshield but process exists, we still check that
-                # the pid file was written by us: allow if cmdline contains python
-                if "python" in parts:
-                    # Check that the process's cwd or exe is plausible
-                    return True
-                return False
-            except Exception:
-                pass
-        # Fallback: try ps (portable)
-        import subprocess
-        try:
-            out = subprocess.check_output(["ps", "-o", "args=", "-p", str(pid)], stderr=subprocess.DEVNULL, timeout=2)
-            txt = out.decode(errors="ignore").lower()
-            if "callshield" in txt:
-                return True
-            if "python" in txt:
-                return True
-            return False
-        except Exception:
-            # If we cannot verify, assume it belongs to us if we couldn't disprove (avoid killing unrelated)
-            # But for safety, we will treat unknown as not belonging if pid file is stale
-            return False
-    except Exception:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return [
+        part.decode("utf-8", errors="replace")
+        for part in raw.split(b"\x00")
+        if part
+    ]
+
+
+def _pid_is_callshield(pid: int) -> bool:
+    """Return true only for CALLSHIELD's exact foreground daemon command.
+
+    Merely being a Python process is deliberately insufficient: accepting any
+    Python PID could terminate an unrelated application. On platforms without
+    safe process inspection, ownership remains unverified and no signal is sent.
+    """
+
+    args = _proc_cmdline(pid)
+    if not args or "_run-fg" not in args:
+        return False
+    for index, value in enumerate(args[:-1]):
+        if value == "-m" and args[index + 1] == "callshield":
+            return True
+    return False
+
+
+def _process_identity(pid: int) -> Optional[str]:
+    """Return Linux process start time, used to detect PID reuse."""
+
+    try:
+        # /proc/<pid>/stat field 22 is starttime. The command field may contain
+        # spaces/parentheses, so split only after its final closing parenthesis.
+        content = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        remainder = content[content.rfind(")") + 2 :].split()
+        return remainder[19]  # field 22 after removing pid/comm
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _safe_unlink_pid(path: Path, expected_pid: Optional[int] = None) -> bool:
+    if not _is_owned_regular_file(path):
+        return False
+    if expected_pid is not None and _read_pid_from(path) != expected_pid:
+        return False
+    try:
+        path.unlink()
+        return True
+    except OSError:
         return False
 
 
 def _write_pid(cfg: Config) -> int:
-    p = _pid_path(cfg)
-    # Prefer new run_dir location if configured pid_file is legacy data dir
+    """Atomically claim the PID file for the current process."""
+
+    path = _pid_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        run_pid = _run_dir(cfg) / "callshield.pid"
-        # If legacy path is inside data and run_dir is different, write to run_dir
-        if Path(cfg.pid_file).parent.name == "data" and run_pid.parent != Path(cfg.pid_file).parent:
-            p = run_pid
-    except Exception:
-        pass
-    p.parent.mkdir(parents=True, exist_ok=True)
-    pid = os.getpid()
-    with open(p, "w", encoding="utf-8") as fh:
-        fh.write(str(pid))
-    try:
-        os.chmod(p, 0o600)
+        path.parent.chmod(0o700)
     except OSError:
         pass
-    # Also ensure stale legacy path is cleaned if we wrote to new location
-    for alt in _all_pid_paths(cfg):
-        if alt != p and alt.exists():
-            try:
-                alt.unlink()
-            except OSError:
-                pass
+
+    # Clean only known, owner-owned stale PID files. A verified live daemon is
+    # always preserved and causes duplicate startup rejection.
+    for candidate in _all_pid_paths(cfg):
+        if not (candidate.exists() or candidate.is_symlink()):
+            continue
+        if not _is_owned_regular_file(candidate):
+            raise DaemonError(
+                f"Unsafe PID path is not an owner-owned regular file: {candidate}"
+            )
+        existing = _read_pid_from(candidate)
+        if existing and _pid_alive(existing) and (
+            existing == os.getpid() or _pid_is_callshield(existing)
+        ):
+            raise DaemonError(
+                f"CALLSHIELD engine is already running (PID {existing})."
+            )
+        _safe_unlink_pid(candidate, expected_pid=existing)
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(path), flags, 0o600)
+    except FileExistsError as exc:
+        raise DaemonError("CALLSHIELD PID file was claimed by another startup.") from exc
+    try:
+        pid = os.getpid()
+        os.write(descriptor, f"{pid}\n".encode("ascii"))
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
     return pid
 
 
 def _clear_pid(cfg: Config, expected_pid: Optional[int] = None) -> None:
-    for p in _all_pid_paths(cfg):
-        try:
-            if expected_pid is not None:
-                current = None
-                try:
-                    raw = p.read_text(encoding="utf-8").strip().split()[0]
-                    current = int(raw) if raw else None
-                except Exception:
-                    current = None
-                if current != expected_pid:
-                    continue
-            p.unlink(missing_ok=True)
-        except OSError:
-            pass
-    # Also clean socket if we own it and daemon is not running
-    try:
-        sp = _socket_path(cfg)
-        if expected_pid is not None:
-            # Only clean socket if pid matches or no pid
-            pass
-        # If no pid file exists anymore, it's safe to clean socket if stale
-        if _read_pid(cfg) is None and sp.exists():
-            # Check if socket is stale (no process listening)
-            # We will just unlink; daemon will recreate on next start
-            try:
-                sp.unlink()
-            except OSError:
-                pass
-    except Exception:
-        pass
+    """Remove only owner-owned PID files matching ``expected_pid``."""
+
+    for path in _all_pid_paths(cfg):
+        _safe_unlink_pid(path, expected_pid=expected_pid)
 
 
-def _clear_socket(cfg: Config) -> None:
+def _is_owned_socket(path: Path) -> bool:
     try:
-        sp = _socket_path(cfg)
-        if sp.exists():
-            try:
-                sp.unlink()
-            except OSError:
-                pass
-    except Exception:
-        pass
+        info = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISSOCK(info.st_mode):
+        return False
+    getuid = getattr(os, "geteuid", None)
+    return getuid is None or info.st_uid == getuid()
+
+
+def _socket_is_active(cfg: Config, timeout: float = 0.2) -> bool:
+    path = _socket_path(cfg)
+    if not _is_owned_socket(path):
+        return False
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(timeout)
+        client.connect(str(path))
+        return True
+    except (ConnectionRefusedError, FileNotFoundError, socket.timeout):
+        return False
+    except OSError:
+        # Permission and unexpected errors are treated as active/unsafe: never
+        # unlink an endpoint we could not prove stale.
+        return True
+    finally:
+        client.close()
+
+
+def _clear_socket(cfg: Config) -> bool:
+    """Remove only a stale, owner-owned Unix socket at the configured path."""
+
+    path = _socket_path(cfg)
+    if not _is_owned_socket(path) or _socket_is_active(cfg):
+        return False
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def status(cfg: Optional[Config] = None) -> Tuple[str, Optional[int]]:
-    """Return ('RUNNING'|'STOPPED'|'STALE', pid_or_None)."""
-    cfg = cfg or load_config()
-    pid = _read_pid(cfg)
+    """Return ``(RUNNING|STOPPED|STALE, pid)`` without modifying state."""
+
+    selected = cfg or load_config()
+    path, pid = _pid_record(selected)
+    if path is None:
+        return "STOPPED", None
     if pid is None:
-        return ("STOPPED", None)
-    if _pid_alive(pid):
-        # Verify it's actually callshield if possible; if not, treat as stale to avoid confusion
-        if _pid_is_callshield(pid):
-            return ("RUNNING", pid)
-        else:
-            # If we cannot verify it's callshield, but pid is alive, we treat as STALE
-            # to avoid killing unrelated process, but report STALE so user knows
-            # We don't automatically clear; status will show STALE and start will need manual attention
-            # However for safety we check if pid file is old (>5min) then treat as stale
-            try:
-                for p in _all_pid_paths(cfg):
-                    if p.exists():
-                        age = time.time() - p.stat().st_mtime
-                        if age > 300:
-                            return ("STALE", pid)
-            except Exception:
-                pass
-            return ("RUNNING", pid)
-    return ("STALE", pid)
+        return "STALE", None
+    if not _pid_alive(pid):
+        return "STALE", pid
+    if not _pid_is_callshield(pid):
+        return "STALE", pid
+    return "RUNNING", pid
 
 
 def start(cfg: Optional[Config] = None) -> int:
-    cfg = cfg or load_config()
-    state, pid = status(cfg)
+    """Claim daemon runtime state in the current process.
+
+    The user-facing CLI launches ``_run-fg``; this function remains as the
+    compatible low-level Phase 1/2 API and is also useful in lifecycle tests.
+    """
+
+    selected = cfg or load_config()
+    state, pid = status(selected)
     if state == "RUNNING":
         raise DaemonError(f"CALLSHIELD engine is already running (PID {pid}).")
     if state == "STALE":
-        _clear_pid(cfg)
-        _clear_socket(cfg)
-    pid = _write_pid(cfg)
-    return pid
+        _clear_pid(selected, expected_pid=pid)
+        _clear_socket(selected)
+    return _write_pid(selected)
 
 
-def stop(cfg: Optional[Config] = None, timeout: Optional[float] = None) -> Tuple[bool, Optional[int]]:
-    cfg = cfg or load_config()
+def stop(
+    cfg: Optional[Config] = None, timeout: Optional[float] = None
+) -> Tuple[bool, Optional[int]]:
+    """Gracefully stop a verified CALLSHIELD daemon.
+
+    An unrelated or unverifiable process is never signalled. PID identity is
+    checked again before the optional final kill to protect against PID reuse.
+    """
+
+    selected = cfg or load_config()
     if timeout is None:
-        timeout = float(cfg.shutdown_timeout) if hasattr(cfg, 'shutdown_timeout') else 5.0
-    pid = _read_pid(cfg)
+        timeout = float(selected.shutdown_timeout)
+    path, pid = _pid_record(selected)
+    if path is None:
+        return False, None
     if pid is None:
-        return (False, None)
+        _clear_pid(selected)
+        _clear_socket(selected)
+        return True, None
     if not _pid_alive(pid):
-        _clear_pid(cfg)
-        _clear_socket(cfg)
-        return (True, pid)
-    # Verify we own it before signalling
+        _clear_pid(selected, expected_pid=pid)
+        _clear_socket(selected)
+        return True, pid
     if not _pid_is_callshield(pid):
-        # Don't kill unrelated processes; just report stale and clean file
-        _clear_pid(cfg, expected_pid=pid)
-        return (True, pid)
+        # The PID file is CALLSHIELD state and may be cleaned, but the unrelated
+        # live process is intentionally untouched.
+        _clear_pid(selected, expected_pid=pid)
+        _clear_socket(selected)
+        return False, pid
+
+    identity = _process_identity(pid)
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        _clear_pid(cfg)
-        _clear_socket(cfg)
-        return (True, pid)
+        _clear_pid(selected, expected_pid=pid)
+        _clear_socket(selected)
+        return True, pid
     except PermissionError as exc:
-        raise DaemonError(f"Cannot signal PID {pid}: {exc}") from exc
-    waited = 0.0
-    interval = 0.2
-    while waited < timeout:
+        raise DaemonError(f"Cannot signal CALLSHIELD PID {pid}: {exc}") from exc
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while time.monotonic() < deadline:
         if not _pid_alive(pid):
-            _clear_pid(cfg, expected_pid=pid)
-            _clear_socket(cfg)
-            return (True, pid)
-        time.sleep(interval)
-        waited += interval
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    _clear_pid(cfg, expected_pid=pid)
-    _clear_socket(cfg)
-    return (True, pid)
+            _clear_pid(selected, expected_pid=pid)
+            _clear_socket(selected)
+            return True, pid
+        time.sleep(0.1)
+
+    # A wedged daemon may require a final signal. Re-verify both command and
+    # process start time immediately before doing so; otherwise leave it alone.
+    if (
+        identity is not None
+        and _pid_is_callshield(pid)
+        and _process_identity(pid) == identity
+    ):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            raise DaemonError(f"Cannot terminate CALLSHIELD PID {pid}: {exc}") from exc
+        final_deadline = time.monotonic() + 1.0
+        while time.monotonic() < final_deadline and _pid_alive(pid):
+            time.sleep(0.05)
+
+    if _pid_alive(pid):
+        raise DaemonError(
+            f"CALLSHIELD PID {pid} did not stop; runtime files were preserved."
+        )
+    _clear_pid(selected, expected_pid=pid)
+    _clear_socket(selected)
+    return True, pid

@@ -60,14 +60,58 @@ class TestConfig(unittest.TestCase):
         cfg = load_config(self.path)
         self.assertEqual(cfg.protection_mode, "RELAXED")
 
-    def test_corrupt_file_errors(self):
+    def test_corrupt_file_fails_safe_and_strict_mode_errors(self):
         self.path.write_text("{not valid json", encoding="utf-8")
+        cfg = load_config(self.path)
+        self.assertFalse(cfg.screening_enabled)
+        self.assertEqual(cfg.screening_mode, "DRY_RUN")
+        self.assertFalse(cfg.active_mode_confirmed)
+        self.assertTrue(getattr(cfg, "_config_integrity_error", None))
         with self.assertRaises(ConfigError):
-            load_config(self.path)
+            load_config(self.path, strict=True)
 
     def test_invalid_signal_weight_rejected(self):
         with self.assertRaises(ConfigError):
             set_value(Config(), "signal_weights", "blacklist_match=abc")
+
+    def test_phase3_resource_defaults(self):
+        cfg = Config()
+        self.assertEqual(cfg.event_queue_size, 256)
+        self.assertEqual(cfg.heartbeat_interval, 30)
+        self.assertEqual(cfg.event_payload_limit, 8 * 1024)
+        self.assertGreater(cfg.ipc_timeout, 0)
+        self.assertEqual(cfg.socket_path.rsplit("/", 1)[-1], "callshield.sock")
+
+    def test_phase3_bounds_rejected(self):
+        for values in (
+            {"event_queue_size": 0},
+            {"heartbeat_interval": 0},
+            {"ipc_timeout": 0},
+            {"event_payload_limit": 128},
+            {"status_refresh_interval": 99},
+        ):
+            with self.subTest(values=values), self.assertRaises(ConfigError):
+                Config.from_dict(values)
+
+    def test_phase3_config_aliases(self):
+        cfg = Config.from_dict(
+            {
+                "queue_size": 64,
+                "watch_interval": 3,
+                "daemon_socket": "/tmp/callshield-alias.sock",
+                "daemon_pid_file": "/tmp/callshield-alias.pid",
+            }
+        )
+        self.assertEqual(cfg.event_queue_size, 64)
+        self.assertEqual(cfg.status_refresh_interval, 3)
+        self.assertEqual(cfg.socket_path, "/tmp/callshield-alias.sock")
+        self.assertEqual(cfg.pid_file, "/tmp/callshield-alias.pid")
+
+    def test_set_phase3_timeout_and_payload_limit(self):
+        cfg = set_value(Config(), "ipc_timeout", "1.5")
+        cfg = set_value(cfg, "event_payload_limit", "4096")
+        self.assertEqual(cfg.ipc_timeout, 1.5)
+        self.assertEqual(cfg.event_payload_limit, 4096)
 
 
 if __name__ == "__main__":

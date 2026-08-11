@@ -2,98 +2,100 @@ package com.callshield.bridge
 
 import android.telecom.Call
 import android.telecom.CallScreeningService
+import android.telecom.PhoneAccount
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
-/**
- * Minimal CallScreeningService for CALLSHIELD Phase 4.
- * - Receives real incoming call screening requests from Android
- * - Extracts number, validates, sends to Termux daemon via BridgeClient
- * - Waits with strict timeout (1500ms default)
- * - Logs decision, returns DRY-RUN response (always ALLOW)
- * - Never rejects calls in Phase 4, never blocks indefinitely, never uses shell/root
- */
+/** Android call-screening entry point with fail-open Phase 5 ACTIVE support. */
 class CallShieldScreeningService : CallScreeningService() {
+    companion object {
+        private const val TAG = "CallShieldScreening"
+        private const val SERVICE_TIMEOUT_MS = 1500L
+    }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val bridgeClient = BridgeClient()
-    private val TAG = "CallShieldScreening"
+    private val serviceJob = SupervisorJob()
+    private val serviceScope = CoroutineScope(serviceJob + Dispatchers.IO)
+    private val bridgeClient = BridgeClient(timeoutMs = SERVICE_TIMEOUT_MS.toInt())
 
     override fun onScreenCall(callDetails: Call.Details) {
-        val isIncoming = callDetails.callDirection == Call.Details.DIRECTION_INCOMING
-        if (!isIncoming) {
-            Log.d(TAG, "Not incoming, allowing")
-            respondToCall(callDetails, CallResponse.Builder().build())
+        if (callDetails.callDirection != Call.Details.DIRECTION_INCOMING) {
+            respondWithDecision(callDetails, ScreeningResult.unknown("OUTGOING_CALL"))
             return
         }
 
-        val rawNumber = callDetails.handle?.schemeSpecificPart ?: ""
-        if (rawNumber.isBlank()) {
-            Log.w(TAG, "No number, allowing")
-            respondToCall(callDetails, CallResponse.Builder().build())
+        val handle = callDetails.handle
+        if (handle == null || !handle.scheme.equals(PhoneAccount.SCHEME_TEL, ignoreCase = true)) {
+            respondWithDecision(callDetails, ScreeningResult.unknown("INVALID_HANDLE"))
+            return
+        }
+        val number = Protocol.normalizeTelNumber(handle.schemeSpecificPart)
+        if (number == null) {
+            respondWithDecision(callDetails, ScreeningResult.unknown("INVALID_NUMBER"))
             return
         }
 
-        // Normalize loosely: keep + and digits, strip spaces/dashes
-        val number = normalizeNumber(rawNumber)
-        Log.i(TAG, "Screening incoming call: ${maskNumber(number)}")
-
-        scope.launch {
-            val result = withTimeoutOrNull(1600) {
-                // Use screening timeout from config (default 1500ms) is enforced inside BridgeClient
-                bridgeClient.screenNumber(number)
-            } ?: ScreeningResult.unknown(java.util.UUID.randomUUID().toString(), "SCREENING_TIMEOUT")
-
-            // Log screening event
-            Log.i(TAG, "Screening result for ${maskNumber(number)}: risk=${result.riskScore} verdict=${result.verdict} rec=${result.recommendedAction} applied=${result.appliedAction} mode=${result.mode} reason=${result.reason}")
-
-            // Phase 4 DRY-RUN: always ALLOW, never reject
-            // We explicitly do NOT call setDisallowCall(true) / setRejectCall(true) / setSilenceCall(true)
-            val response = CallResponse.Builder()
-                .setDisallowCall(false)
-                .setRejectCall(false)
-                .setSkipCallLog(false)
-                .setSkipNotification(false)
-                .build()
-
-            // Record that recommended was BLOCK but applied ALLOW in dry-run
-            if (result.recommendedAction == "BLOCK") {
-                Log.i(TAG, "Dry-run: recommended BLOCK but applied ALLOW for ${maskNumber(number)}")
-            }
-
+        serviceScope.launch {
+            var result = ScreeningResult.unknown("INTERNAL_ERROR")
             try {
-                respondToCall(callDetails, response)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to respond to call", e)
+                result = withTimeoutOrNull(SERVICE_TIMEOUT_MS) {
+                    bridgeClient.screenNumber(number)
+                } ?: ScreeningResult.unknown("SCREENING_TIMEOUT", SERVICE_TIMEOUT_MS.toInt())
+            } catch (exception: Exception) {
+                Log.w(TAG, "Bridge failure: ${exception.javaClass.simpleName}")
+                result = ScreeningResult.unknown("INTERNAL_ERROR")
+            } finally {
+                Log.i(
+                    TAG,
+                    "number=${maskNumber(number)} verdict=${result.verdict} " +
+                        "recommended=${result.recommendedAction} applied=${result.appliedAction} " +
+                        "mode=${result.mode} reason=${result.reason} latency=${result.latencyMs}ms"
+                )
+                val delivered = respondWithDecision(callDetails, result)
+                if (delivered && result.shouldApplyBlock()) {
+                    bridgeClient.confirmRejection(result.requestId)
+                }
             }
         }
     }
 
-    private fun normalizeNumber(raw: String): String {
-        // Keep + and digits, remove common formatting
-        var cleaned = raw.replace(Regex("[\\s\\-\\.\\(\\)\\[\\]/\\\\]+"), "")
-        if (cleaned.startsWith("00")) cleaned = "+" + cleaned.substring(2)
-        // Validate allowed chars
-        if (!cleaned.matches(Regex("^\\+?[0-9]+$"))) {
-            // If contains letters, treat as invalid
-            return raw
+    override fun onDestroy() {
+        serviceScope.cancel("CallScreeningService destroyed")
+        super.onDestroy()
+    }
+
+    private fun respondWithDecision(
+        callDetails: Call.Details,
+        result: ScreeningResult
+    ): Boolean {
+        val reject = result.shouldApplyBlock()
+        val response = CallResponse.Builder()
+            .setDisallowCall(reject)
+            .setRejectCall(reject)
+            .setSkipCallLog(false)
+            .setSkipNotification(false)
+            .build()
+        return try {
+            respondToCall(callDetails, response)
+            true
+        } catch (exception: Exception) {
+            Log.w(
+                TAG,
+                "Unable to deliver fail-open response (${result.reason}): " +
+                    exception.javaClass.simpleName
+            )
+            false
         }
-        if (!cleaned.startsWith("+")) cleaned = "+$cleaned"
-        return cleaned
     }
 
     private fun maskNumber(number: String): String {
-        if (number.length <= 4) return "***"
-        val digits = number.filter { it.isDigit() }
-        if (digits.length <= 4) return "***"
+        val digits = number.filter(Char::isDigit)
+        if (digits.length <= 4) return "****"
         val prefix = if (number.startsWith("+")) "+" else ""
-        val keep = minOf(3, digits.length - 4 - 2)
-        val suffix = digits.takeLast(4)
-        val middle = "*".repeat(maxOf(2, digits.length - keep - 4))
-        return prefix + digits.take(keep) + middle + suffix
+        return prefix + "*".repeat(digits.length - 4) + digits.takeLast(4)
     }
 }

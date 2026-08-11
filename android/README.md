@@ -1,138 +1,89 @@
-# CALLSHIELD Android Bridge — Phase 4
+# CALLSHIELD Android Bridge — Phase 8 Compatibility
 
-Minimal privileged bridge between Android's `CallScreeningService` and the Termux daemon.
+The Kotlin bridge connects Android `CallScreeningService` to the existing
+Termux daemon using a bounded filesystem `LocalSocket` only.
 
-> **Phase 4 receives and analyzes real Android call-screening events but does not automatically reject calls. Automatic rejection is intentionally disabled until Phase 5.**
+## Decision safety
 
-## Architecture
+Android requests rejection only when a strictly validated response contains:
 
-```
-REAL INCOMING CALL
-        │
-        ▼
-Android CallScreeningService (CallShieldScreeningService.kt)
-        │
-        ▼
-BridgeClient (Protocol.kt / ScreeningResult.kt)
-        │
-        ▼
-Local CALLSHIELD IPC (~/.callshield/run/callshield.sock, Unix socket, 700)
-        │
-        ▼
-Termux Daemon 0.3.0+ (DaemonService + EventProcessor)
-        │
-        ▼
-Detection Engine (analyze_number)
-        │
-        ▼
-DetectionResult → Bridge response
-        │
-        ▼
-Android Bridge (logs, returns dry-run ALLOW)
+```text
+recommended_action = BLOCK
+applied_action = BLOCK
+mode = ACTIVE
+emergency_off = false
+policy_error = false
 ```
 
-The fraud engine remains in Python/Termux. The Android component is only a privileged bridge.
+Every other state is ALLOW, including malformed input/response, unexpected
+action or mode, timeout, unavailable daemon/socket, emergency, cancellation,
+and internal errors.
+
+## Phase 6 protocol hardening
+
+Screening requests now include:
+
+- exact `callshield/1` protocol
+- fresh UUID request ID
+- timezone timestamp within the replay window
+- validated `tel:` number
+- `android_call_screening` source
+
+Rejection feedback uses a separate fresh request UUID/timestamp and carries the
+original screening request ID as `screening_request_id`. The daemon maintains a
+bounded replay cache and confirms only a persisted ACTIVE applied block.
+
+Request/response sizes and read time remain bounded. Invalid daemon JSON is
+rejected before `ScreeningResult` can request a block.
+
+## Lifecycle
+
+The service processes incoming calls only. Null, non-`tel`, empty, or malformed
+handles immediately ALLOW. The coroutine scope is tied to service destruction;
+lifecycle cancellation remains fail-open.
 
 ## Permissions
 
-- **Required:** No manifest permission for call screening; Android grants via `RoleManager` / Settings → Default apps → Call screening.
-- **NOT requested:** CAMERA, MICROPHONE, LOCATION, SMS, CONTACTS, STORAGE, root.
+The manifest requests no camera, microphone, contacts, SMS, location, storage,
+accessibility, or Internet permission. Android's protected Call Screening role
+must be explicitly granted by the user.
 
-## Screening Setup
+## Safe defaults and emergency
 
-1. Install Termux: `pkg update && pkg upgrade && pkg install python git`
-2. Install CALLSHIELD: `git clone <repo> && cd Callshield && bash scripts/install.sh`
-3. Build Android bridge (if SDK available):
-   ```bash
-   cd android
-   ./gradlew assembleDebug  # or use Android Studio
-   adb install app/build/outputs/apk/debug/app-debug.apk
-   ```
-   If SDK/Gradle is not available, the bridge cannot be built on this host — see "Build Validation" below.
-4. Enable call screening:
-   - Android Settings → Apps → Default apps → Call screening app → select **CallShield Bridge**
-   - Or: `adb shell telecom set-call-screening-service com.callshield.bridge/.CallShieldScreeningService`
-5. Verify:
-   ```bash
-   callshield screening status  # Bridge CONNECTED, Mode DRY_RUN, Timeout 1500ms
-   callshield status            # Daemon RUNNING, Call Screening NOT CONNECTED (dry-run) until real call
-   callshield metrics           # Incoming Calls, Screened, etc.
-   ```
+Fresh Termux configuration is screening disabled and DRY_RUN. ACTIVE requires
+explicit CLI confirmation. The owner-only emergency marker overrides ACTIVE,
+and reset leaves protection disabled and DRY_RUN.
 
-## Dry-Run Mode
+## Android/Termux isolation limitation
 
-- `screening_mode` defaults to `DRY_RUN` (config `screening_mode=DRY_RUN`, `screening_timeout_ms=1500`).
-- Every call is analyzed (real `risk_score`, `verdict`, `recommended_action`), but **applied is always `ALLOW`**:
-  ```
-  Recommended: BLOCK (risk 94)
-  Applied:     ALLOW
-  Reason:      DRY_RUN
-  ```
-- Change (Phase 4 only allows DRY_RUN):
-  ```bash
-  callshield screening mode          # show
-  callshield screening enable        # enable bridge
-  callshield screening disable       # disable
-  ```
+Termux and a separately installed Android bridge normally use different UIDs.
+Filesystem permissions and SELinux commonly prevent opening Termux's private
+0600 socket. No TCP, HTTP, public socket, or root workaround is provided. A
+secure shared Unix endpoint or same-UID companion deployment remains required
+for physical use.
 
-## Termux IPC
+CLI `Bridge: CONNECTED` means local CLI-to-daemon IPC only; it does not verify a
+device or granted Android role.
 
-- **Primary:** Unix socket `~/.callshield/run/callshield.sock` (700, local-only, JSON, 16KB req, 64KB resp, timeout, no TCP).
-- **Android sandbox:** Direct access to Termux private `~/.callshield` may be blocked on Android 10+ (SELinux). The bridge first tries `LocalSocket` to the Termux path, then fallback to `/data/local/tmp/callshield.sock` (documented alternative, also 700, still local, no network). **No insecure world-readable bridge is created.** If both fail, the bridge fails safely (`UNKNOWN`/`ALLOW`, reason `DAEMON_UNAVAILABLE`/`SCREENING_TIMEOUT`).
+## Build status
 
-## Protocol
+JDK, Gradle/wrapper, Android SDK, emulator, and physical device were unavailable:
 
-Request (`callshield/1`):
-```json
-{
-  "protocol": "callshield/1",
-  "type": "incoming_call",
-  "request_id": "uuid",
-  "number": "+919876543210",
-  "timestamp": "2026-08-10T12:00:00Z"
-}
+```text
+ANDROID BUILD = NOT VERIFIED
+PHYSICAL DEVICE = NOT VERIFIED
 ```
 
-Response:
-```json
-{
-  "protocol": "callshield/1",
-  "request_id": "uuid",
-  "risk_score": 87,
-  "confidence": 92,
-  "verdict": "HIGH_RISK",
-  "recommended_action": "BLOCK",
-  "applied_action": "ALLOW",
-  "mode": "DRY_RUN"
-}
-```
+No APK or physical rejection result is claimed.
 
-Validated: protocol version, request_id, number format, size. Never `eval`/`exec`.
+## Phase 8 intelligence context
 
-## Timeout
+The daemon may include local reputation and adaptive trend/pattern/delta fields
+as additional response context. Android's ACTIVE safety decision remains based
+on the existing validated policy/action/mode/emergency fields; adaptive
+intelligence cannot request rejection directly and no new Android blocking path
+was added.
 
-- `screening_timeout_ms` default 1500ms.
-- If daemon doesn't respond in time, bridge returns `UNKNOWN`/`ALLOW`/`SCREENING_TIMEOUT`, never rejects.
+## Phase boundary
 
-## Privacy
-
-- Local only, no upload, masked logs (`+91******210`), minimal `screening_events` table (masked + hash, not raw), documented.
-
-## Build Validation
-
-If `ANDROID_HOME`/`gradle` not available, build is skipped and reported as limitation; Python/Termux tests still validate.
-
-```bash
-./gradlew testDebugUnitTest  # runs Protocol/ScreeningResult/BridgeClient tests
-```
-
-## No Auto-Rejection
-
-Phase 4 never calls `setDisallowCall(true)`, `setRejectCall(true)`, `setSilenceCall(true)`, root, or hidden APIs. See `CallShieldScreeningService.kt` — always builds `CallResponse.Builder().setDisallowCall(false).setRejectCall(false)...`.
-
-## Troubleshooting
-
-- `callshield screening status` shows `NOT CONNECTED` → check `callshield status` (daemon RUNNING?), `callshield metrics`, `adb logcat | grep CallShieldScreening`
-- `TIMEOUT` → increase `screening_timeout_ms` via `callshield config set screening_timeout_ms 2000` (200–5000)
-- Permissions: ensure call-screening role granted in Settings.
-
+Phase 9 has not started.

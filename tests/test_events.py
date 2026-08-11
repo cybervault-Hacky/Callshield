@@ -19,7 +19,18 @@ class TestEventModel(unittest.TestCase):
 
     def test_invalid_type(self):
         with self.assertRaises(ValueError):
-            create_event("FAKE_EVENT", number="+919876543210")
+            create_event("UNSUPPORTED_EVENT", number="+919876543210")
+
+    def test_phase4_incoming_call_type(self):
+        from callshield.events.types import SOURCE_ANDROID
+
+        event = create_event(
+            "INCOMING_CALL",
+            number="+919876543210",
+            source=SOURCE_ANDROID,
+        )
+        self.assertEqual(event.event_type, "INCOMING_CALL")
+        self.assertEqual(event.source, "android_call_screening")
 
     def test_from_dict(self):
         data = {
@@ -42,6 +53,36 @@ class TestEventModel(unittest.TestCase):
         for t in VALID_EVENT_TYPES:
             ev = create_event(t, number="+919876543210" if t not in ("SYSTEM", "HEARTBEAT") else None)
             self.assertEqual(ev.event_type, t)
+
+    def test_event_id_must_be_uuid(self):
+        with self.assertRaises(ValueError):
+            Event(event_id="not-a-uuid", event_type="SYSTEM")
+
+    def test_timestamp_must_be_timezone_aware_iso(self):
+        with self.assertRaises(ValueError):
+            Event(event_type="SYSTEM", timestamp="yesterday")
+        with self.assertRaises(ValueError):
+            Event(event_type="SYSTEM", timestamp="2026-08-11T12:00:00")
+
+    def test_payload_uses_utf8_byte_limit(self):
+        # 2,100 emoji are fewer than 8,192 characters but exceed 8 KiB UTF-8.
+        with self.assertRaises(ValueError):
+            Event(event_type="SYSTEM", payload={"value": "😀" * 2100})
+
+    def test_payload_must_be_json_serializable(self):
+        with self.assertRaises(ValueError):
+            Event(event_type="SYSTEM", payload={"bad": {1, 2, 3}})
+
+    def test_from_dict_does_not_coerce_malformed_payload(self):
+        with self.assertRaises(ValueError):
+            Event.from_dict(
+                {
+                    "event_type": "SYSTEM",
+                    "timestamp": "2026-08-11T12:00:00Z",
+                    "source": "TEST",
+                    "payload": [],
+                }
+            )
 
 
 class TestEventProcessor(unittest.TestCase):
@@ -88,6 +129,27 @@ class TestEventProcessor(unittest.TestCase):
         ev.payload = {"number": "+919876543210", "extra": "x" * 100}
         result = proc.process(ev)
         self.assertIn(result["status"], ("processed", "failed"))
+
+    def test_action_events_are_advisory_records_only(self):
+        proc = EventProcessor(self.cfg)
+        number = "+919876543210"
+        for event_type in ("BLOCK_ACTION", "ALLOW_ACTION"):
+            result = proc.process(
+                create_event(event_type, number=number, source="TEST")
+            )
+            self.assertEqual(result["status"], "processed")
+        # Neither event mutates the user's blacklist or whitelist.
+        self.assertIsNone(self.db.get_list_entry(number, "blacklist"))
+        self.assertIsNone(self.db.get_list_entry(number, "whitelist"))
+
+    def test_configured_payload_limit_is_rechecked(self):
+        self.cfg.event_payload_limit = 256
+        proc = EventProcessor(self.cfg)
+        event = create_event(
+            "NUMBER_SCAN", number="+919876543210", payload={"x": "y" * 300}
+        )
+        with self.assertRaises(ValueError):
+            proc.process(event)
 
 
 if __name__ == "__main__":

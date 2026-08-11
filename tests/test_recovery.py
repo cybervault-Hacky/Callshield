@@ -1,8 +1,14 @@
 """Tests for crash recovery and shutdown (Phase 3)."""
 
+import socket
+import threading
 import time
 import unittest
+from pathlib import Path
 
+from callshield.daemon.process import DaemonError
+from callshield.daemon.recovery import recover_runtime, validate_startup
+from callshield.daemon.service import DaemonService
 from callshield.events import Event, EventQueue
 from callshield.events.processor import EventProcessor
 from tests._common import IsolatedEnv
@@ -74,6 +80,78 @@ class TestRecovery(unittest.TestCase):
         from callshield.daemon.process import status
         state, _ = status(self.cfg)
         self.assertEqual(state, "STOPPED")
+
+    def test_stale_pid_and_socket_recovery(self):
+        pid_path = Path(self.cfg.pid_file)
+        pid_path.write_text("999999", encoding="utf-8")
+        socket_path = Path(self.cfg.socket_path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.close()
+
+        recover_runtime(self.cfg)
+        self.assertFalse(pid_path.exists())
+        self.assertFalse(socket_path.exists())
+
+    def test_active_socket_is_never_removed(self):
+        socket_path = Path(self.cfg.socket_path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        try:
+            with self.assertRaises(DaemonError):
+                recover_runtime(self.cfg)
+            self.assertTrue(socket_path.exists())
+        finally:
+            listener.close()
+            socket_path.unlink(missing_ok=True)
+
+    def test_non_socket_runtime_file_is_preserved(self):
+        socket_path = Path(self.cfg.socket_path)
+        socket_path.write_text("unrelated", encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            validate_startup(self.cfg)
+        self.assertEqual(socket_path.read_text(encoding="utf-8"), "unrelated")
+
+    def test_processor_exception_isolated_in_worker(self):
+        service = DaemonService(self.cfg)
+        original = service.processor.process
+        calls = {"count": 0}
+
+        def flaky(event):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("isolated test failure")
+            return original(event)
+
+        service.processor.process = flaky
+        worker = threading.Thread(target=service._processor_loop)
+        worker.start()
+        service.queue.enqueue(Event(event_type="SYSTEM", source="TEST"))
+        service.queue.enqueue(Event(event_type="SYSTEM", source="TEST"))
+        self.assertTrue(service.queue.wait_until_done(3.0))
+        service.request_shutdown()
+        worker.join(timeout=2.0)
+        snapshot = service.health.snapshot()
+        self.assertEqual(snapshot["failed"], 1)
+        self.assertEqual(snapshot["processed"], 1)
+        self.assertFalse(worker.is_alive())
+        service._do_graceful_shutdown()
+
+    def test_graceful_shutdown_processes_accepted_queue(self):
+        service = DaemonService(self.cfg)
+        worker = threading.Thread(target=service._processor_loop)
+        worker.start()
+        for _ in range(4):
+            self.assertTrue(
+                service.queue.enqueue(Event(event_type="SYSTEM", source="TEST"))
+            )
+        service.request_shutdown()
+        self.assertTrue(service.queue.wait_until_done(3.0))
+        worker.join(timeout=2.0)
+        self.assertEqual(service.health.snapshot()["processed"], 4)
+        self.assertEqual(service.queue.size(), 0)
+        service._do_graceful_shutdown()
 
 
 if __name__ == "__main__":

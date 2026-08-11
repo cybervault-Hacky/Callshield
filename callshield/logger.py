@@ -14,12 +14,13 @@ The module also provides a small wrapper so the rest of the code can call
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
 from .config import Config
 from .database import Database
-from .utils import iso_now
+from .utils import iso_now, mask_number
 
 
 _EVENT_LOGGER_NAME = "callshield.file"
@@ -35,7 +36,15 @@ def get_file_logger(log_path: Path) -> logging.Logger:
     logger.handlers = []
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            log_path.parent.chmod(0o700)
+        except OSError:
+            pass
         handler = logging.FileHandler(log_path, encoding="utf-8")
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass
     except OSError:
         # Fall back to a stderr logger if the file is unwritable, so we don't
         # lose diagnostics.
@@ -99,7 +108,7 @@ def log_event(
     try:
         get_file_logger(Path(cfg.log_file)).info(
             "event id=%s number=%s score=%s conf=%s rep=%s verdict=%s action=%s reason=%s",
-            event_id, number, risk_score, confidence, reputation,
+            event_id, mask_number(number), risk_score, confidence, reputation,
             verdict, action, reason,
         )
     except Exception:  # pragma: no cover - logging must never break flow

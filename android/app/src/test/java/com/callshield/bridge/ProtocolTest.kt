@@ -1,82 +1,95 @@
 package com.callshield.bridge
 
+import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
+import java.util.UUID
 
 class ProtocolTest {
     @Test
-    fun testValidRequest() {
-        val req = Protocol.ScreeningRequest(number = "+919876543210")
-        assertNull(req.validate())
-        val json = req.toJsonString()
-        assertTrue(json.contains("callshield/1"))
-        assertTrue(json.contains("+919876543210"))
+    fun exactAndroidRequestContract() {
+        val id = UUID.randomUUID().toString()
+        val request = Protocol.ScreeningRequest(requestId = id, number = "+919876543210")
+        assertNull(request.validate())
+        val json = JSONObject(request.toJsonString())
+        assertEquals(setOf("protocol", "request_id", "timestamp", "number", "source"), json.keys().asSequence().toSet())
     }
 
     @Test
-    fun testInvalidProtocol() {
-        val req = Protocol.ScreeningRequest(protocol = "bad/1", number = "+919876543210")
-        assertNotNull(req.validate())
+    fun requestValidationRejectsMalformedValues() {
+        assertNotNull(Protocol.ScreeningRequest(protocol = "other/1", number = "+919876543210").validate())
+        assertNotNull(Protocol.ScreeningRequest(requestId = "bad", number = "+919876543210").validate())
+        assertNotNull(Protocol.ScreeningRequest(number = "not-a-number").validate())
     }
 
     @Test
-    fun testMissingNumber() {
-        val req = Protocol.ScreeningRequest(number = "")
-        assertNotNull(req.validate())
+    fun activeBlockResponseIsValid() {
+        val response = Protocol.ScreeningResponse.fromJson(responseJson("BLOCK", "BLOCK", "ACTIVE"))
+        assertNotNull(response)
+        assertTrue(response!!.isValid())
     }
 
     @Test
-    fun testNumberTooLong() {
-        val req = Protocol.ScreeningRequest(number = "1".repeat(101))
-        assertNotNull(req.validate())
+    fun dryRunBlockApplicationIsRejected() {
+        assertNull(Protocol.ScreeningResponse.fromJson(responseJson("BLOCK", "BLOCK", "DRY_RUN")))
     }
 
     @Test
-    fun testResponseParsing() {
-        val json = """{"protocol":"callshield/1","request_id":"abc","risk_score":87,"confidence":92,"verdict":"HIGH_RISK","recommended_action":"BLOCK","applied_action":"ALLOW","mode":"DRY_RUN"}"""
-        val resp = Protocol.ScreeningResponse.fromJson(json)
-        assertNotNull(resp)
-        assertEquals(87, resp!!.riskScore)
-        assertEquals("HIGH_RISK", resp.verdict)
-        assertEquals("ALLOW", resp.appliedAction)
-        assertTrue(resp.isValid())
+    fun malformedOrUnexpectedDecisionFailsParsing() {
+        assertNull(Protocol.ScreeningResponse.fromJson("not-json"))
+        assertNull(Protocol.ScreeningResponse.fromJson(responseJson("BLOCK", "INVALID", "ACTIVE")))
+        assertNull(Protocol.ScreeningResponse.fromJson(responseJson("BLOCK", "BLOCK", "UNKNOWN")))
     }
 
     @Test
-    fun testResponseRejectsBlockApplied() {
-        val json = """{"protocol":"callshield/1","request_id":"abc","risk_score":90,"confidence":90,"verdict":"MALICIOUS","recommended_action":"BLOCK","applied_action":"BLOCK","mode":"DRY_RUN"}"""
-        val resp = Protocol.ScreeningResponse.fromJson(json)
-        assertNotNull(resp)
-        // Phase 4 must not have applied BLOCK
-        assertFalse(resp!!.isValid())
+    fun emergencyCannotApplyBlock() {
+        assertNull(
+            Protocol.ScreeningResponse.fromJson(
+                responseJson("BLOCK", "BLOCK", "ACTIVE", emergency = true)
+            )
+        )
     }
 
     @Test
-    fun testTimeoutResponse() {
-        val resp = Protocol.ScreeningResponse.timeout("req-123")
-        assertEquals("UNKNOWN", resp.verdict)
-        assertEquals("ALLOW", resp.appliedAction)
-        assertEquals("SCREENING_TIMEOUT", resp.reason)
+    fun feedbackContractIsBoundedAndValidated() {
+        val id = UUID.randomUUID().toString()
+        val feedback = Protocol.ScreeningFeedback(screeningRequestId = id)
+        assertTrue(feedback.validate())
+        val json = JSONObject(feedback.toJsonString())
+        assertEquals("screening_feedback", json.getString("command"))
+        assertEquals(id, json.getString("screening_request_id"))
+        assertEquals("REJECTED", json.getString("result"))
     }
 
     @Test
-    fun testRequestIdMatching() {
-        val req = Protocol.ScreeningRequest(number = "+919876543210", requestId = "test-123")
-        val respJson = """{"protocol":"callshield/1","request_id":"test-123","risk_score":10,"confidence":50,"verdict":"UNKNOWN","recommended_action":"ALLOW","applied_action":"ALLOW","mode":"DRY_RUN"}"""
-        val resp = Protocol.ScreeningResponse.fromJson(respJson)
-        assertEquals(req.requestId, resp!!.requestId)
+    fun telNumberNormalizationIsConservative() {
+        assertEquals("+919876543210", Protocol.normalizeTelNumber("+91 98765-43210"))
+        assertNull(Protocol.normalizeTelNumber(null))
+        assertNull(Protocol.normalizeTelNumber("sip:user@example.com"))
     }
 
-    @Test
-    fun testMalformedResponse() {
-        val resp = Protocol.ScreeningResponse.fromJson("not json")
-        assertNull(resp)
-    }
-
-    @Test
-    fun testSizeLimits() {
-        val req = Protocol.ScreeningRequest(number = "+919876543210")
-        val json = req.toJsonString()
-        assertTrue(json.toByteArray().size <= Protocol.MAX_REQUEST_BYTES)
+    private fun responseJson(
+        recommended: String,
+        applied: String,
+        mode: String,
+        emergency: Boolean = false
+    ): String {
+        return JSONObject().apply {
+            put("protocol", "callshield/1")
+            put("request_id", UUID.randomUUID().toString())
+            put("risk_score", 95)
+            put("confidence", 95)
+            put("verdict", "MALICIOUS")
+            put("recommended_action", recommended)
+            put("applied_action", applied)
+            put("mode", mode)
+            put("reason", "test")
+            put("latency_ms", 10)
+            put("policy_name", "BALANCED")
+            put("threshold", 85)
+            put("confidence_threshold", 80)
+            put("emergency_off", emergency)
+            put("policy_error", false)
+        }.toString()
     }
 }

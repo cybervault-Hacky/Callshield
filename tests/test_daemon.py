@@ -88,6 +88,86 @@ class TestDaemonProcess(unittest.TestCase):
         # Cleanup
         subprocess.run([sys.executable, "-m", "callshield", "stop"], env=env, capture_output=True, text=True, cwd=str(pathlib.Path(__file__).resolve().parents[1]))
 
+    def test_explicit_daemon_commands_and_restart(self):
+        import pathlib
+        import subprocess
+        import sys
+
+        env = os.environ.copy()
+        root = pathlib.Path(__file__).resolve().parents[1]
+        env["CALLSHIELD_DATA_DIR"] = str(self.env.data)
+        env["CALLSHIELD_LOG_DIR"] = str(self.env.logs)
+        env["PYTHONPATH"] = str(root)
+        commands = (
+            (["daemon", "start"], "started"),
+            (["daemon", "status"], "RUNNING"),
+            (["daemon", "info"], "DAEMON INFO"),
+            (["daemon", "health"], "HEALTH"),
+            (["daemon", "restart"], "started"),
+            (["daemon", "status"], "RUNNING"),
+            (["daemon", "stop"], "stopped"),
+        )
+        for arguments, expected in commands:
+            result = subprocess.run(
+                [sys.executable, "-m", "callshield", *arguments],
+                env=env,
+                capture_output=True,
+                text=True,
+                cwd=str(root),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(expected.lower(), result.stdout.lower())
+
+    def test_watch_interrupt_keeps_daemon_running(self):
+        import pathlib
+        import signal
+        import subprocess
+        import sys
+
+        env = os.environ.copy()
+        root = pathlib.Path(__file__).resolve().parents[1]
+        env["CALLSHIELD_DATA_DIR"] = str(self.env.data)
+        env["CALLSHIELD_LOG_DIR"] = str(self.env.logs)
+        env["PYTHONPATH"] = str(root)
+        started = subprocess.run(
+            [sys.executable, "-m", "callshield", "daemon", "start"],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=str(root),
+        )
+        self.assertEqual(started.returncode, 0, started.stderr)
+        watcher = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "callshield",
+                "status",
+                "--watch",
+                "--interval",
+                "1",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(root),
+        )
+        time.sleep(1.2)
+        watcher.send_signal(signal.SIGINT)
+        stdout, stderr = watcher.communicate(timeout=4)
+        self.assertEqual(watcher.returncode, 0, stderr)
+        self.assertIn("daemon keeps running", stdout)
+        current, _ = status(self.cfg)
+        self.assertEqual(current, "RUNNING")
+        subprocess.run(
+            [sys.executable, "-m", "callshield", "daemon", "stop"],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=str(root),
+        )
+
     def test_pid_cleanup(self):
         # Ensure stop cleans PID
         import subprocess, os, sys, pathlib

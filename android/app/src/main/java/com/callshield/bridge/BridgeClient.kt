@@ -1,190 +1,198 @@
 package com.callshield.bridge
 
-import android.util.Log
-import java.io.File
-import java.util.concurrent.TimeUnit
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.net.Socket
-import java.io.BufferedReader
-import java.io.BufferedWriter
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
-import android.net.LocalSocket
-import android.net.LocalSocketAddress
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
+import java.util.UUID
 
-/**
- * Bridge client that talks to Termux daemon via Unix domain socket.
- *
- * Primary: Unix socket at ~/.callshield/run/callshield.sock
- * Fallback: Documented file-based bridge at same dir (poll-based) if socket is inaccessible due to Android sandbox.
- * No TCP, no network, no root, no shell exec, size-limited, timeout-enforced.
- */
+/** Local Unix-domain-socket client for the existing CALLSHIELD daemon IPC. */
 class BridgeClient(
-    private val socketPath: String = "/data/data/com.termux/files/home/.callshield/run/callshield.sock",
-    private val fallbackSocketPaths: List<String> = listOf(
-        "/data/data/com.termux/files/home/.callshield/run/callshield.sock",
-        "/data/local/tmp/callshield.sock"
-    ),
-    private val timeoutMs: Long = 1500
+    private val socketPath: String = DEFAULT_TERMUX_SOCKET,
+    additionalSocketPaths: List<String> = emptyList(),
+    timeoutMs: Int = DEFAULT_TIMEOUT_MS
 ) {
     companion object {
-        private const val TAG = "CallShieldBridge"
-        const val PROTOCOL = "callshield/1"
+        const val DEFAULT_TIMEOUT_MS = 1500
+        const val DEFAULT_TERMUX_SOCKET =
+            "/data/data/com.termux/files/home/.callshield/run/callshield.sock"
     }
 
-    /**
-     * Send screening request and await response with timeout.
-     * Returns ScreeningResult; on timeout/error returns UNKNOWN/ALLOW with reason.
-     */
-    suspend fun screenNumber(number: String, requestId: String? = null): ScreeningResult {
-        val reqId = requestId ?: java.util.UUID.randomUUID().toString()
+    private val effectiveTimeoutMs = timeoutMs.coerceIn(200, 5000)
+    private val socketPaths = (listOf(socketPath) + additionalSocketPaths)
+        .filter { it.isNotBlank() }
+        .distinct()
+        .take(4)
+
+    /** Return a fail-open result for every validation, transport, or protocol failure. */
+    suspend fun screenNumber(number: String, requestId: String = UUID.randomUUID().toString()): ScreeningResult {
+        val started = System.nanoTime()
         val request = Protocol.ScreeningRequest(
-            protocol = Protocol.VERSION,
-            type = "incoming_call",
-            requestId = reqId,
+            requestId = requestId,
             number = number
         )
-        val validationError = request.validate()
-        if (validationError != null) {
-            Log.w(TAG, "Invalid request: $validationError")
-            return ScreeningResult.unknown(reqId, "INVALID_NUMBER")
+        request.validate()?.let { reason ->
+            return ScreeningResult.unknown(reason, elapsed(started))
+        }
+        val encodedRequest = (request.toJsonString() + "\n").toByteArray(StandardCharsets.UTF_8)
+        if (encodedRequest.size > Protocol.MAX_REQUEST_BYTES) {
+            return ScreeningResult.unknown("REQUEST_TOO_LARGE", elapsed(started))
         }
 
-        val jsonStr = request.toJsonString()
-        if (jsonStr.toByteArray().size > Protocol.MAX_REQUEST_BYTES) {
-            return ScreeningResult.unknown(reqId, "REQUEST_TOO_LARGE")
-        }
-
-        // Try primary socket, then fallbacks
-        val pathsToTry = listOf(socketPath) + fallbackSocketPaths.filter { it != socketPath }
-        for (path in pathsToTry) {
-            val result = trySocket(path, jsonStr, reqId)
-            if (result != null) {
-                // Valid response received
-                return result
+        val response = withContext(Dispatchers.IO) {
+            withTimeoutOrNull(effectiveTimeoutMs.toLong()) {
+                for (path in socketPaths) {
+                    val candidate = requestOnSocket(path, encodedRequest, requestId)
+                    if (candidate != null) return@withTimeoutOrNull candidate
+                }
+                null
             }
         }
+        if (response != null) return response
 
-        // All paths failed — daemon unavailable, return safe fallback
-        Log.w(TAG, "Daemon unavailable for $number, returning UNKNOWN/ALLOW")
-        return ScreeningResult.unknown(reqId, "DAEMON_UNAVAILABLE")
-    }
-
-    private suspend fun trySocket(path: String, jsonStr: String, reqId: String): ScreeningResult? = withContext(Dispatchers.IO) {
-        return@withContext withTimeoutOrNull(timeoutMs) {
-            var socket: LocalSocket? = null
-            var socket2: Socket? = null
-            try {
-                // Try Android LocalSocket first (Unix domain)
-                socket = LocalSocket()
-                val address = LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM)
-                socket.connect(address)
-                socket.soTimeout = timeoutMs.toInt()
-
-                val writer = BufferedWriter(OutputStreamWriter(socket.outputStream))
-                val reader = BufferedReader(InputStreamReader(socket.inputStream))
-
-                writer.write(jsonStr)
-                writer.write("\n")
-                writer.flush()
-
-                // Read response with timeout
-                val response = StringBuilder()
-                var line: String?
-                val start = System.currentTimeMillis()
-                while (System.currentTimeMillis() - start < timeoutMs) {
-                    if (reader.ready()) {
-                        line = reader.readLine()
-                        if (line != null) {
-                            response.append(line)
-                            break
-                        }
-                    } else {
-                        Thread.sleep(50)
-                    }
-                    if (response.length > Protocol.MAX_RESPONSE_BYTES) {
-                        break
-                    }
-                }
-
-                if (response.isEmpty()) {
-                    return@withTimeoutOrNull null
-                }
-
-                val respStr = response.toString()
-                if (respStr.toByteArray().size > Protocol.MAX_RESPONSE_BYTES) {
-                    Log.w(TAG, "Response too large")
-                    return@withTimeoutOrNull null
-                }
-
-                val protoResp = Protocol.ScreeningResponse.fromJson(respStr)
-                if (protoResp == null) {
-                    Log.w(TAG, "Malformed response: $respStr")
-                    return@withTimeoutOrNull null
-                }
-
-                // Validate request_id matches
-                if (protoResp.requestId != reqId) {
-                    Log.w(TAG, "Request ID mismatch")
-                    return@withTimeoutOrNull null
-                }
-
-                // Phase 4 dry-run: ensure applied is ALLOW
-                if (protoResp.appliedAction != "ALLOW") {
-                    Log.w(TAG, "Unexpected appliedAction ${protoResp.appliedAction}, forcing ALLOW for dry-run")
-                    return@withTimeoutOrNull ScreeningResult(
-                        riskScore = protoResp.riskScore,
-                        confidence = protoResp.confidence,
-                        verdict = protoResp.verdict,
-                        recommendedAction = protoResp.recommendedAction,
-                        appliedAction = "ALLOW",
-                        mode = "DRY_RUN",
-                        reason = protoResp.reason
-                    )
-                }
-
-                return@withTimeoutOrNull ScreeningResult.fromProtocolResponse(protoResp)
-            } catch (e: Exception) {
-                Log.w(TAG, "Socket $path failed: ${e.message}")
-                // Try Java Socket as fallback (for Termux's run dir via file descriptor)
-                // This is not used but kept for documentation of fallback mechanism
-                return@withTimeoutOrNull null
-            } finally {
-                try { socket?.close() } catch (_: Exception) {}
-                try { socket2?.close() } catch (_: Exception) {}
-            }
-        } ?: run {
-            // Timeout
-            Log.w(TAG, "Screening timeout for $reqId")
-            null
+        val reason = if (elapsed(started) >= effectiveTimeoutMs - 20) {
+            "SCREENING_TIMEOUT"
+        } else {
+            "DAEMON_UNAVAILABLE"
         }
+        return ScreeningResult.unknown(reason, elapsed(started))
     }
 
-    /**
-     * Check if bridge can connect (for health).
-     */
+    /** CONNECTED means only that the daemon's local ping operation answered. */
     suspend fun checkBridge(): Boolean = withContext(Dispatchers.IO) {
-        val pathsToTry = listOf(socketPath) + fallbackSocketPaths.filter { it != socketPath }
-        for (path in pathsToTry) {
-            try {
-                val file = File(path)
-                if (file.exists()) {
-                    // Try ping
-                    val s = LocalSocket()
-                    s.connect(LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM))
-                    s.soTimeout = 500
-                    val writer = BufferedWriter(OutputStreamWriter(s.outputStream))
-                    val reader = BufferedReader(InputStreamReader(s.inputStream))
-                    writer.write("""{"command":"ping"}""" + "\n")
-                    writer.flush()
-                    val line = reader.readLine()
-                    s.close()
-                    if (line != null && line.contains("pong")) return@withContext true
+        withTimeoutOrNull(500L) {
+            for (path in socketPaths) {
+                if (pingSocket(path)) return@withTimeoutOrNull true
+            }
+            false
+        } ?: false
+    }
+
+    /** Confirm rejection only after Android accepted an ACTIVE block response. */
+    suspend fun confirmRejection(requestId: String): Boolean {
+        val feedback = Protocol.ScreeningFeedback(screeningRequestId = requestId)
+        if (!feedback.validate()) return false
+        val encoded = (feedback.toJsonString() + "\n").toByteArray(StandardCharsets.UTF_8)
+        return withContext(Dispatchers.IO) {
+            withTimeoutOrNull(500L) {
+                for (path in socketPaths) {
+                    if (feedbackOnSocket(path, encoded)) return@withTimeoutOrNull true
                 }
-            } catch (_: Exception) {}
+                false
+            } ?: false
         }
-        return@withContext false
+    }
+
+    private fun requestOnSocket(
+        path: String,
+        request: ByteArray,
+        requestId: String
+    ): ScreeningResult? {
+        var socket: LocalSocket? = null
+        return try {
+            socket = LocalSocket()
+            socket.soTimeout = effectiveTimeoutMs
+            socket.connect(
+                LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM)
+            )
+            socket.soTimeout = effectiveTimeoutMs
+            socket.outputStream.write(request)
+            socket.outputStream.flush()
+            val responseText = readBoundedLine(socket, Protocol.MAX_RESPONSE_BYTES)
+                ?: return null
+            val response = Protocol.ScreeningResponse.fromJson(responseText)
+                ?: return null
+            if (response.requestId != requestId) return null
+            ScreeningResult.fromProtocolResponse(response)
+        } catch (_: Exception) {
+            null
+        } finally {
+            try {
+                socket?.close()
+            } catch (_: Exception) {
+                // Fail-open result is returned by the caller.
+            }
+        }
+    }
+
+    private fun feedbackOnSocket(path: String, request: ByteArray): Boolean {
+        var socket: LocalSocket? = null
+        return try {
+            socket = LocalSocket()
+            socket.soTimeout = 500
+            socket.connect(
+                LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM)
+            )
+            socket.soTimeout = 500
+            socket.outputStream.write(request)
+            socket.outputStream.flush()
+            val response = readBoundedLine(socket, 4096) ?: return false
+            val json = JSONObject(response)
+            json.optString("status") == "ok" && json.optBoolean("confirmed", false)
+        } catch (_: Exception) {
+            false
+        } finally {
+            try {
+                socket?.close()
+            } catch (_: Exception) {
+                // Confirmation failure must not change the call decision.
+            }
+        }
+    }
+
+    private fun pingSocket(path: String): Boolean {
+        var socket: LocalSocket? = null
+        return try {
+            socket = LocalSocket()
+            socket.soTimeout = 500
+            socket.connect(
+                LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM)
+            )
+            socket.soTimeout = 500
+            val ping = JSONObject().apply {
+                put("command", "ping")
+                put("protocol", Protocol.VERSION)
+                put("request_id", UUID.randomUUID().toString())
+                put("timestamp", java.time.Instant.now().toString())
+            }.toString().plus("\n").toByteArray(StandardCharsets.UTF_8)
+            socket.outputStream.write(ping)
+            socket.outputStream.flush()
+            val response = readBoundedLine(socket, 4096)
+            response?.contains("\"pong\":true") == true
+        } catch (_: Exception) {
+            false
+        } finally {
+            try {
+                socket?.close()
+            } catch (_: Exception) {
+                // The bridge remains fail-open.
+            }
+        }
+    }
+
+    private fun readBoundedLine(socket: LocalSocket, maximumBytes: Int): String? {
+        val output = ByteArrayOutputStream()
+        while (output.size() <= maximumBytes) {
+            val value = socket.inputStream.read()
+            if (value == -1 || value == '\n'.code) break
+            output.write(value)
+        }
+        if (output.size() == 0 || output.size() > maximumBytes) return null
+        val decoder = StandardCharsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+        return decoder.decode(ByteBuffer.wrap(output.toByteArray())).toString()
+    }
+
+    private fun elapsed(started: Long): Int {
+        return ((System.nanoTime() - started).coerceAtLeast(0L) / 1_000_000L)
+            .coerceAtMost(Int.MAX_VALUE.toLong())
+            .toInt()
     }
 }

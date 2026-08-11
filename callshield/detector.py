@@ -10,7 +10,7 @@ preserving the public API.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace, field
 from typing import Any, Dict, List, Optional
 
 from . import normalizer as norm
@@ -157,8 +157,9 @@ def _apply_weight_multipliers(cfg: Config) -> Config:
             weights[k] = max(
                 0, int(round(weights[k] * cfg.pattern_weight))
             )
-    cfg.signal_weights = weights
-    return cfg
+    # Never mutate the shared daemon configuration: Phase 4 may analyze
+    # several screening requests concurrently.
+    return replace(cfg, signal_weights=weights)
 
 
 def open_database(cfg: Config) -> Database:

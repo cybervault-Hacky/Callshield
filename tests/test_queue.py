@@ -62,6 +62,31 @@ class TestEventQueue(unittest.TestCase):
         self.assertEqual(m["size"], 3)
         self.assertGreaterEqual(m["peak"], 3)
 
+    def test_explicit_enqueue_dequeue_size_api(self):
+        q = EventQueue(maxsize=3)
+        event = Event(event_type="SYSTEM")
+        self.assertTrue(q.enqueue(event))
+        self.assertEqual(q.size(), 1)
+        self.assertEqual(q.dequeue(block=False).event_id, event.event_id)
+        q.task_done()
+        self.assertTrue(q.wait_until_done(0.1))
+
+    def test_drain_returns_all_queued_events(self):
+        q = EventQueue(maxsize=5)
+        for _ in range(4):
+            q.enqueue(Event(event_type="SYSTEM"))
+        drained = q.drain()
+        self.assertEqual(len(drained), 4)
+        self.assertEqual(q.size(), 0)
+        self.assertTrue(q.wait_until_done(0.1))
+
+    def test_closed_enqueue_is_tracked_as_dropped(self):
+        q = EventQueue(maxsize=1)
+        q.close()
+        self.assertFalse(q.enqueue(Event(event_type="SYSTEM")))
+        self.assertEqual(q.metrics()["received"], 1)
+        self.assertEqual(q.metrics()["dropped"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

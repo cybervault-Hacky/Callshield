@@ -1,12 +1,8 @@
-"""Event type definitions for CALLSHIELD Phase 3.
-
-Phase 3 supports local event types only. No fake INCOMING_CALL.
-The enum is extensible for Phase 4 call-screening.
-"""
+"""Local event type definitions through CALLSHIELD Phase 4."""
 
 from __future__ import annotations
 
-# Valid event types for Phase 3+4
+# Valid event types for Phase 3
 VALID_EVENT_TYPES = (
     "NUMBER_SCAN",
     "USER_REPORT",

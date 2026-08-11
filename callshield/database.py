@@ -4,12 +4,13 @@ All queries are parameterized. The schema is created automatically on first
 connect. The layer exposes small, purpose-built methods used by the rest of the
 engine — it is not a generic ORM.
 
-Schema is migrated automatically from Phase 1 -> Phase 2 on first open.
+Schema is migrated automatically through Phase 8 on first open.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -19,14 +20,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from . import DATA_DIR
-from .utils import DatabaseError, ensure_parent
+from .utils import DatabaseError, ensure_parent, mask_number
 
 DEFAULT_DB_PATH = DATA_DIR / "callshield.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 7
 
 
 # ----- Schema --------------------------------------------------------------
-# Phase 2 schema. Phase 1 databases are migrated on open.
+# Current schema. Earlier databases are migrated on open.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version  INTEGER PRIMARY KEY
@@ -81,25 +82,140 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 CREATE TABLE IF NOT EXISTS screening_events (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp          TEXT NOT NULL,
-    number             TEXT NOT NULL,
-    number_masked      TEXT,
-    number_hash        TEXT,
-    risk_score         INTEGER NOT NULL,
-    confidence         INTEGER NOT NULL DEFAULT 0,
-    verdict            TEXT NOT NULL,
-    recommended_action TEXT NOT NULL,
-    applied_action     TEXT NOT NULL,
-    result_reason      TEXT,
-    latency_ms         INTEGER,
-    source             TEXT,
-    event_id           TEXT
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp            TEXT NOT NULL,
+    number               TEXT NOT NULL,
+    number_masked        TEXT NOT NULL,
+    number_hash          TEXT NOT NULL,
+    risk                 INTEGER NOT NULL CHECK (risk BETWEEN 0 AND 100),
+    confidence           INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    verdict              TEXT NOT NULL,
+    recommended_action   TEXT NOT NULL
+                           CHECK (recommended_action IN ('ALLOW','BLOCK')),
+    applied_action       TEXT NOT NULL DEFAULT 'ALLOW'
+                           CHECK (applied_action IN ('ALLOW','BLOCK')),
+    reason               TEXT,
+    latency_ms           INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+    source               TEXT NOT NULL,
+    event_id             TEXT NOT NULL,
+    mode                 TEXT NOT NULL DEFAULT 'DRY_RUN'
+                           CHECK (mode IN ('DRY_RUN','ACTIVE')),
+    policy_action        TEXT NOT NULL DEFAULT 'ALLOW'
+                           CHECK (policy_action IN ('ALLOW','BLOCK')),
+    policy_name          TEXT NOT NULL DEFAULT 'BALANCED'
+                           CHECK (policy_name IN ('RELAXED','BALANCED','STRICT')),
+    threshold            INTEGER NOT NULL DEFAULT 85 CHECK (threshold BETWEEN 0 AND 100),
+    confidence_threshold INTEGER NOT NULL DEFAULT 80
+                           CHECK (confidence_threshold BETWEEN 0 AND 100),
+    policy_reason        TEXT,
+    emergency_off        INTEGER NOT NULL DEFAULT 0 CHECK (emergency_off IN (0,1)),
+    actually_rejected    INTEGER NOT NULL DEFAULT 0 CHECK (actually_rejected IN (0,1)),
+    rejection_confirmed_at TEXT,
+    reputation_score      INTEGER CHECK (reputation_score BETWEEN 0 AND 100),
+    reputation_confidence INTEGER CHECK (reputation_confidence BETWEEN 0 AND 100),
+    reputation_trend      TEXT CHECK (reputation_trend IN ('IMPROVING','STABLE','WORSENING','UNKNOWN')),
+    reputation_reasons    TEXT,
+    CHECK (applied_action = 'ALLOW' OR (mode = 'ACTIVE' AND policy_action = 'BLOCK'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_screening_timestamp ON screening_events(timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_screening_number    ON screening_events(number);
+CREATE TABLE IF NOT EXISTS reputation_profiles (
+    number_hash          TEXT PRIMARY KEY,
+    number_masked        TEXT NOT NULL,
+    first_seen           TEXT,
+    last_seen            TEXT,
+    calls_seen           INTEGER NOT NULL DEFAULT 0,
+    calls_answered       INTEGER NOT NULL DEFAULT 0,
+    calls_rejected       INTEGER NOT NULL DEFAULT 0,
+    calls_allowed        INTEGER NOT NULL DEFAULT 0,
+    block_recommendations INTEGER NOT NULL DEFAULT 0,
+    user_reports         INTEGER NOT NULL DEFAULT 0,
+    risk_score           INTEGER NOT NULL DEFAULT 0 CHECK (risk_score BETWEEN 0 AND 100),
+    confidence           INTEGER NOT NULL DEFAULT 0 CHECK (confidence BETWEEN 0 AND 100),
+    risk                 TEXT NOT NULL DEFAULT 'UNKNOWN'
+                           CHECK (risk IN ('TRUSTED','LOW','MODERATE','HIGH','CRITICAL','UNKNOWN')),
+    trend                TEXT NOT NULL DEFAULT 'UNKNOWN'
+                           CHECK (trend IN ('IMPROVING','STABLE','WORSENING','UNKNOWN')),
+    signals_json         TEXT NOT NULL DEFAULT '[]',
+    reasons_json         TEXT NOT NULL DEFAULT '[]',
+    updated_at           TEXT NOT NULL
+);
 
+CREATE TABLE IF NOT EXISTS reputation_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    number_hash TEXT NOT NULL,
+    timestamp   TEXT NOT NULL,
+    old_score   INTEGER,
+    new_score   INTEGER NOT NULL CHECK (new_score BETWEEN 0 AND 100),
+    risk_before TEXT,
+    risk_after  TEXT NOT NULL,
+    trigger     TEXT NOT NULL,
+    FOREIGN KEY (number_hash) REFERENCES reputation_profiles(number_hash)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS trusted_numbers (
+    number_hash   TEXT PRIMARY KEY,
+    number_masked TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT,
+    note          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS intelligence_observations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    number_hash        TEXT NOT NULL,
+    number_masked      TEXT NOT NULL,
+    event_id           TEXT NOT NULL UNIQUE,
+    timestamp          TEXT NOT NULL,
+    event_type         TEXT NOT NULL,
+    risk_score         INTEGER NOT NULL CHECK (risk_score BETWEEN 0 AND 100),
+    confidence         INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    recommended_action TEXT NOT NULL CHECK (recommended_action IN ('ALLOW','BLOCK','UNKNOWN')),
+    applied_action     TEXT NOT NULL CHECK (applied_action IN ('ALLOW','BLOCK','UNKNOWN')),
+    confirmed          INTEGER NOT NULL DEFAULT 0 CHECK (confirmed IN (0,1)),
+    source             TEXT NOT NULL,
+    trust_state        TEXT NOT NULL DEFAULT 'UNKNOWN'
+                         CHECK (trust_state IN ('TRUSTED','UNTRUSTED','EXPIRED','UNKNOWN')),
+    trust_expires      TEXT,
+    evidence_json      TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS intelligence_profiles (
+    number_hash        TEXT PRIMARY KEY,
+    number_masked      TEXT NOT NULL,
+    baseline_score     INTEGER NOT NULL CHECK (baseline_score BETWEEN 0 AND 100),
+    current_score      INTEGER NOT NULL CHECK (current_score BETWEEN 0 AND 100),
+    confidence         INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    trend              TEXT NOT NULL
+                         CHECK (trend IN ('IMPROVING','STABLE','WORSENING','VOLATILE','INSUFFICIENT_DATA')),
+    risk_delta         INTEGER NOT NULL,
+    confidence_delta   INTEGER NOT NULL,
+    snapshot_json      TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_intelligence_observation_hash_time
+    ON intelligence_observations(number_hash, timestamp DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_intelligence_observation_event
+    ON intelligence_observations(event_id);
+CREATE INDEX IF NOT EXISTS idx_intelligence_observation_type
+    ON intelligence_observations(event_type, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_intelligence_profile_updated
+    ON intelligence_profiles(updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_reputation_updated
+    ON reputation_profiles(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reputation_risk
+    ON reputation_profiles(risk, risk_score DESC);
+CREATE INDEX IF NOT EXISTS idx_reputation_history_hash_time
+    ON reputation_history(number_hash, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_trusted_expiry
+    ON trusted_numbers(expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_screening_timestamp
+    ON screening_events(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_screening_hash
+    ON screening_events(number_hash);
 """
 
 
@@ -116,23 +232,36 @@ _P1_REPUTATION_MAP = {
 class Database:
     """Thin wrapper around a SQLite connection with CALLSHIELD schema helpers."""
 
-    def __init__(self, path: Optional[Path] = None) -> None:
+    def __init__(
+        self, path: Optional[Path] = None, *, timeout: float = 5.0
+    ) -> None:
         self.path = Path(path) if path else DEFAULT_DB_PATH
         ensure_parent(self.path)
+        connect_timeout = max(0.01, min(float(timeout), 30.0))
         try:
             self._conn = sqlite3.connect(
                 str(self.path),
                 check_same_thread=False,
+                timeout=connect_timeout,
             )
         except sqlite3.Error as exc:
             raise DatabaseError(f"Unable to open database at {self.path}: {exc}") from exc
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._initialize()
         try:
-            self._conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.Error:
-            pass
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.execute(f"PRAGMA busy_timeout = {int(connect_timeout * 1000)}")
+            journal_row = self._conn.execute("PRAGMA journal_mode = WAL").fetchone()
+            journal_mode = str(journal_row[0] if journal_row else "").lower()
+            if journal_mode != "wal":
+                raise DatabaseError(f"SQLite WAL mode unavailable at {self.path}")
+            self._conn.execute("PRAGMA synchronous = FULL")
+            self._initialize()
+            self.validate_schema()
+        except (sqlite3.Error, DatabaseError) as exc:
+            self._conn.close()
+            if isinstance(exc, DatabaseError):
+                raise
+            raise DatabaseError(f"Database setup failed at {self.path}: {exc}") from exc
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -143,6 +272,7 @@ class Database:
         try:
             self._conn.executescript(SCHEMA)
             self._migrate()
+            self._ensure_phase6_indexes()
         except sqlite3.Error as exc:
             raise DatabaseError(f"Database initialization failed: {exc}") from exc
 
@@ -185,6 +315,14 @@ class Database:
                 self._migrate_v1_to_v2()
             if current_version <= 2:
                 self._migrate_v2_to_v3()
+            if current_version <= 3:
+                self._migrate_v3_to_v4()
+            if current_version <= 4:
+                self._migrate_v4_to_v5()
+            if current_version <= 5:
+                self._migrate_v5_to_v6()
+            if current_version <= 6:
+                self._migrate_v6_to_v7()
         except sqlite3.Error as exc:
             raise DatabaseError(f"Database migration to v{SCHEMA_VERSION} failed: {exc}") from exc
 
@@ -301,7 +439,8 @@ class Database:
             )
 
     def _migrate_v2_to_v3(self) -> None:
-        # Add screening_events table for Phase 4
+        """Add the Phase 4 dry-run screening audit table."""
+
         with self._conn:
             self._conn.execute(
                 """
@@ -309,26 +448,352 @@ class Database:
                     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp          TEXT NOT NULL,
                     number             TEXT NOT NULL,
-                    number_masked      TEXT,
-                    number_hash        TEXT,
-                    risk_score         INTEGER NOT NULL,
-                    confidence         INTEGER NOT NULL DEFAULT 0,
+                    number_masked      TEXT NOT NULL,
+                    number_hash        TEXT NOT NULL,
+                    risk               INTEGER NOT NULL CHECK (risk BETWEEN 0 AND 100),
+                    confidence         INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
                     verdict            TEXT NOT NULL,
-                    recommended_action TEXT NOT NULL,
-                    applied_action     TEXT NOT NULL,
-                    result_reason      TEXT,
-                    latency_ms         INTEGER,
-                    source             TEXT,
-                    event_id           TEXT
+                    recommended_action TEXT NOT NULL
+                                         CHECK (recommended_action IN ('ALLOW','BLOCK','UNKNOWN')),
+                    applied_action     TEXT NOT NULL DEFAULT 'ALLOW'
+                                         CHECK (applied_action = 'ALLOW'),
+                    reason             TEXT,
+                    latency_ms         INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+                    source             TEXT NOT NULL,
+                    event_id           TEXT NOT NULL,
+                    mode               TEXT NOT NULL DEFAULT 'DRY_RUN'
+                                         CHECK (mode = 'DRY_RUN')
                 )
                 """
             )
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_screening_timestamp ON screening_events(timestamp DESC)"
+                "CREATE INDEX IF NOT EXISTS idx_screening_timestamp "
+                "ON screening_events(timestamp DESC)"
             )
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_screening_number ON screening_events(number)"
+                "CREATE INDEX IF NOT EXISTS idx_screening_hash "
+                "ON screening_events(number_hash)"
             )
+
+    def _migrate_v3_to_v4(self) -> None:
+        """Rebuild Phase 4 screening rows with Phase 5 policy fields."""
+
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(screening_events)")
+        }
+        if "policy_name" in columns and "actually_rejected" in columns:
+            return
+        with self._conn:
+            self._conn.execute("DROP TABLE IF EXISTS screening_events_v4")
+            self._conn.execute(
+                """
+                CREATE TABLE screening_events_v4 (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp            TEXT NOT NULL,
+                    number               TEXT NOT NULL,
+                    number_masked        TEXT NOT NULL,
+                    number_hash          TEXT NOT NULL,
+                    risk                 INTEGER NOT NULL CHECK (risk BETWEEN 0 AND 100),
+                    confidence           INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+                    verdict              TEXT NOT NULL,
+                    recommended_action   TEXT NOT NULL
+                                             CHECK (recommended_action IN ('ALLOW','BLOCK')),
+                    applied_action       TEXT NOT NULL DEFAULT 'ALLOW'
+                                             CHECK (applied_action IN ('ALLOW','BLOCK')),
+                    reason               TEXT,
+                    latency_ms           INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+                    source               TEXT NOT NULL,
+                    event_id             TEXT NOT NULL,
+                    mode                 TEXT NOT NULL DEFAULT 'DRY_RUN'
+                                             CHECK (mode IN ('DRY_RUN','ACTIVE')),
+                    policy_action        TEXT NOT NULL DEFAULT 'ALLOW'
+                                             CHECK (policy_action IN ('ALLOW','BLOCK')),
+                    policy_name          TEXT NOT NULL DEFAULT 'BALANCED'
+                                             CHECK (policy_name IN ('RELAXED','BALANCED','STRICT')),
+                    threshold            INTEGER NOT NULL DEFAULT 85 CHECK (threshold BETWEEN 0 AND 100),
+                    confidence_threshold INTEGER NOT NULL DEFAULT 80
+                                             CHECK (confidence_threshold BETWEEN 0 AND 100),
+                    policy_reason        TEXT,
+                    emergency_off        INTEGER NOT NULL DEFAULT 0 CHECK (emergency_off IN (0,1)),
+                    actually_rejected    INTEGER NOT NULL DEFAULT 0 CHECK (actually_rejected IN (0,1)),
+                    rejection_confirmed_at TEXT,
+                    CHECK (applied_action = 'ALLOW' OR (mode = 'ACTIVE' AND policy_action = 'BLOCK'))
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                INSERT INTO screening_events_v4
+                    (id, timestamp, number, number_masked, number_hash, risk,
+                     confidence, verdict, recommended_action, applied_action,
+                     reason, latency_ms, source, event_id, mode, policy_action,
+                     policy_name, threshold, confidence_threshold, policy_reason,
+                     emergency_off, actually_rejected)
+                SELECT id, timestamp, number, number_masked, number_hash, risk,
+                       confidence, verdict,
+                       CASE WHEN recommended_action = 'BLOCK' THEN 'BLOCK' ELSE 'ALLOW' END,
+                       'ALLOW', reason, latency_ms, source, event_id, 'DRY_RUN',
+                       CASE WHEN recommended_action = 'BLOCK' THEN 'BLOCK' ELSE 'ALLOW' END,
+                       'BALANCED', 85, 80, reason, 0, 0
+                  FROM screening_events
+                """
+            )
+            self._conn.execute("DROP TABLE screening_events")
+            self._conn.execute(
+                "ALTER TABLE screening_events_v4 RENAME TO screening_events"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_timestamp "
+                "ON screening_events(timestamp DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_hash "
+                "ON screening_events(number_hash)"
+            )
+
+    def _migrate_v4_to_v5(self) -> None:
+        """Add Phase 6 lookup indexes without rewriting user rows."""
+
+        self._ensure_phase6_indexes()
+
+    def _ensure_phase6_indexes(self) -> None:
+        with self._conn:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_event_id "
+                "ON screening_events(event_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_applied "
+                "ON screening_events(applied_action, timestamp DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_policy_action "
+                "ON screening_events(policy_action, timestamp DESC)"
+            )
+
+    def _migrate_v5_to_v6(self) -> None:
+        """Add bounded local reputation/trust storage and decision snapshots."""
+
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(screening_events)")
+        }
+        with self._conn:
+            if "reputation_score" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE screening_events ADD COLUMN reputation_score "
+                    "INTEGER CHECK (reputation_score BETWEEN 0 AND 100)"
+                )
+            if "reputation_confidence" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE screening_events ADD COLUMN reputation_confidence "
+                    "INTEGER CHECK (reputation_confidence BETWEEN 0 AND 100)"
+                )
+            if "reputation_trend" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE screening_events ADD COLUMN reputation_trend TEXT "
+                    "CHECK (reputation_trend IN ('IMPROVING','STABLE','WORSENING','UNKNOWN'))"
+                )
+            if "reputation_reasons" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE screening_events ADD COLUMN reputation_reasons TEXT"
+                )
+
+    def _migrate_v6_to_v7(self) -> None:
+        """Create bounded derived adaptive-intelligence storage."""
+
+        with self._conn:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intelligence_observation_hash_time "
+                "ON intelligence_observations(number_hash, timestamp DESC, id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intelligence_observation_event "
+                "ON intelligence_observations(event_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intelligence_observation_type "
+                "ON intelligence_observations(event_type, timestamp DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intelligence_profile_updated "
+                "ON intelligence_profiles(updated_at DESC)"
+            )
+
+    def integrity_check(self, *, quick: bool = False) -> bool:
+        pragma = "quick_check" if quick else "integrity_check"
+        try:
+            rows = self._conn.execute(f"PRAGMA {pragma}").fetchall()
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Database integrity check failed: {exc}") from exc
+        if not rows or any(str(row[0]).lower() != "ok" for row in rows):
+            details = "; ".join(str(row[0]) for row in rows[:10]) or "no result"
+            raise DatabaseError(f"Database corruption detected: {details}")
+        return True
+
+    def validate_schema(self) -> bool:
+        required_tables = {
+            "schema_version",
+            "numbers",
+            "events",
+            "reports",
+            "settings",
+            "screening_events",
+            "reputation_profiles",
+            "reputation_history",
+            "trusted_numbers",
+            "intelligence_observations",
+            "intelligence_profiles",
+        }
+        tables = {
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        missing = required_tables - tables
+        if missing:
+            raise DatabaseError(f"Database schema missing tables: {', '.join(sorted(missing))}")
+        version_row = self._conn.execute(
+            "SELECT version FROM schema_version LIMIT 1"
+        ).fetchone()
+        if not version_row or int(version_row[0]) != SCHEMA_VERSION:
+            raise DatabaseError("Database schema version is invalid")
+        screening_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(screening_events)"
+            ).fetchall()
+        }
+        required_columns = {
+            "id",
+            "timestamp",
+            "number_masked",
+            "number_hash",
+            "risk",
+            "confidence",
+            "policy_name",
+            "policy_action",
+            "applied_action",
+            "event_id",
+            "actually_rejected",
+            "reputation_score",
+            "reputation_confidence",
+            "reputation_trend",
+            "reputation_reasons",
+        }
+        if required_columns - screening_columns:
+            raise DatabaseError("Database screening schema is incomplete")
+        reputation_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(reputation_profiles)"
+            ).fetchall()
+        }
+        if {
+            "number_hash",
+            "number_masked",
+            "risk_score",
+            "confidence",
+            "risk",
+            "trend",
+            "signals_json",
+            "reasons_json",
+        } - reputation_columns:
+            raise DatabaseError("Database reputation schema is incomplete")
+        history_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(reputation_history)"
+            ).fetchall()
+        }
+        if {"number_hash", "old_score", "new_score", "trigger"} - history_columns:
+            raise DatabaseError("Database reputation history schema is incomplete")
+        trust_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(trusted_numbers)"
+            ).fetchall()
+        }
+        if {"number_hash", "number_masked", "expires_at"} - trust_columns:
+            raise DatabaseError("Database trust schema is incomplete")
+        intelligence_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(intelligence_observations)"
+            ).fetchall()
+        }
+        if {
+            "number_hash",
+            "number_masked",
+            "event_id",
+            "timestamp",
+            "event_type",
+            "risk_score",
+            "confidence",
+            "recommended_action",
+            "applied_action",
+            "confirmed",
+            "evidence_json",
+        } - intelligence_columns:
+            raise DatabaseError("Database intelligence observation schema is incomplete")
+        intelligence_profile_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(intelligence_profiles)"
+            ).fetchall()
+        }
+        if {
+            "number_hash",
+            "number_masked",
+            "baseline_score",
+            "current_score",
+            "confidence",
+            "trend",
+            "risk_delta",
+            "confidence_delta",
+            "snapshot_json",
+        } - intelligence_profile_columns:
+            raise DatabaseError("Database intelligence profile schema is incomplete")
+        screening_indexes = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA index_list(screening_events)"
+            ).fetchall()
+        }
+        required_indexes = {
+            "idx_screening_timestamp",
+            "idx_screening_hash",
+            "idx_screening_event_id",
+            "idx_screening_applied",
+            "idx_screening_policy_action",
+        }
+        if required_indexes - screening_indexes:
+            raise DatabaseError("Database screening indexes are incomplete")
+        all_indexes = {
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        reputation_indexes = {
+            "idx_reputation_updated",
+            "idx_reputation_risk",
+            "idx_reputation_history_hash_time",
+            "idx_trusted_expiry",
+            "idx_intelligence_observation_hash_time",
+            "idx_intelligence_observation_event",
+            "idx_intelligence_observation_type",
+            "idx_intelligence_profile_updated",
+        }
+        if reputation_indexes - all_indexes:
+            raise DatabaseError("Database reputation/intelligence indexes are incomplete")
+        foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()
+        if not foreign_keys or int(foreign_keys[0]) != 1:
+            raise DatabaseError("SQLite foreign_keys is not enabled")
+        journal = self._conn.execute("PRAGMA journal_mode").fetchone()
+        if not journal or str(journal[0]).lower() != "wal":
+            raise DatabaseError("SQLite WAL mode is not enabled")
+        return True
 
     def close(self) -> None:
         try:
@@ -342,11 +807,13 @@ class Database:
             self._conn.execute("BEGIN")
             yield self._conn
             self._conn.execute("COMMIT")
-        except Exception:
+        except Exception as exc:
             try:
                 self._conn.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
+            if isinstance(exc, sqlite3.Error):
+                raise DatabaseError(f"Database transaction failed: {exc}") from exc
             raise
 
     # ----- numbers --------------------------------------------------------
@@ -497,6 +964,32 @@ class Database:
         )
         return [dict(r) for r in cur.fetchall()]
 
+    def event_metrics(self, high_risk_threshold: int = 60) -> Dict[str, int]:
+        """Return persisted analysis counters for stopped-daemon reporting."""
+
+        row = self._conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(CASE
+                    WHEN risk_score >= ?
+                      OR reputation IN ('HIGH_RISK', 'MALICIOUS')
+                      OR risk_level IN ('HIGH', 'CRITICAL')
+                    THEN 1 ELSE 0 END), 0) AS high_risk,
+                COALESCE(SUM(CASE WHEN action = 'BLOCK' THEN 1 ELSE 0 END), 0)
+                    AS block_recommendations
+            FROM events
+            """,
+            (int(high_risk_threshold),),
+        ).fetchone()
+        return {
+            "total": int(row["total"] if row else 0),
+            "high_risk": int(row["high_risk"] if row else 0),
+            "block_recommendations": int(
+                row["block_recommendations"] if row else 0
+            ),
+        }
+
     def get_events_for_number(
         self, number: str, limit: int = 1000
     ) -> List[Dict[str, Any]]:
@@ -566,73 +1059,254 @@ class Database:
         )
         return [dict(r) for r in cur.fetchall()]
 
-    # ----- screening events (Phase 4) ---------------------------------------
+    # ----- screening events (Phase 4) ------------------------------------
     def add_screening_event(
         self,
+        *,
         timestamp: str,
         number: str,
         risk_score: int,
         confidence: int,
         verdict: str,
         recommended_action: str,
-        applied_action: str,
-        result_reason: Optional[str] = None,
-        latency_ms: Optional[int] = None,
-        source: Optional[str] = None,
-        event_id: Optional[str] = None,
+        applied_action: str = "ALLOW",
+        reason: Optional[str] = None,
+        latency_ms: int = 0,
+        source: str = "android_call_screening",
+        event_id: str,
+        mode: str = "DRY_RUN",
+        policy_action: Optional[str] = None,
+        policy_name: str = "BALANCED",
+        threshold: int = 85,
+        confidence_threshold: int = 80,
+        policy_reason: Optional[str] = None,
+        emergency_off: bool = False,
+        reputation_score: Optional[int] = None,
+        reputation_confidence: Optional[int] = None,
+        reputation_trend: Optional[str] = None,
+        reputation_reasons: Optional[Sequence[str]] = None,
     ) -> int:
-        # Mask and hash for privacy
-        try:
-            from .utils import mask_number
-            masked = mask_number(number)
-        except Exception:
-            masked = number[:4] + "***" + number[-4:] if len(number) > 8 else "***"
-        try:
-            h = hashlib.sha256(number.encode()).hexdigest()[:16]
-        except Exception:
-            h = None
+        """Persist one policy-screening result with privacy metadata."""
+
+        recommendation = str(recommended_action)
+        applied = str(applied_action)
+        selected_mode = str(mode)
+        selected_policy = str(policy_name)
+        policy_recommendation = str(policy_action or recommendation)
+        if recommendation not in ("ALLOW", "BLOCK"):
+            raise ValueError("Invalid screening recommendation")
+        if policy_recommendation not in ("ALLOW", "BLOCK"):
+            raise ValueError("Invalid policy action")
+        if applied not in ("ALLOW", "BLOCK"):
+            raise ValueError("Invalid applied screening action")
+        if selected_mode not in ("DRY_RUN", "ACTIVE"):
+            raise ValueError("Invalid screening mode")
+        if applied == "BLOCK" and selected_mode != "ACTIVE":
+            raise ValueError("BLOCK may only be persisted in ACTIVE mode")
+        if applied == "BLOCK" and (
+            recommendation != "BLOCK" or policy_recommendation != "BLOCK"
+        ):
+            raise ValueError("Applied BLOCK requires a policy BLOCK recommendation")
+        if applied == "BLOCK" and emergency_off:
+            raise ValueError("Emergency-off cannot persist a BLOCK action")
+        if selected_policy not in ("RELAXED", "BALANCED", "STRICT"):
+            raise ValueError("Invalid policy name")
+        risk = int(risk_score)
+        conf = int(confidence)
+        latency = int(latency_ms)
+        active_threshold = int(threshold)
+        confidence_limit = int(confidence_threshold)
+        for value, label in (
+            (risk, "risk"),
+            (conf, "confidence"),
+            (active_threshold, "threshold"),
+            (confidence_limit, "confidence threshold"),
+        ):
+            if not (0 <= value <= 100):
+                raise ValueError(f"Screening {label} must be between 0 and 100")
+        if latency < 0:
+            raise ValueError("Screening latency cannot be negative")
+        raw_number = str(number or "")[:128]
+        masked = mask_number(raw_number)
+        number_hash = hashlib.sha256(raw_number.encode("utf-8")).hexdigest()
+        clean_reason = str(reason or "")[:500] or None
+        clean_policy_reason = str(policy_reason or clean_reason or "")[:500] or None
+        clean_source = str(source or "android_call_screening")[:64]
+        clean_event_id = str(event_id)[:64]
+        rep_score = None if reputation_score is None else int(reputation_score)
+        rep_confidence = (
+            None if reputation_confidence is None else int(reputation_confidence)
+        )
+        if rep_score is not None and not (0 <= rep_score <= 100):
+            raise ValueError("Reputation score must be between 0 and 100")
+        if rep_confidence is not None and not (0 <= rep_confidence <= 100):
+            raise ValueError("Reputation confidence must be between 0 and 100")
+        rep_trend = reputation_trend or None
+        if rep_trend not in (None, "IMPROVING", "STABLE", "WORSENING", "UNKNOWN"):
+            raise ValueError("Invalid reputation trend")
+        reason_values = [str(item)[:200] for item in (reputation_reasons or [])[:20]]
+        rep_reasons_json = json.dumps(reason_values, separators=(",", ":"))
+        if len(rep_reasons_json.encode("utf-8")) > 4096:
+            raise ValueError("Reputation reasons are too large")
         with self.transaction():
-            cur = self._conn.execute(
+            cursor = self._conn.execute(
                 """
                 INSERT INTO screening_events
-                    (timestamp, number, number_masked, number_hash, risk_score, confidence, verdict, recommended_action, applied_action, result_reason, latency_ms, source, event_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (timestamp, number, number_masked, number_hash, risk,
+                     confidence, verdict, recommended_action, applied_action,
+                     reason, latency_ms, source, event_id, mode, policy_action,
+                     policy_name, threshold, confidence_threshold, policy_reason,
+                     emergency_off, actually_rejected, reputation_score,
+                     reputation_confidence, reputation_trend, reputation_reasons)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                 """,
-                (timestamp, number, masked, h, int(risk_score), int(confidence), verdict, recommended_action, applied_action, result_reason, latency_ms, source, event_id),
+                (
+                    timestamp,
+                    raw_number,
+                    masked,
+                    number_hash,
+                    risk,
+                    conf,
+                    str(verdict or "UNKNOWN")[:32],
+                    recommendation,
+                    applied,
+                    clean_reason,
+                    latency,
+                    clean_source,
+                    clean_event_id,
+                    selected_mode,
+                    policy_recommendation,
+                    selected_policy,
+                    active_threshold,
+                    confidence_limit,
+                    clean_policy_reason,
+                    int(bool(emergency_off)),
+                    rep_score,
+                    rep_confidence,
+                    rep_trend,
+                    rep_reasons_json,
+                ),
             )
-            return int(cur.lastrowid)
+            return int(cursor.lastrowid)
 
     def recent_screening_events(self, limit: int = 50) -> List[Dict[str, Any]]:
-        limit = max(1, min(int(limit), 1000))
-        cur = self._conn.execute(
-            "SELECT * FROM screening_events ORDER BY timestamp DESC LIMIT ?",
-            (limit,),
+        bounded_limit = max(1, min(int(limit), 1000))
+        cursor = self._conn.execute(
+            "SELECT * FROM screening_events ORDER BY timestamp DESC, id DESC LIMIT ?",
+            (bounded_limit,),
         )
-        return [dict(r) for r in cur.fetchall()]
+        return [dict(row) for row in cursor.fetchall()]
 
     def count_screening_events(self) -> int:
-        cur = self._conn.execute("SELECT COUNT(*) FROM screening_events")
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS count FROM screening_events"
+        ).fetchone()
+        return int(row["count"] if row else 0)
 
-    def screening_metrics(self) -> Dict[str, Any]:
-        cur = self._conn.execute("SELECT COUNT(*) as total FROM screening_events")
-        total = int(cur.fetchone()[0] or 0)
-        cur = self._conn.execute("SELECT COUNT(*) FROM screening_events WHERE verdict IN ('HIGH_RISK','MALICIOUS','CRITICAL')")
-        high = int(cur.fetchone()[0] or 0)
-        cur = self._conn.execute("SELECT COUNT(*) FROM screening_events WHERE recommended_action='BLOCK'")
-        block_rec = int(cur.fetchone()[0] or 0)
-        cur = self._conn.execute("SELECT COUNT(*) FROM screening_events WHERE applied_action='BLOCK'")
-        actually_rejected = int(cur.fetchone()[0] or 0)
-        cur = self._conn.execute("SELECT COUNT(*) FROM screening_events WHERE result_reason='SCREENING_TIMEOUT'")
-        timeouts = int(cur.fetchone()[0] or 0)
-        return {
-            "total": total,
-            "high_risk": high,
-            "block_recommended": block_rec,
-            "actually_rejected": actually_rejected,
-            "timeouts": timeouts,
-        }
+    def screening_event_exists(self, event_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM screening_events WHERE event_id = ? LIMIT 1",
+            (str(event_id)[:64],),
+        ).fetchone()
+        return row is not None
+
+    def confirm_screening_rejection(
+        self, event_id: str, confirmed_at: str
+    ) -> bool:
+        """Mark actual rejection only for a persisted ACTIVE applied block."""
+
+        with self.transaction():
+            cursor = self._conn.execute(
+                """
+                UPDATE screening_events
+                   SET actually_rejected = 1,
+                       rejection_confirmed_at = ?
+                 WHERE event_id = ?
+                   AND applied_action = 'BLOCK'
+                   AND mode = 'ACTIVE'
+                   AND actually_rejected = 0
+                """,
+                (confirmed_at, str(event_id)[:64]),
+            )
+            return cursor.rowcount == 1
+
+    def screening_metrics(self) -> Dict[str, int]:
+        row = self._conn.execute(
+            """
+            SELECT
+                COUNT(*) AS incoming_calls,
+                COUNT(*) AS screened,
+                COALESCE(SUM(CASE WHEN reason = 'SCREENING_TIMEOUT' THEN 1 ELSE 0 END), 0)
+                    AS timeouts,
+                COALESCE(SUM(CASE WHEN policy_reason IN
+                    ('INVALID_POLICY_CONFIG','INVALID_SCREENING_MODE','INVALID_ACTIVATION_STATE')
+                    THEN 1 ELSE 0 END), 0) AS policy_errors,
+                COALESCE(SUM(CASE WHEN reason IN ('ANALYSIS_ERROR','INTERNAL_ERROR') THEN 1 ELSE 0 END), 0)
+                    AS bridge_errors,
+                COALESCE(SUM(CASE WHEN verdict IN ('HIGH_RISK','MALICIOUS') THEN 1 ELSE 0 END), 0)
+                    AS high_risk,
+                COALESCE(SUM(CASE WHEN applied_action = 'ALLOW' THEN 1 ELSE 0 END), 0)
+                    AS screening_allowed,
+                COALESCE(SUM(CASE WHEN verdict = 'UNKNOWN' THEN 1 ELSE 0 END), 0)
+                    AS screening_unknown,
+                COALESCE(SUM(CASE WHEN policy_action = 'BLOCK' THEN 1 ELSE 0 END), 0)
+                    AS screening_block_recommended,
+                COALESCE(SUM(CASE WHEN applied_action = 'BLOCK' THEN 1 ELSE 0 END), 0)
+                    AS screening_blocked,
+                COALESCE(SUM(actually_rejected), 0) AS actually_rejected
+            FROM screening_events
+            """
+        ).fetchone()
+        keys = (
+            "incoming_calls",
+            "screened",
+            "timeouts",
+            "policy_errors",
+            "bridge_errors",
+            "high_risk",
+            "screening_allowed",
+            "screening_unknown",
+            "screening_block_recommended",
+            "screening_blocked",
+            "actually_rejected",
+        )
+        metrics = {key: int(row[key] if row else 0) for key in keys}
+        metrics["total"] = metrics["incoming_calls"]
+        metrics["block_recommended"] = metrics["screening_block_recommended"]
+        return metrics
+
+    def recent_blocks(self, limit: int = 20) -> List[Dict[str, Any]]:
+        bounded = max(1, min(int(limit), 200))
+        rows = self._conn.execute(
+            """
+            SELECT id, timestamp, number_masked, risk, confidence, policy_name,
+                   recommended_action, applied_action, reason,
+                   actually_rejected, rejection_confirmed_at
+              FROM screening_events
+             WHERE applied_action = 'BLOCK'
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?
+            """,
+            (bounded,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def inspect_block(self, block_id: int) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            """
+            SELECT id, timestamp, number_masked, risk, confidence, policy_name,
+                   threshold, confidence_threshold, recommended_action,
+                   applied_action, reason, policy_reason, emergency_off,
+                   actually_rejected, rejection_confirmed_at,
+                   reputation_score, reputation_confidence, reputation_trend,
+                   reputation_reasons
+              FROM screening_events
+             WHERE id = ? AND applied_action = 'BLOCK'
+             LIMIT 1
+            """,
+            (int(block_id),),
+        ).fetchone()
+        return dict(row) if row else None
 
     # ----- settings -------------------------------------------------------
     def get_setting(self, key: str) -> Optional[str]:

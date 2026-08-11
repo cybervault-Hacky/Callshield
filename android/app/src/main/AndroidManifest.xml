@@ -1,32 +1,30 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- No CAMERA, MICROPHONE, LOCATION, SMS, CONTACTS, STORAGE -->
-    <!-- Only call-screening related role is requested via system dialog, not manifest permission -->
+    <!-- No camera, microphone, contacts, SMS, location, storage, accessibility, or Internet permission. -->
 
     <application
         android:allowBackup="false"
+        android:icon="@android:drawable/sym_def_app_icon"
         android:label="CallShield Bridge"
-        android:theme="@android:style/Theme.NoDisplay"
-        android:icon="@android:drawable/sym_def_app_icon">
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Translucent.NoTitleBar"
+        android:usesCleartextTraffic="false">
 
-        <!-- Minimal no-UI activity for system requirements (optional) -->
         <activity
             android:name=".BridgeSetupActivity"
             android:exported="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
-        <!-- CallScreeningService — the only privileged component -->
         <service
             android:name=".CallShieldScreeningService"
-            android:permission="android.permission.BIND_SCREENING_SERVICE"
-            android:exported="true">
+            android:exported="true"
+            android:permission="android.permission.BIND_SCREENING_SERVICE">
             <intent-filter>
                 <action android:name="android.telecom.CallScreeningService" />
             </intent-filter>

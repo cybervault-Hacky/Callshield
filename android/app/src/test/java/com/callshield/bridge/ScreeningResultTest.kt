@@ -2,69 +2,63 @@ package com.callshield.bridge
 
 import org.junit.Assert.*
 import org.junit.Test
+import java.util.UUID
 
 class ScreeningResultTest {
     @Test
-    fun testDryRunNeverBlocks() {
-        val resp = Protocol.ScreeningResponse(
-            protocol = "callshield/1",
-            requestId = "test",
-            riskScore = 95,
-            confidence = 96,
+    fun activeBlockCanRequestRejection() {
+        val result = result(applied = "BLOCK", mode = "ACTIVE")
+        assertTrue(result.shouldApplyBlock())
+    }
+
+    @Test
+    fun activeAllowDoesNotRequestRejection() {
+        assertFalse(result(applied = "ALLOW", mode = "ACTIVE").shouldApplyBlock())
+    }
+
+    @Test
+    fun dryRunNeverRequestsRejection() {
+        assertFalse(result(applied = "ALLOW", mode = "DRY_RUN").shouldApplyBlock())
+    }
+
+    @Test
+    fun emergencyNeverRequestsRejection() {
+        val value = ScreeningResult(
+            requestId = UUID.randomUUID().toString(),
+            riskScore = 100,
+            confidence = 100,
             verdict = "MALICIOUS",
             recommendedAction = "BLOCK",
-            appliedAction = "ALLOW",
-            mode = "DRY_RUN"
+            appliedAction = "BLOCK",
+            mode = "ACTIVE",
+            reason = "EMERGENCY_OFF",
+            latencyMs = 1,
+            policyName = "BALANCED",
+            emergencyOff = true
         )
-        val result = ScreeningResult.fromProtocolResponse(resp)
-        assertEquals("BLOCK", result.recommendedAction)
-        assertEquals("ALLOW", result.appliedAction)
-        assertFalse(result.shouldApplyBlock())
-        assertTrue(result.isDryRun())
+        assertFalse(value.shouldApplyBlock())
     }
 
     @Test
-    fun testUnknownNumber() {
-        val result = ScreeningResult.unknown("req-1", "UNKNOWN")
-        assertEquals("UNKNOWN", result.verdict)
-        assertEquals("ALLOW", result.appliedAction)
+    fun unknownFallbackAllows() {
+        val value = ScreeningResult.unknown("DAEMON_UNAVAILABLE")
+        assertEquals("ALLOW", value.appliedAction)
+        assertFalse(value.shouldApplyBlock())
     }
 
-    @Test
-    fun testHighRiskDryRun() {
-        val result = ScreeningResult(
-            riskScore = 87,
-            confidence = 92,
-            verdict = "HIGH_RISK",
+    private fun result(applied: String, mode: String): ScreeningResult {
+        return ScreeningResult(
+            requestId = UUID.randomUUID().toString(),
+            riskScore = 95,
+            confidence = 95,
+            verdict = "MALICIOUS",
             recommendedAction = "BLOCK",
-            appliedAction = "ALLOW",
-            mode = "DRY_RUN",
-            reason = "Phase 4 dry-run"
+            appliedAction = applied,
+            mode = mode,
+            reason = "test",
+            latencyMs = 1,
+            policyName = "BALANCED",
+            emergencyOff = false
         )
-        assertEquals("BLOCK", result.recommendedAction)
-        assertEquals("ALLOW", result.appliedAction)
-    }
-
-    @Test
-    fun testSafeNumber() {
-        val result = ScreeningResult(
-            riskScore = 5,
-            confidence = 80,
-            verdict = "SAFE",
-            recommendedAction = "ALLOW",
-            appliedAction = "ALLOW",
-            mode = "DRY_RUN",
-            reason = "No indicators"
-        )
-        assertEquals("ALLOW", result.recommendedAction)
-        assertEquals("ALLOW", result.appliedAction)
-    }
-
-    @Test
-    fun testTimeoutHandling() {
-        val result = ScreeningResult.unknown("req-timeout", "SCREENING_TIMEOUT")
-        assertEquals("UNKNOWN", result.verdict)
-        assertEquals("ALLOW", result.appliedAction)
-        assertEquals("SCREENING_TIMEOUT", result.reason)
     }
 }

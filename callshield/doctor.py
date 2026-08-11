@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import config as config_module
+from .adaptive import BehaviorStorage
 from .config import Config, config_integrity
 from .daemon.process import _clear_pid, _clear_socket, status as daemon_status
 from .database import Database, SCHEMA_VERSION
@@ -142,6 +143,53 @@ def run_doctor(
         checks.append(
             DoctorCheck("Trust Database", HEALTHY, f"local trust records={trust_count}")
         )
+        behavior_storage = BehaviorStorage(database, cfg)
+        intelligence_ok = behavior_storage.integrity_check()
+        observation_count = int(
+            database._conn.execute(
+                "SELECT COUNT(*) FROM intelligence_observations"
+            ).fetchone()[0]
+        )
+        intelligence_profile_count = int(
+            database._conn.execute(
+                "SELECT COUNT(*) FROM intelligence_profiles"
+            ).fetchone()[0]
+        )
+        checks.append(
+            DoctorCheck(
+                "Intelligence Database",
+                HEALTHY,
+                f"observations={observation_count} profiles={intelligence_profile_count}",
+            )
+        )
+        checks.append(
+            DoctorCheck("Intelligence Schema", HEALTHY, "schema and indexes present")
+        )
+        checks.append(
+            DoctorCheck(
+                "Intelligence Integrity",
+                HEALTHY if intelligence_ok else ERROR,
+                "bounded derived JSON valid" if intelligence_ok else "corrupt intelligence JSON",
+            )
+        )
+        checks.append(
+            DoctorCheck(
+                "Intelligence Storage",
+                HEALTHY,
+                "hashes and masked identifiers only",
+            )
+        )
+        checks.append(
+            DoctorCheck(
+                "Intelligence Retention",
+                HEALTHY,
+                (
+                    f"observations={cfg.intelligence_observation_limit} "
+                    f"profiles={cfg.intelligence_profile_limit} "
+                    f"age={cfg.intelligence_history_days}d"
+                ),
+            )
+        )
     except Exception as exc:
         checks.append(DoctorCheck("Database", ERROR, str(exc)))
         checks.append(DoctorCheck("Schema", ERROR, "not validated"))
@@ -149,6 +197,11 @@ def run_doctor(
         checks.append(DoctorCheck("Reputation Schema", ERROR, "not validated"))
         checks.append(DoctorCheck("Reputation Integrity", ERROR, "not validated"))
         checks.append(DoctorCheck("Trust Database", ERROR, "not available"))
+        checks.append(DoctorCheck("Intelligence Database", ERROR, "not available"))
+        checks.append(DoctorCheck("Intelligence Schema", ERROR, "not validated"))
+        checks.append(DoctorCheck("Intelligence Integrity", ERROR, "not validated"))
+        checks.append(DoctorCheck("Intelligence Storage", ERROR, "not available"))
+        checks.append(DoctorCheck("Intelligence Retention", ERROR, "not validated"))
     finally:
         if database is not None:
             try:

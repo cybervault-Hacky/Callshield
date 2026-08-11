@@ -1,7 +1,7 @@
 # CALLSHIELD Phase 6 Security Audit
 
 Date: 2026-08-11
-Scope: repository implementation through version 0.7.0
+Scope: repository implementation through version 0.8.0
 
 ## Results
 
@@ -27,6 +27,9 @@ Scope: repository implementation through version 0.7.0
 | Root requirement | PASS | Installation/runtime use user-owned paths and request no root operation |
 | Phase 7 reputation privacy | PASS | Package has no network imports; profile/history/trust storage uses masked identifiers and canonical SHA-256 hashes only |
 | Reputation fail-open | PASS | Unavailable/corrupt reputation marks policy unavailable and applies ALLOW; trust/whitelist remain overrides |
+| Phase 8 adaptive privacy | PASS | Adaptive package has no network imports and derived tables use hashes/masks without unsupported telemetry fields |
+| Adaptive policy safety | PASS | Intelligence unavailable applies ALLOW; trend/pattern context cannot raise detector risk or bypass existing gates |
+| Intelligence retention | PASS | Derived observations/profiles have count/age bounds and cleanup does not delete core Phase 1–7 evidence |
 
 ## Not tested
 

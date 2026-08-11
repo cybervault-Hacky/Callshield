@@ -1,7 +1,7 @@
 """Persistent, validated configuration for CALLSHIELD.
 
-Configuration is stored as JSON in the local data directory. Phase 7 retains
-all Phase 1–6 controls and adds bounded local reputation/trust retention.
+Configuration is stored as JSON in the local data directory. Phase 8 retains
+all Phase 1–7 controls and adds bounded derived intelligence retention.
 """
 
 from __future__ import annotations
@@ -116,6 +116,10 @@ class Config:
     reputation_profile_limit: int = 5000
     trust_record_limit: int = 1000
     trust_max_seconds: int = 365 * 24 * 60 * 60
+    intelligence_query_limit: int = 100
+    intelligence_observation_limit: int = 200
+    intelligence_profile_limit: int = 5000
+    intelligence_history_days: int = 90
     max_log_size: int = 2 * 1024 * 1024
     max_log_files: int = 3
     ipc_enabled: bool = True
@@ -282,6 +286,10 @@ class Config:
         self._validate_int("reputation_profile_limit", 100, 10000)
         self._validate_int("trust_record_limit", 10, 2000)
         self._validate_int("trust_max_seconds", 60, 365 * 24 * 60 * 60)
+        self._validate_int("intelligence_query_limit", 10, 500)
+        self._validate_int("intelligence_observation_limit", 20, 1000)
+        self._validate_int("intelligence_profile_limit", 100, 10000)
+        self._validate_int("intelligence_history_days", 7, 365)
         self._validate_int("max_log_size", 64 * 1024, 100 * 1024 * 1024)
         self._validate_int("max_log_files", 1, 10)
         if (
@@ -447,6 +455,10 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         "reputation_profile_limit",
         "trust_record_limit",
         "trust_max_seconds",
+        "intelligence_query_limit",
+        "intelligence_observation_limit",
+        "intelligence_profile_limit",
+        "intelligence_history_days",
         "screening_timeout_ms",
         "relaxed_active_block_threshold",
         "relaxed_confidence_threshold",

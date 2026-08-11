@@ -2,10 +2,11 @@
 
 > **Hardened, local-first reputation and explainable call intelligence for Termux and Android.**
 
-CALLSHIELD keeps analysis, trust, history, and persistence on-device. Phase 7
-adds deterministic reputation profiles and measured explanations without cloud
-lookups, telemetry, accounts, advertising, or network reputation services.
-All Phase 6 hardening and Phase 1–5 call-protection behavior remains.
+CALLSHIELD keeps analysis, trust, history, and persistence on-device. Phase 8
+adds bounded behavioral timelines, adaptive trends, measured patterns, and
+explainable intelligence snapshots without cloud lookups, surveillance,
+telemetry, accounts, advertising, or network reputation services. All Phase 1–7
+safety and call-protection behavior remains.
 
 ## Phase status
 
@@ -16,7 +17,8 @@ All Phase 6 hardening and Phase 1–5 call-protection behavior remains.
 - Phase 5 — Active Call Protection: **COMPLETE**
 - Phase 6 — Hardening & Reliability: **COMPLETE**
 - Phase 7 — Reputation & Explainable Intelligence: **COMPLETE**
-- Phase 8 — **NOT STARTED**
+- Phase 8 — Adaptive Threat Intelligence & Behavior Engine: **COMPLETE**
+- Phase 9 — **NOT STARTED**
 
 ## Safety invariants
 
@@ -64,6 +66,86 @@ validated ALLOW/BLOCK → SQLite → health/metrics
 ```
 
 There is no TCP or HTTP server and no second IPC architecture.
+
+## Phase 8 adaptive intelligence
+
+The adaptive architecture is:
+
+```text
+OBSERVE → CORRELATE → SCORE → EXPLAIN → ADAPT
+
+analyze_number()
+→ ReputationEngine
+→ BehaviorEngine
+→ PolicyEngine
+→ existing safety gates
+```
+
+`callshield/adaptive/` stores bounded derived observations using masked
+identifiers and canonical hashes. It tracks only CALLSHIELD measurements:
+risk/confidence, recommendations, applied outcomes, confirmations, reports,
+trust changes, scans, screening outcomes, and timestamps.
+
+It does not infer call duration, answer status, caller identity, location,
+audio, contacts, or device contents.
+
+### Adaptive trend
+
+```text
+IMPROVING / STABLE / WORSENING / VOLATILE / INSUFFICIENT_DATA
+```
+
+Explicit thresholds:
+
+- less than 5 points: statistical noise for direction changes
+- at least 10 points: sustained trend
+- at least 20 points: sudden change
+- range of 25 plus two direction changes: volatility
+- fewer than three observations: insufficient data
+
+Trend alone never forces BLOCK. VOLATILE context can only veto an otherwise
+active block for safer review.
+
+### Explainable patterns
+
+Measured detectors include repeated high risk, repeated/previous BLOCK
+recommendations, repeated reports, rapid increase, recent improvement,
+historical trust, expired trust, and inconsistent behavior. Each pattern
+contains an ID, evidence, observation count, time window, confidence, and
+explanation.
+
+### Intelligence CLI
+
+```bash
+callshield intelligence
+callshield intelligence +919876543210
+callshield intelligence +919876543210 --json
+callshield intelligence +919876543210 --history
+callshield intelligence +919876543210 --explain
+callshield intelligence list
+```
+
+Output is masked and explicitly distinguishes OBSERVED, RECOMMENDED, APPLIED,
+and CONFIRMED. JSON excludes hashes and plaintext identifiers.
+
+### Retention
+
+Derived intelligence defaults to:
+
+- 100-row lookup bound
+- 200 observations per identifier
+- 5,000 profile snapshots
+- 90-day observation age
+- 20 patterns/explanations
+
+Cleanup is deterministic and never deletes core events, screening evidence,
+reports, reputation, trust, or block history.
+
+If adaptive intelligence is unavailable or corrupt:
+
+```text
+INTELLIGENCE_UNAVAILABLE → ALLOW
+```
 
 ## Phase 7 reputation and explanations
 
@@ -261,6 +343,8 @@ Checks:
 - Policy
 - Reputation Database / Schema / Integrity
 - Trust Database
+- Intelligence Database / Schema / Integrity
+- Intelligence Storage / Retention
 - Storage
 
 Statuses are `HEALTHY`, `WARNING`, `ERROR`, and `NOT VERIFIED`.
@@ -298,6 +382,9 @@ callshield config show
 callshield reputation
 callshield reputation +919876543210 --json
 callshield reputation list
+callshield intelligence +919876543210 --explain
+callshield intelligence +919876543210 --history
+callshield intelligence list
 callshield trust +919876543210 --for 24h
 callshield untrust +919876543210
 
@@ -350,15 +437,15 @@ is added. Physical integration remains deployment-specific and unverified.
 
 ```bash
 pytest -q
-# 332 passed
+# 396 passed
 ```
 
-All 271 Phase 1–6 tests remain. Sixty-one Phase 7 tests cover reputation
-scoring, explanations, bounded history, all trend states, separate confidence,
-CLI/JSON privacy, trust/expiry, policy fail-open behavior, schema/migration,
-retention limits, doctor integration, block snapshots, and concurrent lookups.
+All 332 Phase 1–7 tests remain. Sixty-four Phase 8 tests cover behavioral
+timeline, all adaptive trends, volatility, risk/confidence deltas, measured
+patterns, snapshots, explanations, CLI/JSON, doctor, retention, schema migration,
+5/10-way concurrency, privacy, fail-open behavior, and policy safety.
 
-See `SECURITY_AUDIT.md` for Phase 6/7 PASS versus NOT TESTED results.
+See `SECURITY_AUDIT.md` for Phase 6–8 PASS versus NOT TESTED results.
 
 ## Performance
 
@@ -386,6 +473,18 @@ indexed events:
 This is a sequential local SQLite/reputation lookup workload, not Android or
 end-to-end screening. See `PERFORMANCE_PHASE7.md` and
 `scripts/benchmark_phase7.py`.
+
+Phase 8 bounded adaptive benchmark (1,000 iterations over 100 observations):
+
+| Workload | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| intelligence lookup | 0.579679 ms | 0.834626 ms | 1.091556 ms |
+| behavioral analysis | 0.072811 ms | 0.098954 ms | 0.120621 ms |
+| trend calculation | 0.045488 ms | 0.105911 ms | 0.131718 ms |
+| full snapshot | 0.756128 ms | 0.821092 ms | 0.993023 ms |
+
+See `PERFORMANCE_PHASE8.md` and `scripts/benchmark_phase8.py`. These are local
+bounded measurements, not Android or physical-call performance.
 
 ## Installation
 
@@ -417,7 +516,7 @@ claimed.
 
 ## Phase boundary
 
-Phase 8 has not started. No Phase 8 functionality is included.
+Phase 9 has not started. No Phase 9 functionality is included.
 
 ## License
 

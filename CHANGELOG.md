@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.8.0 — Phase 8: Adaptive Threat Intelligence & Behavior Engine
+
+### Added
+- Dedicated `callshield/adaptive/` package with bounded behavioral observations, deterministic adaptive trends, explainable patterns, privacy-preserving storage, and JSON-serializable intelligence snapshots.
+- Trend states `IMPROVING`, `STABLE`, `WORSENING`, `VOLATILE`, and `INSUFFICIENT_DATA` with explicit 5-point noise, 10-point sustained, 20-point sudden-change, and 25-point volatility thresholds.
+- Measured patterns for repeated high risk, repeated/previous BLOCK recommendation, repeated reports, rapid increase, recent improvement, historical trust, expired trust, and inconsistent behavior.
+- Risk/confidence deltas against the previous persisted intelligence baseline.
+- Schema version 7 with bounded derived `intelligence_observations` and `intelligence_profiles` tables, hash/mask identifiers, indexes, age/count cleanup, and no deletion of core Phase 1–7 evidence.
+- Optional adaptive context between ReputationEngine and PolicyEngine; context may only preserve or reduce blocking, never create a BLOCK by itself.
+- `callshield intelligence [number|list] [--json] [--history] [--explain]` with masked OBSERVED/RECOMMENDED/APPLIED/CONFIRMED output.
+- Doctor checks for Intelligence Database, Schema, Integrity, Storage, and Retention.
+- Trust/report/scan/screening observations and Android feedback confirmation updates in the local timeline.
+- Reproducible Phase 8 benchmark measuring lookup, behavioral analysis, trend calculation, and full snapshot p50/p95/p99.
+- 64 Phase 8 Python tests (396 total) covering timeline, trends, volatility, deltas, patterns, snapshots, explanations, CLI/JSON, doctor, retention, migration, concurrency, privacy, fail-open, policy gates, and performance structure.
+
+### Safety and privacy
+- Trend or pattern context never bypasses PolicyEngine, explicit ACTIVE confirmation, whitelist/trust, emergency-off, final response validation, or fail-open behavior.
+- Volatile intelligence vetoes an otherwise active block for review; unavailable/corrupt intelligence returns ALLOW.
+- Derived intelligence tables store only hashes and masked identifiers; no call duration, answer state, identity, location, audio, contact, or device-content inference.
+- No cloud API, remote lookup, DNS lookup, telemetry, analytics, advertising, account, HTTP/TCP listener, or new network communication.
+- Retention defaults: 200 observations per identifier, 5,000 profiles, 90-day age, and 100-row lookup bound.
+
+### Verification
+- Python suite: 396 passed; all 332 Phase 1–7 tests preserved.
+- Android build/device remain NOT VERIFIED; existing Phase 5 blocking behavior was not expanded.
+- Phase 9 has not started.
+
 ## 0.7.0 — Phase 7: Reputation & Explainable Intelligence
 
 ### Added

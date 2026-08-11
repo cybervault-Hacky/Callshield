@@ -4,7 +4,7 @@ All queries are parameterized. The schema is created automatically on first
 connect. The layer exposes small, purpose-built methods used by the rest of the
 engine — it is not a generic ORM.
 
-Schema is migrated automatically through Phase 7 on first open.
+Schema is migrated automatically through Phase 8 on first open.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from . import DATA_DIR
 from .utils import DatabaseError, ensure_parent, mask_number
 
 DEFAULT_DB_PATH = DATA_DIR / "callshield.db"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 # ----- Schema --------------------------------------------------------------
@@ -161,6 +161,48 @@ CREATE TABLE IF NOT EXISTS trusted_numbers (
     note          TEXT
 );
 
+CREATE TABLE IF NOT EXISTS intelligence_observations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    number_hash        TEXT NOT NULL,
+    number_masked      TEXT NOT NULL,
+    event_id           TEXT NOT NULL UNIQUE,
+    timestamp          TEXT NOT NULL,
+    event_type         TEXT NOT NULL,
+    risk_score         INTEGER NOT NULL CHECK (risk_score BETWEEN 0 AND 100),
+    confidence         INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    recommended_action TEXT NOT NULL CHECK (recommended_action IN ('ALLOW','BLOCK','UNKNOWN')),
+    applied_action     TEXT NOT NULL CHECK (applied_action IN ('ALLOW','BLOCK','UNKNOWN')),
+    confirmed          INTEGER NOT NULL DEFAULT 0 CHECK (confirmed IN (0,1)),
+    source             TEXT NOT NULL,
+    trust_state        TEXT NOT NULL DEFAULT 'UNKNOWN'
+                         CHECK (trust_state IN ('TRUSTED','UNTRUSTED','EXPIRED','UNKNOWN')),
+    trust_expires      TEXT,
+    evidence_json      TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS intelligence_profiles (
+    number_hash        TEXT PRIMARY KEY,
+    number_masked      TEXT NOT NULL,
+    baseline_score     INTEGER NOT NULL CHECK (baseline_score BETWEEN 0 AND 100),
+    current_score      INTEGER NOT NULL CHECK (current_score BETWEEN 0 AND 100),
+    confidence         INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    trend              TEXT NOT NULL
+                         CHECK (trend IN ('IMPROVING','STABLE','WORSENING','VOLATILE','INSUFFICIENT_DATA')),
+    risk_delta         INTEGER NOT NULL,
+    confidence_delta   INTEGER NOT NULL,
+    snapshot_json      TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_intelligence_observation_hash_time
+    ON intelligence_observations(number_hash, timestamp DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_intelligence_observation_event
+    ON intelligence_observations(event_id);
+CREATE INDEX IF NOT EXISTS idx_intelligence_observation_type
+    ON intelligence_observations(event_type, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_intelligence_profile_updated
+    ON intelligence_profiles(updated_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_reputation_updated
     ON reputation_profiles(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reputation_risk
@@ -279,6 +321,8 @@ class Database:
                 self._migrate_v4_to_v5()
             if current_version <= 5:
                 self._migrate_v5_to_v6()
+            if current_version <= 6:
+                self._migrate_v6_to_v7()
         except sqlite3.Error as exc:
             raise DatabaseError(f"Database migration to v{SCHEMA_VERSION} failed: {exc}") from exc
 
@@ -554,6 +598,26 @@ class Database:
                     "ALTER TABLE screening_events ADD COLUMN reputation_reasons TEXT"
                 )
 
+    def _migrate_v6_to_v7(self) -> None:
+        """Create bounded derived adaptive-intelligence storage."""
+
+        with self._conn:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intelligence_observation_hash_time "
+                "ON intelligence_observations(number_hash, timestamp DESC, id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intelligence_observation_event "
+                "ON intelligence_observations(event_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intelligence_observation_type "
+                "ON intelligence_observations(event_type, timestamp DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intelligence_profile_updated "
+                "ON intelligence_profiles(updated_at DESC)"
+            )
 
     def integrity_check(self, *, quick: bool = False) -> bool:
         pragma = "quick_check" if quick else "integrity_check"
@@ -577,6 +641,8 @@ class Database:
             "reputation_profiles",
             "reputation_history",
             "trusted_numbers",
+            "intelligence_observations",
+            "intelligence_profiles",
         }
         tables = {
             str(row[0])
@@ -650,6 +716,44 @@ class Database:
         }
         if {"number_hash", "number_masked", "expires_at"} - trust_columns:
             raise DatabaseError("Database trust schema is incomplete")
+        intelligence_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(intelligence_observations)"
+            ).fetchall()
+        }
+        if {
+            "number_hash",
+            "number_masked",
+            "event_id",
+            "timestamp",
+            "event_type",
+            "risk_score",
+            "confidence",
+            "recommended_action",
+            "applied_action",
+            "confirmed",
+            "evidence_json",
+        } - intelligence_columns:
+            raise DatabaseError("Database intelligence observation schema is incomplete")
+        intelligence_profile_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(intelligence_profiles)"
+            ).fetchall()
+        }
+        if {
+            "number_hash",
+            "number_masked",
+            "baseline_score",
+            "current_score",
+            "confidence",
+            "trend",
+            "risk_delta",
+            "confidence_delta",
+            "snapshot_json",
+        } - intelligence_profile_columns:
+            raise DatabaseError("Database intelligence profile schema is incomplete")
         screening_indexes = {
             str(row[1])
             for row in self._conn.execute(
@@ -676,9 +780,13 @@ class Database:
             "idx_reputation_risk",
             "idx_reputation_history_hash_time",
             "idx_trusted_expiry",
+            "idx_intelligence_observation_hash_time",
+            "idx_intelligence_observation_event",
+            "idx_intelligence_observation_type",
+            "idx_intelligence_profile_updated",
         }
         if reputation_indexes - all_indexes:
-            raise DatabaseError("Database reputation indexes are incomplete")
+            raise DatabaseError("Database reputation/intelligence indexes are incomplete")
         foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()
         if not foreign_keys or int(foreign_keys[0]) != 1:
             raise DatabaseError("SQLite foreign_keys is not enabled")

@@ -241,7 +241,7 @@ class TestPhase5DatabaseMigration(unittest.TestCase):
             version = database._conn.execute(
                 "SELECT version FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 6)
+            self.assertEqual(version, 7)
             row = database.recent_screening_events(limit=1)[0]
             self.assertEqual(row["applied_action"], "ALLOW")
             self.assertEqual(row["policy_action"], "BLOCK")

@@ -61,6 +61,7 @@ class PolicyEngine:
             else bool(emergency_off)
         )
         reputation_error = _reputation_unavailable(detection)
+        intelligence_error = _intelligence_unavailable(detection)
 
         try:
             normalized_policy = normalize_policy_name(selected_name)
@@ -82,6 +83,17 @@ class PolicyEngine:
                 policy_name=normalized_policy,
                 mode=str(selected_mode or "INVALID"),
                 reason="REPUTATION_UNAVAILABLE",
+                whitelisted=whitelist_match,
+                threshold=thresholds.active_block,
+                confidence_threshold=thresholds.confidence,
+            )
+        if intelligence_error:
+            return _safe_error_decision(
+                risk=risk,
+                confidence=confidence,
+                policy_name=normalized_policy,
+                mode=str(selected_mode or "INVALID"),
+                reason="INTELLIGENCE_UNAVAILABLE",
                 whitelisted=whitelist_match,
                 threshold=thresholds.active_block,
                 confidence_threshold=thresholds.confidence,
@@ -138,6 +150,12 @@ class PolicyEngine:
         else:
             applied = "BLOCK"
             reason = "ACTIVE_POLICY_BLOCK"
+
+        # Adaptive context is advisory and can only make the result safer.
+        # Volatility never creates a BLOCK; it vetoes an otherwise active one.
+        if applied == "BLOCK" and _intelligence_trend(detection) == "VOLATILE":
+            applied = "ALLOW"
+            reason = "VOLATILE_INTELLIGENCE_REVIEW"
 
         return PolicyDecision(
             recommended_action=recommendation,
@@ -245,6 +263,9 @@ def _is_whitelisted(detection: Any) -> bool:
         profile = detection.get("reputation_profile")
         if isinstance(profile, Mapping):
             trusted = trusted or bool(profile.get("trusted", False))
+        intelligence = detection.get("intelligence_context")
+        if isinstance(intelligence, Mapping):
+            trusted = trusted or intelligence.get("trust_state") == "TRUSTED"
     else:
         signals = getattr(detection, "signals", []) or []
         reputation = getattr(detection, "reputation", None)
@@ -264,6 +285,23 @@ def _reputation_unavailable(detection: Any) -> bool:
         profile = detection.get("reputation_profile")
         return isinstance(profile, Mapping) and profile.get("available") is False
     return bool(getattr(detection, "reputation_error", False))
+
+
+def _intelligence_unavailable(detection: Any) -> bool:
+    if isinstance(detection, Mapping):
+        if detection.get("intelligence_error"):
+            return True
+        context = detection.get("intelligence_context")
+        return isinstance(context, Mapping) and context.get("available") is False
+    return bool(getattr(detection, "intelligence_error", False))
+
+
+def _intelligence_trend(detection: Any) -> str:
+    if isinstance(detection, Mapping):
+        context = detection.get("intelligence_context")
+        if isinstance(context, Mapping):
+            return str(context.get("behavioral_trend", "INSUFFICIENT_DATA"))
+    return "INSUFFICIENT_DATA"
 
 
 def _safe_error_decision(

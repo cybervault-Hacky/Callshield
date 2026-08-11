@@ -11,6 +11,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
+from ..adaptive import BehaviorEngine, BehaviorObservation
 from ..config import Config
 from ..database import Database
 from ..detector import analyze_number
@@ -134,8 +135,55 @@ class EventProcessor:
                         "reputation_confidence": reputation_profile.confidence,
                     }
                 )
+                behavior_engine = BehaviorEngine(database, self.cfg)
+                intelligence = behavior_engine.snapshot(
+                    normalized,
+                    reputation=reputation_profile,
+                    detection=result["detection"],
+                    observation=BehaviorObservation(
+                        event_id=event.event_id,
+                        timestamp=event.timestamp,
+                        event_type="INCOMING_CALL",
+                        risk_score=analysis.risk_score,
+                        confidence=analysis.confidence,
+                        recommended_action=analysis.recommended_action,
+                        applied_action="UNKNOWN",
+                        confirmed=False,
+                        source=event.source,
+                        trust_state=(
+                            "TRUSTED" if reputation_profile.trusted else "UNTRUSTED"
+                        ),
+                        trust_expires=reputation_profile.trusted_until,
+                        evidence={
+                            "reputation_score": reputation_profile.risk_score,
+                            "reputation_confidence": reputation_profile.confidence,
+                            "user_reports": reputation_profile.user_reports,
+                        },
+                    ),
+                    persist=True,
+                )
+                intelligence_data = intelligence.to_public_dict(include_history=False)
+                result["intelligence"] = intelligence_data
+                result["detection"].update(
+                    {
+                        "intelligence_context": intelligence_data,
+                        "intelligence_error": not intelligence.available,
+                    }
+                )
                 decision = PolicyEngine(self.cfg).decide(result["detection"])
                 decision_data = decision.to_dict()
+                behavior_engine.update_outcome(
+                    event.event_id,
+                    recommended_action=decision.recommended_action,
+                    applied_action=decision.applied_action,
+                )
+                intelligence.recommended = decision.recommended_action
+                intelligence.applied = decision.applied_action
+                if intelligence.available:
+                    behavior_engine.storage.save_snapshot(intelligence)
+                    result["intelligence"] = intelligence.to_public_dict(
+                        include_history=False
+                    )
                 latency_ms = _elapsed_ms(started)
                 result["policy"] = decision_data
                 result["detection"].update(

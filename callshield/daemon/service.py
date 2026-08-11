@@ -18,6 +18,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
+from ..adaptive import BehaviorStorage
 from ..config import Config, load_config
 from ..database import Database
 from ..events import EventQueue, EventProcessor
@@ -598,6 +599,10 @@ class DaemonService:
                     confirmed = database.confirm_screening_rejection(
                         screening_request_id, iso_now()
                     )
+                    if confirmed:
+                        BehaviorStorage(database, self.cfg).confirm(
+                            screening_request_id
+                        )
                 finally:
                     database.close()
                 if confirmed:
@@ -771,6 +776,7 @@ class DaemonService:
 
         policy = processed.get("policy") or screening
         reputation_profile = processed.get("reputation_profile") or {}
+        intelligence = processed.get("intelligence") or {}
         recommendation = str(policy.get("recommended_action") or "ALLOW")
         if recommendation not in ("ALLOW", "BLOCK"):
             recommendation = "ALLOW"
@@ -808,6 +814,16 @@ class DaemonService:
             "reputation_reasons": list(
                 reputation_profile.get("reasons", [])[:20]
             ),
+            "intelligence_trend": str(
+                intelligence.get("behavioral_trend", "INSUFFICIENT_DATA")
+            ),
+            "intelligence_patterns": [
+                str(item.get("pattern_id"))
+                for item in intelligence.get("patterns", [])[:20]
+                if isinstance(item, dict) and item.get("pattern_id")
+            ],
+            "risk_delta": int(intelligence.get("risk_delta", 0)),
+            "confidence_delta": int(intelligence.get("confidence_delta", 0)),
         }
         normalized_number = str(detection.get("number") or number)
         return self._finalize_screening(response, normalized_number)

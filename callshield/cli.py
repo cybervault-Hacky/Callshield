@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
+from .adaptive import BehaviorEngine, BehaviorObservation, BehaviorStorage
 from .config import (
     Config,
     load_config,
@@ -75,7 +76,7 @@ from .utils import (
 
 _BANNER = "CALLSHIELD"
 _TAGLINE = "Fraud Protection Engine"
-_PHASE = "Phase 7 — Reputation & Explainable Intelligence"
+_PHASE = "Phase 8 — Adaptive Threat Intelligence & Behavior Engine"
 _PHASE_COMPAT = "Phase 1 — Foundation"
 
 
@@ -387,6 +388,14 @@ def build_parser() -> argparse.ArgumentParser:
     s_rep.add_argument("number", nargs="?", help="Number or 'list'.")
     s_rep.add_argument("--json", action="store_true")
 
+    s_intelligence = sub.add_parser(
+        "intelligence", help="Show bounded adaptive behavioral intelligence."
+    )
+    s_intelligence.add_argument("number", nargs="?", help="Number or 'list'.")
+    s_intelligence.add_argument("--json", action="store_true")
+    s_intelligence.add_argument("--history", action="store_true")
+    s_intelligence.add_argument("--explain", action="store_true")
+
     s_trust = sub.add_parser("trust", help="Locally trust a normalized number.")
     s_trust.add_argument("number")
     s_trust.add_argument("--for", dest="duration", default=None, help="Temporary duration such as 24h or 7d.")
@@ -661,6 +670,26 @@ def _cmd_scan(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
             result: AnalysisResult = analyze_number(
                 args.number, db=db, cfg=cfg, record_event=record
             )
+            if record:
+                try:
+                    BehaviorEngine(db, cfg).add_observation(
+                        result.normalized_number,
+                        BehaviorObservation(
+                            event_id=str(uuid.uuid4()),
+                            timestamp=iso_now(),
+                            event_type="NUMBER_SCAN",
+                            risk_score=result.risk_score,
+                            confidence=result.confidence,
+                            recommended_action=result.recommended_action,
+                            applied_action="UNKNOWN",
+                            confirmed=False,
+                            source="CLI",
+                            evidence={"verdict": result.verdict},
+                        ),
+                    )
+                except Exception:
+                    # Derived intelligence must never break the core scan.
+                    pass
         except InvalidNumberError as exc:
             _print_error(
                 ui if not as_json else None,
@@ -847,15 +876,33 @@ def _cmd_report(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     try:
         db.add_report(n.normalized, reason, iso_now())
         total = db.count_reports(n.normalized)
+        try:
+            BehaviorEngine(db, cfg).add_observation(
+                n.normalized,
+                BehaviorObservation(
+                    event_id=str(uuid.uuid4()),
+                    timestamp=iso_now(),
+                    event_type="USER_REPORT",
+                    risk_score=0,
+                    confidence=0,
+                    recommended_action="UNKNOWN",
+                    applied_action="UNKNOWN",
+                    confirmed=False,
+                    source="CLI",
+                    evidence={"report_count": total},
+                ),
+            )
+        except Exception:
+            pass
     finally:
         db.close()
     _header(ui, "USER REPORT")
-    print(f"Number        {n.normalized}")
+    print(f"Number        {mask_number(n.normalized)}")
     print(f"Total reports {total}")
     if reason:
         print(f"Reason        {reason}")
     print(ui.dim + "\n(User reports are stored locally only.)" + ui.reset)
-    log_info(cfg, f"report add number={n.normalized} total={total}")
+    log_info(cfg, f"report add number={mask_number(n.normalized)} total={total}")
     return EXIT_OK
 
 
@@ -1010,6 +1057,146 @@ def _cmd_reputation(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     return EXIT_OK
 
 
+def _cmd_intelligence(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    requested = getattr(args, "number", None)
+    as_json = bool(getattr(args, "json", False))
+    include_history = bool(getattr(args, "history", False))
+    explain = bool(getattr(args, "explain", False))
+    if requested is None or requested.lower() == "list":
+        database = None
+        try:
+            database = open_database(cfg)
+            rows = BehaviorStorage(database, cfg).recent_profiles(limit=50)
+        except Exception as exc:
+            _print_error(ui, f"Intelligence storage unavailable: {exc}")
+            return EXIT_DATABASE
+        finally:
+            if database is not None:
+                database.close()
+        if as_json:
+            _print_json({"profiles": rows, "count": len(rows)})
+            return EXIT_OK
+        _header(ui, "CALLSHIELD INTELLIGENCE")
+        if not rows:
+            print("No intelligence snapshots recorded.")
+            return EXIT_OK
+        print(f"{'NUMBER':<20} {'SCORE':>5} {'CONF':>5} {'DELTA':>6} TREND")
+        for row in rows:
+            print(
+                f"{row['number_masked']:<20} {row['current_score']:>5} "
+                f"{row['confidence']:>4}% {row['risk_delta']:>+6} {row['trend']}"
+            )
+        return EXIT_OK
+
+    n = _normalize_or_error(
+        ui, requested, cfg, usage_hint="callshield intelligence <number>"
+    )
+    if n is None:
+        return EXIT_INVALID_NUMBER
+    database = None
+    try:
+        database = open_database(cfg)
+        analysis = analyze_number(
+            n.normalized, db=database, cfg=cfg, record_event=False
+        )
+        reputation = ReputationEngine(database, cfg).calculate(
+            n.normalized, analysis=analysis, persist=True
+        )
+        snapshot = BehaviorEngine(database, cfg).snapshot(
+            n.normalized,
+            reputation=reputation,
+            detection=analysis,
+            persist=True,
+        )
+    except Exception as exc:
+        snapshot = None
+        error = str(exc)
+    finally:
+        if database is not None:
+            database.close()
+
+    if snapshot is None:
+        fallback = {
+            "number_masked": mask_number(n.normalized),
+            "decision": "ALLOW_RECOMMENDED",
+            "behavioral_trend": "INSUFFICIENT_DATA",
+            "recommended": "ALLOW",
+            "applied": "ALLOW",
+            "confirmed": False,
+            "available": False,
+            "error": error[:200],
+            "patterns": [],
+            "explanations": ["Adaptive intelligence unavailable; fail-open ALLOW"],
+        }
+        if as_json:
+            _print_json(fallback)
+        else:
+            _header(ui, "CALLSHIELD INTELLIGENCE")
+            print(f"Number:              {fallback['number_masked']}")
+            print("Trend:               INSUFFICIENT_DATA")
+            print("Recommended:         ALLOW")
+            print("Applied:             ALLOW")
+            print("Reason:              intelligence unavailable (fail-open)")
+        return EXIT_OK
+
+    public = snapshot.to_public_dict(include_history=include_history)
+    if as_json:
+        _print_json(public)
+        return EXIT_OK
+
+    _header(ui, "CALLSHIELD INTELLIGENCE")
+    print(f"Number:              {snapshot.number_masked}")
+    print(f"Reputation Score:    {snapshot.reputation_score}/100")
+    print(f"Reputation Confidence:{snapshot.reputation_confidence:>4}%")
+    print(f"Behavioral Trend:    {snapshot.behavioral_trend}")
+    print(f"Baseline Score:      {snapshot.baseline_score}")
+    print(f"Current Score:       {snapshot.current_score}")
+    print(f"Risk Delta:          {snapshot.risk_delta:+d}")
+    print(f"Confidence Delta:    {snapshot.confidence_delta:+d}")
+    print(f"Trust State:         {snapshot.trust_state}")
+    if snapshot.trust_expiry:
+        print(f"Trust Expiry:        {snapshot.trust_expiry}")
+    print()
+    print(f"OBSERVED:            {snapshot.observed}")
+    print(f"RECOMMENDED:         {snapshot.recommended}")
+    print(f"APPLIED:             {snapshot.applied}")
+    print(f"CONFIRMED:           {'YES' if snapshot.confirmed else 'NO'}")
+    print()
+    print("Evidence:")
+    print(f"  Observations:       {snapshot.recent_observation_count}")
+    print(f"  High Risk:          {snapshot.recent_high_risk_count}")
+    print(f"  Block Recommended:  {snapshot.recent_block_recommendations}")
+    print(f"  User Reports:       {snapshot.recent_user_reports}")
+    print("Patterns:")
+    if snapshot.patterns:
+        for pattern in snapshot.patterns:
+            print(f"  • {pattern.pattern_id}: {pattern.explanation}")
+            if explain:
+                print(f"    evidence={json.dumps(pattern.evidence, sort_keys=True)}")
+                print(
+                    f"    observations={pattern.observation_count} "
+                    f"window={pattern.time_window_seconds}s confidence={pattern.confidence}%"
+                )
+    else:
+        print("  • none")
+    if snapshot.explanations:
+        print("Explanations:")
+        for explanation in snapshot.explanations:
+            print(f"  • {explanation}")
+    if include_history:
+        print("Timeline:")
+        if snapshot.timeline:
+            for item in snapshot.timeline:
+                print(
+                    f"  {item.timestamp} {item.event_type} risk={item.risk_score} "
+                    f"recommended={item.recommended_action} applied={item.applied_action} "
+                    f"confirmed={'YES' if item.confirmed else 'NO'}"
+                )
+        else:
+            print("  (no observations)")
+    return EXIT_OK
+
+
 def _cmd_trust(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     n = _normalize_or_error(ui, args.number, cfg, usage_hint="callshield trust <number>")
     if n is None:
@@ -1028,6 +1215,26 @@ def _cmd_trust(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
                 expires_at=expires_at,
                 note=args.reason,
             )
+            try:
+                BehaviorEngine(database, cfg).add_observation(
+                    n.normalized,
+                    BehaviorObservation(
+                        event_id=str(uuid.uuid4()),
+                        timestamp=iso_now(),
+                        event_type="TRUST_ADDED",
+                        risk_score=0,
+                        confidence=100,
+                        recommended_action="ALLOW",
+                        applied_action="ALLOW",
+                        confirmed=True,
+                        source="CLI",
+                        trust_state="TRUSTED",
+                        trust_expires=expires_at,
+                        evidence={"temporary": expires_at is not None},
+                    ),
+                )
+            except Exception:
+                pass
         finally:
             database.close()
     except Exception as exc:
@@ -1050,6 +1257,26 @@ def _cmd_untrust(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
             removed = ReputationStorage(database, cfg).remove_trust(
                 number_fingerprint(n.normalized)
             )
+            if removed:
+                try:
+                    BehaviorEngine(database, cfg).add_observation(
+                        n.normalized,
+                        BehaviorObservation(
+                            event_id=str(uuid.uuid4()),
+                            timestamp=iso_now(),
+                            event_type="TRUST_REMOVED",
+                            risk_score=0,
+                            confidence=100,
+                            recommended_action="ALLOW",
+                            applied_action="ALLOW",
+                            confirmed=True,
+                            source="CLI",
+                            trust_state="UNTRUSTED",
+                            evidence={"removed": True},
+                        ),
+                    )
+                except Exception:
+                    pass
         finally:
             database.close()
     except Exception as exc:
@@ -2038,6 +2265,7 @@ _COMMANDS = {
     "unallow": _cmd_unallow,
     "report": _cmd_report,
     "reputation": _cmd_reputation,
+    "intelligence": _cmd_intelligence,
     "trust": _cmd_trust,
     "untrust": _cmd_untrust,
     "history": _cmd_history,

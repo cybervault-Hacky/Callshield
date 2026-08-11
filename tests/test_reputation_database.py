@@ -21,7 +21,7 @@ class TestReputationDatabase(unittest.TestCase):
     def test_schema_and_indexes(self):
         db = Database(self.cfg.database_path)
         try:
-            self.assertEqual(SCHEMA_VERSION, 6)
+            self.assertEqual(SCHEMA_VERSION, 7)
             tables = {
                 row[0]
                 for row in db._conn.execute(
@@ -67,7 +67,7 @@ class TestReputationDatabase(unittest.TestCase):
         try:
             self.assertEqual(
                 migrated._conn.execute("SELECT version FROM schema_version").fetchone()[0],
-                6,
+                7,
             )
             self.assertTrue(migrated.validate_schema())
         finally:

@@ -227,6 +227,14 @@ class HealthMonitor:
                     "last_heartbeat": self.last_heartbeat,
                     "last_error": self.last_error,
                     "db_status": self.db_status,
+                    "config_integrity": (
+                        "ERROR"
+                        if getattr(self.cfg, "_config_integrity_error", None)
+                        else "HEALTHY"
+                    ),
+                    "config_error": getattr(
+                        self.cfg, "_config_integrity_error", None
+                    ),
                     "start_time": self.start_time,
                     "heartbeat_interval": float(self.cfg.heartbeat_interval),
                 }
@@ -299,6 +307,8 @@ class HealthMonitor:
         try:
             snapshot = self.snapshot()
             if snapshot.get("db_status") == "ERROR":
+                return False
+            if snapshot.get("config_integrity") == "ERROR":
                 return False
             if snapshot.get("last_heartbeat") is not None and snapshot.get(
                 "heartbeat_stale"

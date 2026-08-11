@@ -107,8 +107,10 @@ class Config:
     event_queue_size: int = 256
     shutdown_timeout: int = 10
     status_refresh_interval: int = 2
-    ipc_timeout: float = 5.0
+    ipc_timeout: float = 1.5
     event_payload_limit: int = 8 * 1024
+    replay_window_seconds: int = 300
+    replay_cache_size: int = 4096
     max_log_size: int = 2 * 1024 * 1024
     max_log_files: int = 3
     ipc_enabled: bool = True
@@ -268,6 +270,8 @@ class Config:
         self._validate_int("shutdown_timeout", 1, 60)
         self._validate_int("status_refresh_interval", 1, 10)
         self._validate_int("event_payload_limit", 256, 8 * 1024)
+        self._validate_int("replay_window_seconds", 30, 900)
+        self._validate_int("replay_cache_size", 128, 16384)
         self._validate_int("max_log_size", 64 * 1024, 100 * 1024 * 1024)
         self._validate_int("max_log_files", 1, 10)
         if (
@@ -299,19 +303,47 @@ class Config:
             raise ConfigError(f"{name} must be an integer between {minimum} and {maximum}.")
 
 
-def load_config(path: Optional[Path] = None) -> Config:
-    """Load configuration, creating a private default file when absent."""
+def load_config(path: Optional[Path] = None, *, strict: bool = False) -> Config:
+    """Load configuration with a disabled DRY_RUN fail-safe fallback.
+
+    Corrupt files are preserved for diagnosis. In normal operation a safe
+    default object is returned; callers such as doctor may request strict mode.
+    """
 
     target = Path(path) if path is not None else Path(CONFIG_PATH)
     if not target.exists():
         cfg = Config()
         save_config(cfg, target)
+        cfg._config_integrity_error = None  # type: ignore[attr-defined]
         return cfg
     try:
-        data = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
-    return Config.from_dict(data)
+        raw = target.read_text(encoding="utf-8")
+        if not raw.strip():
+            raise ConfigError(f"Configuration file is empty: {target}")
+        data = json.loads(raw)
+        cfg = Config.from_dict(data)
+        cfg._config_integrity_error = None  # type: ignore[attr-defined]
+        return cfg
+    except (OSError, UnicodeError, json.JSONDecodeError, ConfigError) as exc:
+        error = f"Unable to use config file {target}: {exc}"
+        if strict:
+            raise ConfigError(error) from exc
+        cfg = Config()
+        cfg.screening_enabled = False
+        cfg.screening_mode = "DRY_RUN"
+        cfg.active_mode_confirmed = False
+        cfg._config_integrity_error = error  # type: ignore[attr-defined]
+        return cfg
+
+
+def config_integrity(path: Optional[Path] = None) -> Optional[str]:
+    """Return a validation error string, or ``None`` for a valid config."""
+
+    try:
+        load_config(path, strict=True)
+        return None
+    except ConfigError as exc:
+        return exc.message
 
 
 def save_config(cfg: Config, path: Optional[Path] = None) -> None:
@@ -398,6 +430,8 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         "shutdown_timeout",
         "status_refresh_interval",
         "event_payload_limit",
+        "replay_window_seconds",
+        "replay_cache_size",
         "screening_timeout_ms",
         "relaxed_active_block_threshold",
         "relaxed_confidence_threshold",

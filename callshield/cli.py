@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -35,6 +36,7 @@ from .daemon import (
     stop as daemon_stop,
 )
 from .detector import AnalysisResult, analyze_number, open_database
+from .doctor import run_doctor
 from .intelligence import analyze_behavior, number_intelligence
 from .intelligence.profiles import PROFILES, get_profile
 from .logger import log_error, log_info
@@ -67,7 +69,7 @@ from .utils import (
 
 _BANNER = "CALLSHIELD"
 _TAGLINE = "Fraud Protection Engine"
-_PHASE = "Phase 5 — Active Call Protection"
+_PHASE = "Phase 6 — Hardening & Reliability"
 _PHASE_COMPAT = "Phase 1 — Foundation"
 
 
@@ -141,6 +143,15 @@ def _level_from_score(score: int) -> str:
     return "LOW"
 
 
+def _strict_cli_json_object(pairs: Any) -> Dict[str, Any]:
+    result = {}  # type: Dict[str, Any]
+    for key, value in pairs:
+        if key in result or len(result) >= 128:
+            raise ValueError("duplicate or excessive JSON response keys")
+        result[key] = value
+    return result
+
+
 def _ipc_request(
     cfg: Config,
     payload: Dict[str, Any],
@@ -156,9 +167,13 @@ def _ipc_request(
     if not endpoint.exists():
         return None
     timeout_value = float(timeout if timeout is not None else cfg.ipc_timeout)
+    envelope = dict(payload)
+    envelope.setdefault("protocol", "callshield/1")
+    envelope.setdefault("request_id", str(uuid.uuid4()))
+    envelope.setdefault("timestamp", iso_now())
     try:
         request = (
-            json.dumps(payload, allow_nan=False, separators=(",", ":")) + "\n"
+            json.dumps(envelope, allow_nan=False, separators=(",", ":")) + "\n"
         ).encode("utf-8")
     except (TypeError, ValueError):
         return {"status": "error", "error": "Request is not valid JSON"}
@@ -186,9 +201,15 @@ def _ipc_request(
         first, _, remainder = response.partition(b"\n")
         if remainder.strip():
             return {"status": "error", "error": "Invalid daemon response"}
-        decoded = json.loads(first.decode("utf-8", errors="strict"))
+        decoded = json.loads(
+            first.decode("utf-8", errors="strict"),
+            object_pairs_hook=_strict_cli_json_object,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant: {value}")
+            ),
+        )
         return decoded if isinstance(decoded, dict) else None
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return None
     finally:
         if client is not None:
@@ -444,6 +465,17 @@ def build_parser() -> argparse.ArgumentParser:
     s_policy_test.add_argument("--whitelist", action="store_true")
     s_policy_test.add_argument("--emergency-off", action="store_true")
     s_policy_test.add_argument("--disabled", action="store_true")
+
+    s_doctor = sub.add_parser("doctor", help="Run Phase 6 diagnostics.")
+    s_doctor.add_argument("--json", action="store_true", help="Emit JSON diagnostics.")
+    s_doctor.add_argument(
+        "--repair", action="store_true", help="Apply only safe stale-state/permission repairs."
+    )
+
+    s_blocks = sub.add_parser("blocks", help="Inspect applied screening blocks.")
+    s_blocks_sub = s_blocks.add_subparsers(dest="blocks_cmd")
+    s_blocks_inspect = s_blocks_sub.add_parser("inspect", help="Inspect one block by ID.")
+    s_blocks_inspect.add_argument("id", type=int)
 
     return p
 
@@ -1809,6 +1841,72 @@ def _cmd_policy(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     return EXIT_OK
 
 
+def _cmd_doctor(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    report = run_doctor(
+        cfg,
+        repair=bool(getattr(args, "repair", False)),
+        ipc_request=_ipc_request,
+    )
+    if getattr(args, "json", False):
+        _print_json(report.to_dict())
+    else:
+        _header(ui, "CALLSHIELD DOCTOR")
+        print(f"Overall:             {report.status}")
+        print()
+        for check in report.checks:
+            repaired = " (repaired)" if check.repaired else ""
+            print(f"{check.name:<18} {check.status:<12} {check.detail}{repaired}")
+    return EXIT_GENERAL if report.status == "ERROR" else EXIT_OK
+
+
+def _cmd_blocks(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    database = None
+    try:
+        database = open_database(cfg)
+        if getattr(args, "blocks_cmd", None) == "inspect":
+            row = database.inspect_block(args.id)
+            if not row:
+                _print_error(ui, f"Applied block ID {args.id} was not found.")
+                return EXIT_GENERAL
+            _header(ui, "CALLSHIELD BLOCK INSPECTION")
+            print(f"ID:                  {row['id']}")
+            print(f"Timestamp:           {row['timestamp']}")
+            print(f"Number:              {row['number_masked']}")
+            print(f"Risk:                {row['risk']}")
+            print(f"Confidence:          {row['confidence']}")
+            print(f"Policy:              {row['policy_name']}")
+            print(f"Recommendation:      {row['recommended_action']}")
+            print(f"Applied Action:      {row['applied_action']}")
+            print(f"Reason:              {row['policy_reason'] or row['reason'] or 'unknown'}")
+            print(
+                f"Confirmation:        {'CONFIRMED' if row['actually_rejected'] else 'NOT CONFIRMED'}"
+            )
+            return EXIT_OK
+        rows = database.recent_blocks(limit=20)
+        _header(ui, "CALLSHIELD APPLIED BLOCKS")
+        if not rows:
+            print("No applied screening blocks recorded.")
+            return EXIT_OK
+        print(f"{'ID':>5}  {'TIMESTAMP':<20} {'NUMBER':<18} {'RISK':>4} {'POLICY':<9} CONFIRMED")
+        for row in rows:
+            timestamp = str(row["timestamp"]).replace("T", " ")[:19]
+            confirmed = "YES" if row["actually_rejected"] else "NO"
+            print(
+                f"{row['id']:>5}  {timestamp:<20} {row['number_masked']:<18} "
+                f"{row['risk']:>4} {row['policy_name']:<9} {confirmed}"
+            )
+        return EXIT_OK
+    except Exception as exc:
+        _print_error(ui, f"Unable to inspect blocks: {exc}")
+        return EXIT_DATABASE
+    finally:
+        if database is not None:
+            try:
+                database.close()
+            except Exception:
+                pass
+
+
 _COMMANDS = {
     "version": _cmd_version,
     "status": _cmd_status,
@@ -1834,6 +1932,8 @@ _COMMANDS = {
     "emergency-off": _cmd_emergency_off,
     "emergency-reset": _cmd_emergency_reset,
     "policy": _cmd_policy,
+    "doctor": _cmd_doctor,
+    "blocks": _cmd_blocks,
     "_run-fg": _cmd_run_fg,
 }
 

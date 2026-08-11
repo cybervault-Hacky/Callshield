@@ -44,7 +44,8 @@ def validate_startup(cfg: Optional[Config] = None) -> Config:
 
     database = None
     try:
-        database = Database(selected.database_path)
+        database = Database(selected.database_path, timeout=1.0)
+        database.integrity_check(quick=True)
         database.get_setting("heartbeat")
     except Exception as exc:
         raise RuntimeError(

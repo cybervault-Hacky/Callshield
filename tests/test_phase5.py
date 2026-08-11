@@ -21,11 +21,15 @@ def request(number):
     }
 
 
-def feedback(request_id):
+def feedback(screening_request_id):
+    from callshield.utils import iso_now
+
     return {
         "command": "screening_feedback",
         "protocol": "callshield/1",
-        "request_id": request_id,
+        "request_id": str(uuid.uuid4()),
+        "timestamp": iso_now(),
+        "screening_request_id": screening_request_id,
         "source": "android_call_screening",
         "result": "REJECTED",
     }
@@ -237,7 +241,7 @@ class TestPhase5DatabaseMigration(unittest.TestCase):
             version = database._conn.execute(
                 "SELECT version FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 4)
+            self.assertEqual(version, 5)
             row = database.recent_screening_events(limit=1)[0]
             self.assertEqual(row["applied_action"], "ALLOW")
             self.assertEqual(row["policy_action"], "BLOCK")

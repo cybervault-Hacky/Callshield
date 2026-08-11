@@ -12,7 +12,7 @@ class ProtocolTest {
         val request = Protocol.ScreeningRequest(requestId = id, number = "+919876543210")
         assertNull(request.validate())
         val json = JSONObject(request.toJsonString())
-        assertEquals(setOf("protocol", "request_id", "number", "source"), json.keys().asSequence().toSet())
+        assertEquals(setOf("protocol", "request_id", "timestamp", "number", "source"), json.keys().asSequence().toSet())
     }
 
     @Test
@@ -53,10 +53,11 @@ class ProtocolTest {
     @Test
     fun feedbackContractIsBoundedAndValidated() {
         val id = UUID.randomUUID().toString()
-        val feedback = Protocol.ScreeningFeedback(id)
+        val feedback = Protocol.ScreeningFeedback(screeningRequestId = id)
         assertTrue(feedback.validate())
         val json = JSONObject(feedback.toJsonString())
         assertEquals("screening_feedback", json.getString("command"))
+        assertEquals(id, json.getString("screening_request_id"))
         assertEquals("REJECTED", json.getString("result"))
     }
 

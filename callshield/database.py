@@ -22,7 +22,7 @@ from . import DATA_DIR
 from .utils import DatabaseError, ensure_parent, mask_number
 
 DEFAULT_DB_PATH = DATA_DIR / "callshield.db"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 # ----- Schema --------------------------------------------------------------
@@ -148,12 +148,21 @@ class Database:
         except sqlite3.Error as exc:
             raise DatabaseError(f"Unable to open database at {self.path}: {exc}") from exc
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._initialize()
         try:
-            self._conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.Error:
-            pass
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.execute(f"PRAGMA busy_timeout = {int(connect_timeout * 1000)}")
+            journal_row = self._conn.execute("PRAGMA journal_mode = WAL").fetchone()
+            journal_mode = str(journal_row[0] if journal_row else "").lower()
+            if journal_mode != "wal":
+                raise DatabaseError(f"SQLite WAL mode unavailable at {self.path}")
+            self._conn.execute("PRAGMA synchronous = FULL")
+            self._initialize()
+            self.validate_schema()
+        except (sqlite3.Error, DatabaseError) as exc:
+            self._conn.close()
+            if isinstance(exc, DatabaseError):
+                raise
+            raise DatabaseError(f"Database setup failed at {self.path}: {exc}") from exc
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -164,6 +173,7 @@ class Database:
         try:
             self._conn.executescript(SCHEMA)
             self._migrate()
+            self._ensure_phase6_indexes()
         except sqlite3.Error as exc:
             raise DatabaseError(f"Database initialization failed: {exc}") from exc
 
@@ -208,6 +218,8 @@ class Database:
                 self._migrate_v2_to_v3()
             if current_version <= 3:
                 self._migrate_v3_to_v4()
+            if current_version <= 4:
+                self._migrate_v4_to_v5()
         except sqlite3.Error as exc:
             raise DatabaseError(f"Database migration to v{SCHEMA_VERSION} failed: {exc}") from exc
 
@@ -436,6 +448,104 @@ class Database:
                 "ON screening_events(number_hash)"
             )
 
+    def _migrate_v4_to_v5(self) -> None:
+        """Add Phase 6 lookup indexes without rewriting user rows."""
+
+        self._ensure_phase6_indexes()
+
+    def _ensure_phase6_indexes(self) -> None:
+        with self._conn:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_event_id "
+                "ON screening_events(event_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_applied "
+                "ON screening_events(applied_action, timestamp DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_policy_action "
+                "ON screening_events(policy_action, timestamp DESC)"
+            )
+
+    def integrity_check(self, *, quick: bool = False) -> bool:
+        pragma = "quick_check" if quick else "integrity_check"
+        try:
+            rows = self._conn.execute(f"PRAGMA {pragma}").fetchall()
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Database integrity check failed: {exc}") from exc
+        if not rows or any(str(row[0]).lower() != "ok" for row in rows):
+            details = "; ".join(str(row[0]) for row in rows[:10]) or "no result"
+            raise DatabaseError(f"Database corruption detected: {details}")
+        return True
+
+    def validate_schema(self) -> bool:
+        required_tables = {
+            "schema_version",
+            "numbers",
+            "events",
+            "reports",
+            "settings",
+            "screening_events",
+        }
+        tables = {
+            str(row[0])
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        missing = required_tables - tables
+        if missing:
+            raise DatabaseError(f"Database schema missing tables: {', '.join(sorted(missing))}")
+        version_row = self._conn.execute(
+            "SELECT version FROM schema_version LIMIT 1"
+        ).fetchone()
+        if not version_row or int(version_row[0]) != SCHEMA_VERSION:
+            raise DatabaseError("Database schema version is invalid")
+        screening_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(screening_events)"
+            ).fetchall()
+        }
+        required_columns = {
+            "id",
+            "timestamp",
+            "number_masked",
+            "number_hash",
+            "risk",
+            "confidence",
+            "policy_name",
+            "policy_action",
+            "applied_action",
+            "event_id",
+            "actually_rejected",
+        }
+        if required_columns - screening_columns:
+            raise DatabaseError("Database screening schema is incomplete")
+        screening_indexes = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA index_list(screening_events)"
+            ).fetchall()
+        }
+        required_indexes = {
+            "idx_screening_timestamp",
+            "idx_screening_hash",
+            "idx_screening_event_id",
+            "idx_screening_applied",
+            "idx_screening_policy_action",
+        }
+        if required_indexes - screening_indexes:
+            raise DatabaseError("Database screening indexes are incomplete")
+        foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()
+        if not foreign_keys or int(foreign_keys[0]) != 1:
+            raise DatabaseError("SQLite foreign_keys is not enabled")
+        journal = self._conn.execute("PRAGMA journal_mode").fetchone()
+        if not journal or str(journal[0]).lower() != "wal":
+            raise DatabaseError("SQLite WAL mode is not enabled")
+        return True
+
     def close(self) -> None:
         try:
             self._conn.close()
@@ -448,11 +558,13 @@ class Database:
             self._conn.execute("BEGIN")
             yield self._conn
             self._conn.execute("COMMIT")
-        except Exception:
+        except Exception as exc:
             try:
                 self._conn.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
+            if isinstance(exc, sqlite3.Error):
+                raise DatabaseError(f"Database transaction failed: {exc}") from exc
             raise
 
     # ----- numbers --------------------------------------------------------
@@ -818,6 +930,13 @@ class Database:
         ).fetchone()
         return int(row["count"] if row else 0)
 
+    def screening_event_exists(self, event_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM screening_events WHERE event_id = ? LIMIT 1",
+            (str(event_id)[:64],),
+        ).fetchone()
+        return row is not None
+
     def confirm_screening_rejection(
         self, event_id: str, confirmed_at: str
     ) -> bool:
@@ -882,6 +1001,37 @@ class Database:
         metrics["total"] = metrics["incoming_calls"]
         metrics["block_recommended"] = metrics["screening_block_recommended"]
         return metrics
+
+    def recent_blocks(self, limit: int = 20) -> List[Dict[str, Any]]:
+        bounded = max(1, min(int(limit), 200))
+        rows = self._conn.execute(
+            """
+            SELECT id, timestamp, number_masked, risk, confidence, policy_name,
+                   recommended_action, applied_action, reason,
+                   actually_rejected, rejection_confirmed_at
+              FROM screening_events
+             WHERE applied_action = 'BLOCK'
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?
+            """,
+            (bounded,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def inspect_block(self, block_id: int) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            """
+            SELECT id, timestamp, number_masked, risk, confidence, policy_name,
+                   threshold, confidence_threshold, recommended_action,
+                   applied_action, reason, policy_reason, emergency_off,
+                   actually_rejected, rejection_confirmed_at
+              FROM screening_events
+             WHERE id = ? AND applied_action = 'BLOCK'
+             LIMIT 1
+            """,
+            (int(block_id),),
+        ).fetchone()
+        return dict(row) if row else None
 
     # ----- settings -------------------------------------------------------
     def get_setting(self, key: str) -> Optional[str]:

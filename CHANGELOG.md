@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.6.0 — Phase 6: Hardening & Reliability
+
+### Added
+- Strict versioned IPC envelopes for every request with UUID and timezone timestamp validation.
+- Thread-safe replay protection with a 5-minute default freshness window, 4096-entry bounded cache, expiry, duplicate detection, and deterministic eviction.
+- Strict JSON duplicate-key, constant, nesting, key-count, array-size, request-size, and response-size validation while retaining Unix sockets only.
+- Durable atomic file writes: unique same-directory temporary file, flush, file fsync, restrictive mode, atomic replace, and parent-directory fsync.
+- Fail-safe config loading for empty, malformed, or invalid files; runtime falls back to screening disabled, DRY_RUN, and unconfirmed ACTIVE state while preserving the corrupt file for doctor.
+- SQLite schema version 5, full/quick integrity checks, schema/PRAGMA validation, WAL/foreign-key enforcement, FULL synchronous mode, bounded lock behavior, and screening indexes for event ID, applied action, and policy action.
+- `callshield doctor`, `callshield doctor --json`, and `callshield doctor --repair` for runtime, Python, database, schema, config, daemon, IPC, permissions, Android bridge, screening, policy, and storage diagnostics.
+- Safe masked block history with `callshield blocks` and `callshield blocks inspect <id>`.
+- `SECURITY_AUDIT.md` with explicit PASS and NOT TESTED distinctions.
+- Reproducible policy microbenchmark script and `PERFORMANCE_PHASE6.md` with measured p50/p95/p99 results and clearly limited scope.
+- 51 dedicated Phase 6 Python tests (271 total) covering replay, IPC parsing, config durability, DB integrity, resource bounds, policy safety, 5/10-request concurrency, doctor repair, static audit, and block inspection.
+
+### Hardened
+- SIGHUP reload propagates safe config to processor/policy, health, signal handling, and heartbeat without terminating the daemon.
+- Emergency reset uses a synced atomic unlink and remains disabled DRY_RUN.
+- Startup performs SQLite quick integrity/schema validation before accepting work.
+- Android screening and feedback now carry fresh timestamps and independent request IDs; feedback identifies the original screening request separately.
+- Android service lifecycle cancels its bounded coroutine scope; invalid/lifecycle/transport state remains fail-open.
+- Concurrent IPC workers remain bounded at 10 and malformed/disconnected clients remain isolated.
+
+### Safety and verification
+- All system/config/database/replay/IPC failures continue to produce ALLOW for screening decisions.
+- No TCP/HTTP listener, root requirement, unsafe deserialization, dynamic execution, shell execution, or plaintext screening log was added.
+- Python suite: 271 passed; all 220 Phase 1–5 tests preserved.
+- Android build/device and end-to-end phone performance remain NOT VERIFIED due missing JDK, Gradle, SDK, emulator, and device.
+- Phase 7 has not started.
+
 ## 0.5.0 — Phase 5: Active Call Protection
 
 ### Added

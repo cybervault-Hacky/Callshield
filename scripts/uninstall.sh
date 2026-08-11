@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CALLSHIELD uninstaller — Phase 5.
+# CALLSHIELD uninstaller — Phase 6.
 #
 # By default this removes the wrapper command and stops the daemon, but keeps
 # the user database/logs. Pass --purge to remove all state as well.

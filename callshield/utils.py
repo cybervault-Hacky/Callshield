@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -79,25 +80,63 @@ def ensure_parent(path: Path) -> Path:
 
 
 def safe_write_text(path: Path, content: str, mode: int = 0o600) -> None:
-    """Write ``content`` to ``path`` atomically-ish with restricted permissions.
+    """Durably replace a text file without exposing a partial write.
 
-    Permissions are set so that other users on the same host cannot read the
-    file (important for local databases/logs containing phone numbers).
+    The temporary file is unique and created in the destination directory.
+    Both file data and the final directory entry are synced before success is
+    reported. Any abandoned temporary file is removed on failure.
     """
-    ensure_parent(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(content)
+
+    target = Path(path)
+    ensure_parent(target)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    temporary = Path(temporary_name)
     try:
-        os.chmod(tmp, mode)
-    except OSError:
-        # chmod may fail on exotic filesystems; continue rather than break.
-        pass
-    os.replace(tmp, path)
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary), str(target))
+        os.chmod(target, mode)
+        _fsync_directory(target.parent)
+    except Exception:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def safe_unlink(path: Path) -> bool:
+    """Atomically unlink ``path`` and sync its parent directory."""
+
+    target = Path(path)
     try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
+        target.unlink()
+    except FileNotFoundError:
+        return False
+    _fsync_directory(target.parent)
+    return True
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(str(path), flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def supports_color(no_color: bool = False) -> bool:

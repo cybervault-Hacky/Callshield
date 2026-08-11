@@ -1,7 +1,9 @@
 package com.callshield.bridge
 
 import org.json.JSONObject
+import java.time.Instant
 import java.util.UUID
+import kotlin.math.abs
 
 /** Versioned, bounded JSON contract shared with the Termux daemon. */
 object Protocol {
@@ -13,12 +15,14 @@ object Protocol {
     data class ScreeningRequest(
         val protocol: String = VERSION,
         val requestId: String = UUID.randomUUID().toString(),
+        val timestamp: String = Instant.now().toString(),
         val number: String,
         val source: String = SOURCE_ANDROID
     ) {
         fun validate(): String? {
             if (protocol != VERSION) return "INVALID_PROTOCOL"
             if (!Protocol.isUuid(requestId)) return "INVALID_REQUEST_ID"
+            if (!Protocol.isFreshTimestamp(timestamp)) return "INVALID_TIMESTAMP"
             if (source != SOURCE_ANDROID) return "INVALID_SOURCE"
             if (!number.matches(Regex("^\\+?[0-9]{7,15}$"))) return "INVALID_NUMBER"
             return null
@@ -27,21 +31,30 @@ object Protocol {
         fun toJsonString(): String = JSONObject().apply {
             put("protocol", protocol)
             put("request_id", requestId)
+            put("timestamp", timestamp)
             put("number", number)
             put("source", source)
         }.toString()
     }
 
     data class ScreeningFeedback(
-        val requestId: String,
+        val screeningRequestId: String,
+        val requestId: String = UUID.randomUUID().toString(),
+        val timestamp: String = Instant.now().toString(),
         val result: String = "REJECTED"
     ) {
-        fun validate(): Boolean = Protocol.isUuid(requestId) && result == "REJECTED"
+        fun validate(): Boolean =
+            Protocol.isUuid(requestId) &&
+                Protocol.isUuid(screeningRequestId) &&
+                Protocol.isFreshTimestamp(timestamp) &&
+                result == "REJECTED"
 
         fun toJsonString(): String = JSONObject().apply {
             put("command", "screening_feedback")
             put("protocol", VERSION)
             put("request_id", requestId)
+            put("timestamp", timestamp)
+            put("screening_request_id", screeningRequestId)
             put("source", SOURCE_ANDROID)
             put("result", result)
         }.toString()
@@ -160,6 +173,14 @@ object Protocol {
             UUID.fromString(value)
             true
         } catch (_: IllegalArgumentException) {
+            false
+        }
+    }
+
+    internal fun isFreshTimestamp(value: String): Boolean {
+        return try {
+            abs(Instant.now().epochSecond - Instant.parse(value).epochSecond) <= 300
+        } catch (_: Exception) {
             false
         }
     }

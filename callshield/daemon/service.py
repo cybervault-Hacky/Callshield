@@ -24,6 +24,7 @@ from ..events import EventQueue, EventProcessor
 from ..events.models import Event
 from ..events.types import EVENT_TYPE_INCOMING_CALL, SOURCE_ANDROID
 from ..policy import is_emergency_off, thresholds_for_config
+from ..security import ReplayCache, ReplayStatus
 from ..utils import iso_now, mask_number, safe_write_text
 from .health import HealthMonitor
 from .heartbeat import Heartbeat
@@ -33,6 +34,10 @@ from .signals import SignalHandler
 
 MAX_IPC_REQUEST = 16 * 1024
 MAX_IPC_RESPONSE = 64 * 1024
+MAX_JSON_DEPTH = 16
+MAX_JSON_KEYS = 128
+MAX_JSON_ARRAY = 256
+MAX_IPC_WORKERS = 10
 _ALLOWED_IPC_COMMANDS = {
     "status",
     "metrics",
@@ -107,8 +112,12 @@ class DaemonService:
         self._ipc_thread = None  # type: Optional[threading.Thread]
         self._processor_thread = None  # type: Optional[threading.Thread]
         self._ipc_socket = None  # type: Optional[socket.socket]
-        self._ipc_client_slots = threading.BoundedSemaphore(8)
+        self._ipc_client_slots = threading.BoundedSemaphore(MAX_IPC_WORKERS)
         self._ipc_clients = set()  # type: Set[threading.Thread]
+        self._replay_cache = ReplayCache(
+            lifetime_seconds=int(self.cfg.replay_window_seconds),
+            max_entries=int(self.cfg.replay_cache_size),
+        )
         self._ipc_clients_lock = threading.Lock()
         self._signal_handler = None  # type: Optional[SignalHandler]
         self._cleanup_lock = threading.Lock()
@@ -176,6 +185,8 @@ class DaemonService:
                 "database_path",
                 "event_queue_size",
                 "ipc_enabled",
+                "replay_window_seconds",
+                "replay_cache_size",
                 "daemon_log_file",
                 "max_log_size",
                 "max_log_files",
@@ -291,8 +302,7 @@ class DaemonService:
             except OSError:
                 break
             # Screening requests may arrive concurrently. Keep handling
-            # bounded to eight daemon threads so Phase 3 resource guarantees
-            # remain intact.
+            # bounded to ten daemon threads so resource guarantees remain intact.
             if not self._ipc_client_slots.acquire(blocking=False):
                 self._send_ipc_response(
                     connection,
@@ -358,9 +368,16 @@ class DaemonService:
         except UnicodeDecodeError as exc:
             raise ValueError("Request must be valid UTF-8") from exc
         try:
-            return json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON: {exc.msg}") from exc
+            value = json.loads(
+                text,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+            _validate_json_shape(value)
+            return value
+        except (json.JSONDecodeError, RecursionError) as exc:
+            message = exc.msg if isinstance(exc, json.JSONDecodeError) else "too deeply nested"
+            raise ValueError(f"Invalid JSON: {message}") from exc
 
     @staticmethod
     def _send_ipc_response(connection: socket.socket, response: Dict[str, Any]) -> None:
@@ -378,20 +395,54 @@ class DaemonService:
         if not isinstance(request, dict):
             return {"status": "error", "error": "Request must be a JSON object"}
 
-        # The Android wire contract is deliberately commandless and versioned:
-        # protocol, request_id, number, source. It shares this same Unix socket
-        # and does not introduce a second IPC mechanism.
-        if "command" not in request and (
-            "protocol" in request or request.get("source") == SOURCE_ANDROID
-        ):
-            return self._handle_screening_request(request)
-
         command = request.get("command")
+        is_screening = (
+            "command" not in request
+            and request.get("source") == SOURCE_ANDROID
+        )
+        if request.get("protocol") != "callshield/1":
+            return self._reject_ipc_policy(request, "INVALID_PROTOCOL", is_screening)
+        replay_status = self._replay_cache.check_and_store(
+            request.get("request_id"), request.get("timestamp")
+        )
+        if replay_status != ReplayStatus.ACCEPTED:
+            return self._reject_ipc_policy(request, replay_status.value, is_screening)
+
+        if is_screening:
+            return self._handle_screening_request(request)
         if not isinstance(command, str) or not command:
             return {"status": "error", "error": "Invalid request: missing command"}
         if command not in _ALLOWED_IPC_COMMANDS:
             return {"status": "error", "error": f"Unknown command: {command}"}
         return self._handle_ipc_command(command, request)
+
+    def _reject_ipc_policy(
+        self, request: Dict[str, Any], detail: str, is_screening: bool
+    ) -> Dict[str, Any]:
+        if not is_screening:
+            return {
+                "status": "error",
+                "error": "POLICY_ERROR",
+                "detail": detail,
+                "request_id": request.get("request_id"),
+            }
+        request_id = request.get("request_id")
+        if not isinstance(request_id, str) or not _is_uuid(request_id):
+            request_id = str(uuid.uuid4())
+        response = self._screening_fallback(request_id, "POLICY_ERROR", 0)
+        response["policy_error"] = True
+        response["policy_error_detail"] = detail
+        self.health.inc_incoming_call()
+        self.health.inc_received()
+        self.health.record_screening(
+            verdict="UNKNOWN",
+            recommended_action="ALLOW",
+            applied_action="ALLOW",
+            reason="POLICY_ERROR",
+            policy_error=True,
+        )
+        self.health.inc_failed(error=detail)
+        return response
 
     def _snapshot(self) -> Dict[str, Any]:
         self._sync_runtime_metrics()
@@ -423,10 +474,24 @@ class DaemonService:
     def _database_screening_metrics(self) -> Dict[str, int]:
         database = None
         try:
-            database = Database(self.cfg.database_path)
+            database = Database(self.cfg.database_path, timeout=0.2)
             return database.screening_metrics()
         except Exception:
             return {}
+        finally:
+            if database is not None:
+                try:
+                    database.close()
+                except Exception:
+                    pass
+
+    def _screening_request_seen(self, request_id: str) -> Optional[bool]:
+        database = None
+        try:
+            database = Database(self.cfg.database_path, timeout=0.1)
+            return database.screening_event_exists(request_id)
+        except Exception:
+            return None
         finally:
             if database is not None:
                 try:
@@ -520,19 +585,18 @@ class DaemonService:
                     "emergency_off": is_emergency_off(self.cfg),
                 }
             if command == "screening_feedback":
-                request_id = request.get("request_id")
+                screening_request_id = request.get("screening_request_id")
                 if (
-                    request.get("protocol") != "callshield/1"
-                    or request.get("source") != SOURCE_ANDROID
+                    request.get("source") != SOURCE_ANDROID
                     or request.get("result") != "REJECTED"
-                    or not isinstance(request_id, str)
-                    or not _is_uuid(request_id)
+                    or not isinstance(screening_request_id, str)
+                    or not _is_uuid(screening_request_id)
                 ):
                     return {"status": "error", "error": "Invalid screening feedback"}
                 database = Database(self.cfg.database_path, timeout=0.2)
                 try:
                     confirmed = database.confirm_screening_rejection(
-                        request_id, iso_now()
+                        screening_request_id, iso_now()
                     )
                 finally:
                     database.close()
@@ -569,7 +633,8 @@ class DaemonService:
         stored_number = str(number) if isinstance(number, str) else ""
 
         unknown_fields = sorted(
-            set(request) - {"protocol", "request_id", "number", "source"}
+            set(request)
+            - {"protocol", "request_id", "timestamp", "number", "source"}
         )
         if unknown_fields:
             return self._finalize_screening(
@@ -614,6 +679,15 @@ class DaemonService:
                 ),
                 stored_number,
                 failed=True,
+            )
+        persisted_replay = self._screening_request_seen(request_id)
+        if persisted_replay is True:
+            return self._reject_ipc_policy(
+                request, "DUPLICATE_PERSISTED_REQUEST", True
+            )
+        if persisted_replay is None:
+            return self._reject_ipc_policy(
+                request, "DATABASE_REPLAY_CHECK_FAILED", True
             )
         if not self.cfg.screening_enabled:
             return self._finalize_screening(
@@ -1019,6 +1093,42 @@ class DaemonService:
             )
         except Exception:
             pass
+
+
+def _strict_json_object(pairs: Any) -> Dict[str, Any]:
+    result = {}  # type: Dict[str, Any]
+    if len(pairs) > MAX_JSON_KEYS:
+        raise ValueError("JSON object has too many keys")
+    for key, value in pairs:
+        if not isinstance(key, str) or key in result:
+            raise ValueError("JSON object contains a duplicate or invalid key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+def _validate_json_shape(value: Any, depth: int = 0) -> None:
+    if depth > MAX_JSON_DEPTH:
+        raise ValueError("JSON nesting limit exceeded")
+    if isinstance(value, dict):
+        if len(value) > MAX_JSON_KEYS:
+            raise ValueError("JSON object has too many keys")
+        for key, item in value.items():
+            if len(key) > 128:
+                raise ValueError("JSON key is too long")
+            _validate_json_shape(item, depth + 1)
+    elif isinstance(value, list):
+        if len(value) > MAX_JSON_ARRAY:
+            raise ValueError("JSON array is too large")
+        for item in value:
+            _validate_json_shape(item, depth + 1)
+    elif isinstance(value, str) and len(value.encode("utf-8")) > MAX_IPC_REQUEST:
+        raise ValueError("JSON string is too large")
+    elif value is not None and not isinstance(value, (str, int, float, bool)):
+        raise ValueError("Unsupported JSON value")
 
 
 def _elapsed_ms(started: float) -> int:

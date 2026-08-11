@@ -7,6 +7,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -17,7 +18,8 @@ class CallShieldScreeningService : CallScreeningService() {
         private const val SERVICE_TIMEOUT_MS = 1500L
     }
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val serviceJob = SupervisorJob()
+    private val serviceScope = CoroutineScope(serviceJob + Dispatchers.IO)
     private val bridgeClient = BridgeClient(timeoutMs = SERVICE_TIMEOUT_MS.toInt())
 
     override fun onScreenCall(callDetails: Call.Details) {
@@ -59,6 +61,11 @@ class CallShieldScreeningService : CallScreeningService() {
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        serviceScope.cancel("CallScreeningService destroyed")
+        super.onDestroy()
     }
 
     private fun respondWithDecision(

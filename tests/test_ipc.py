@@ -40,7 +40,14 @@ class TestIPC(unittest.TestCase):
         self.env.stop()
 
     def _req(self, payload):
-        return self._raw((json.dumps(payload) + "\n").encode())
+        import uuid
+        from callshield.utils import iso_now
+
+        envelope = dict(payload)
+        envelope.setdefault("protocol", "callshield/1")
+        envelope.setdefault("request_id", str(uuid.uuid4()))
+        envelope.setdefault("timestamp", iso_now())
+        return self._raw((json.dumps(envelope) + "\n").encode())
 
     def _raw(self, data):
         sock_path = Path(self.cfg.socket_path)
@@ -241,7 +248,7 @@ class TestIPC(unittest.TestCase):
             {
                 "command": "screening_feedback",
                 "protocol": "callshield/1",
-                "request_id": request_id,
+                "screening_request_id": request_id,
                 "source": "android_call_screening",
                 "result": "REJECTED",
             }

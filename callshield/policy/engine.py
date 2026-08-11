@@ -7,7 +7,7 @@ import stat
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from ..utils import safe_write_text
+from ..utils import safe_unlink, safe_write_text
 from .models import PolicyDecision
 from .thresholds import PolicyConfigError, normalize_policy_name, thresholds_for_config
 
@@ -54,6 +54,12 @@ class PolicyEngine:
         )
         risk = _score(detection, "risk_score", "risk")
         confidence = _score(detection, "confidence")
+        # Read emergency state before any policy can reach an apply path.
+        emergency = (
+            is_emergency_off(self.cfg)
+            if emergency_off is None
+            else bool(emergency_off)
+        )
 
         try:
             normalized_policy = normalize_policy_name(selected_name)
@@ -91,11 +97,6 @@ class PolicyEngine:
                 confidence_threshold=thresholds.confidence,
             )
 
-        emergency = (
-            is_emergency_off(self.cfg)
-            if emergency_off is None
-            else bool(emergency_off)
-        )
         meets_thresholds = (
             risk >= thresholds.active_block
             and confidence >= thresholds.confidence
@@ -190,7 +191,7 @@ def reset_emergency_off(cfg: Any) -> bool:
         return False
     _require_owned_regular(path)
     try:
-        path.unlink()
+        safe_unlink(path)
     except OSError as exc:
         raise PolicyError(f"Unable to reset emergency-off: {exc}") from exc
     return True

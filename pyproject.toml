@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "callshield"
-version = "0.5.0"
-description = "CALLSHIELD — explicit, fail-open active call protection for Termux and Android"
+version = "0.6.0"
+description = "CALLSHIELD — hardened, fail-open call protection for Termux and Android"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.8"

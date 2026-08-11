@@ -249,7 +249,7 @@ class TestScreeningDatabase(unittest.TestCase):
             version = database._conn.execute(
                 "SELECT version FROM schema_version"
             ).fetchone()[0]
-            self.assertEqual(version, 4)
+            self.assertEqual(version, 5)
             self.assertEqual(database.get_setting("preserved"), "yes")
             self.assertEqual(database.count_screening_events(), 0)
         finally:

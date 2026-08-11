@@ -60,10 +60,15 @@ class TestConfig(unittest.TestCase):
         cfg = load_config(self.path)
         self.assertEqual(cfg.protection_mode, "RELAXED")
 
-    def test_corrupt_file_errors(self):
+    def test_corrupt_file_fails_safe_and_strict_mode_errors(self):
         self.path.write_text("{not valid json", encoding="utf-8")
+        cfg = load_config(self.path)
+        self.assertFalse(cfg.screening_enabled)
+        self.assertEqual(cfg.screening_mode, "DRY_RUN")
+        self.assertFalse(cfg.active_mode_confirmed)
+        self.assertTrue(getattr(cfg, "_config_integrity_error", None))
         with self.assertRaises(ConfigError):
-            load_config(self.path)
+            load_config(self.path, strict=True)
 
     def test_invalid_signal_weight_rejected(self):
         with self.assertRaises(ConfigError):

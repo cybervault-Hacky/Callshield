@@ -76,7 +76,7 @@ class BridgeClient(
 
     /** Confirm rejection only after Android accepted an ACTIVE block response. */
     suspend fun confirmRejection(requestId: String): Boolean {
-        val feedback = Protocol.ScreeningFeedback(requestId)
+        val feedback = Protocol.ScreeningFeedback(screeningRequestId = requestId)
         if (!feedback.validate()) return false
         val encoded = (feedback.toJsonString() + "\n").toByteArray(StandardCharsets.UTF_8)
         return withContext(Dispatchers.IO) {
@@ -155,7 +155,12 @@ class BridgeClient(
                 LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM)
             )
             socket.soTimeout = 500
-            val ping = "{\"command\":\"ping\"}\n".toByteArray(StandardCharsets.UTF_8)
+            val ping = JSONObject().apply {
+                put("command", "ping")
+                put("protocol", Protocol.VERSION)
+                put("request_id", UUID.randomUUID().toString())
+                put("timestamp", java.time.Instant.now().toString())
+            }.toString().plus("\n").toByteArray(StandardCharsets.UTF_8)
             socket.outputStream.write(ping)
             socket.outputStream.flush()
             val response = readBoundedLine(socket, 4096)

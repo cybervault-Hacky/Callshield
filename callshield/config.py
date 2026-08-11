@@ -67,6 +67,10 @@ class Config:
     run_dir: str = field(default_factory=lambda: str(Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))).parent / "run" if Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))).name == "data" else str(Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))) / "run")))
     daemon_log_file: str = field(default_factory=lambda: str(Path(os.environ.get("CALLSHIELD_LOG_DIR", str(DATA_DIR.parent / "logs"))) / "daemon.log"))
     socket_path: str = field(default_factory=lambda: str(Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))).parent / "run" / "callshield.sock" if Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))).name == "data" else str(Path(os.environ.get("CALLSHIELD_DATA_DIR", str(DATA_DIR))) / "run" / "callshield.sock")))
+    # Phase 4 additions — Android screening bridge
+    screening_enabled: bool = True
+    screening_mode: str = "DRY_RUN"  # DRY_RUN (Phase 4) or ACTIVE (Phase 5)
+    screening_timeout_ms: int = 1500
 
     # ----- serialisation -----
     def to_dict(self) -> Dict[str, Any]:
@@ -86,6 +90,11 @@ class Config:
         # If the loaded mode is a Phase 1 legacy name, translate it.
         if base.protection_mode in _LEGACY_MODE_MAP:
             base.protection_mode = _LEGACY_MODE_MAP[base.protection_mode]
+        # Normalize screening_mode
+        if hasattr(base, "screening_mode") and isinstance(base.screening_mode, str):
+            base.screening_mode = base.screening_mode.upper()
+            if base.screening_mode not in ("DRY_RUN", "ACTIVE"):
+                base.screening_mode = "DRY_RUN"
         base._apply_profile_defaults_if_needed()
         base._validate()
         return base
@@ -166,6 +175,13 @@ class Config:
             v = getattr(self, pname)
             if not isinstance(v, str) or not v.strip():
                 raise ConfigError(f"{pname} must be a non-empty string path.")
+        # Phase 4 validations
+        if not isinstance(self.screening_enabled, bool):
+            raise ConfigError("screening_enabled must be true or false.")
+        if self.screening_mode not in ("DRY_RUN", "ACTIVE"):
+            raise ConfigError("screening_mode must be DRY_RUN or ACTIVE.")
+        if not isinstance(self.screening_timeout_ms, int) or not (200 <= self.screening_timeout_ms <= 5000):
+            raise ConfigError("screening_timeout_ms must be an integer between 200 and 5000.")
 
 
 def load_config(path: Path = CONFIG_PATH) -> Config:
@@ -217,11 +233,18 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         if value.upper() == "PERMISSIVE":
             value = "RELAXED"
         return set_profile(cfg, value)
+    if key in {"screening_mode"}:
+        v = value.upper()
+        if v not in ("DRY_RUN", "ACTIVE"):
+            raise ConfigError("screening_mode must be DRY_RUN or ACTIVE")
+        cfg.screening_mode = v
+        cfg._validate()
+        return cfg
     if not hasattr(cfg, key):
         raise ConfigError(f"Unknown configuration key: {key}")
     if key in {"default_country", "color_enabled", "database_path", "pid_file", "log_file", "run_dir", "daemon_log_file", "socket_path"}:
         setattr(cfg, key, value)
-    elif key in {"risk_threshold", "high_risk_threshold", "recent_window_seconds", "heartbeat_interval", "event_queue_size", "shutdown_timeout", "status_refresh_interval", "max_log_size", "max_log_files"}:
+    elif key in {"risk_threshold", "high_risk_threshold", "recent_window_seconds", "heartbeat_interval", "event_queue_size", "shutdown_timeout", "status_refresh_interval", "max_log_size", "max_log_files", "screening_timeout_ms"}:
         try:
             # Support suffix for max_log_size like 2MB
             if key == "max_log_size" and isinstance(value, str) and value.strip().upper().endswith("MB"):
@@ -233,7 +256,7 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         except ValueError as exc:
             raise ConfigError(f"{key} must be an integer.") from exc
         setattr(cfg, key, iv)
-    elif key in {"logging_enabled", "output_json", "quiet", "daemon_enabled", "ipc_enabled"}:
+    elif key in {"logging_enabled", "output_json", "quiet", "daemon_enabled", "ipc_enabled", "screening_enabled"}:
         v = value.lower()
         if v in bool_true:
             setattr(cfg, key, True)

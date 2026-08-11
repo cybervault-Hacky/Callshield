@@ -320,7 +320,7 @@ class DaemonService:
                 return
             # Never exec/eval, only allow known commands
             cmd = req.get("command")
-            allowed = {"status", "metrics", "health", "daemon_info", "event", "stop", "ping"}
+            allowed = {"status", "metrics", "health", "daemon_info", "event", "stop", "ping", "incoming_call", "screening", "screening_status", "bridge_status"}
             if cmd not in allowed:
                 resp = {"status": "error", "error": f"Unknown command: {cmd}"}
                 conn.sendall((json.dumps(resp) + "\n").encode())
@@ -360,7 +360,23 @@ class DaemonService:
                     "events_failed": snap["failed"],
                     "events_dropped": snap["dropped"],
                     "queue_peak": qm.get("peak"),
+                    "screening_mode": getattr(self.cfg, "screening_mode", "DRY_RUN"),
                 })
+                # Also add screening metrics from DB if available
+                try:
+                    from ..database import Database
+                    db = Database(self.cfg.database_path)
+                    sm = db.screening_metrics()
+                    db.close()
+                    snap.update({
+                        "screening_total": sm.get("total", 0),
+                        "screening_high_risk": sm.get("high_risk", 0),
+                        "screening_block_recommended": sm.get("block_recommended", 0),
+                        "screening_actually_rejected": sm.get("actually_rejected", 0),
+                        "screening_timeouts": sm.get("timeouts", 0),
+                    })
+                except Exception:
+                    pass
                 return {"status": "ok", "data": snap}
             elif cmd == "health":
                 snap = self.health.snapshot()
@@ -404,6 +420,129 @@ class DaemonService:
                 # Also update queue metrics
                 self.health.update_queue(self.queue.qsize(), peak=self.queue.metrics().get("peak"))
                 return {"status": "ok", "event_id": ev.event_id}
+            elif cmd in ("incoming_call", "screening"):
+                # Bridge protocol: expect protocol, request_id, number, timestamp
+                # Validate protocol
+                protocol = req.get("protocol") or req.get("version") or "callshield/1"
+                if protocol not in ("callshield/1", "callshield1", "1"):
+                    # Allow but log
+                    pass
+                request_id = req.get("request_id") or req.get("requestId") or str(uuid.uuid4())
+                number = req.get("number") or (req.get("payload") or {}).get("number")
+                if not number:
+                    return {"status": "error", "error": "Missing number", "request_id": request_id, "protocol": "callshield/1"}
+                # Validate size
+                if len(str(number)) > 100:
+                    return {"status": "error", "error": "Number too long", "request_id": request_id, "protocol": "callshield/1"}
+                # Check screening enabled and mode
+                if not getattr(self.cfg, "screening_enabled", True):
+                    return {
+                        "protocol": "callshield/1",
+                        "request_id": request_id,
+                        "risk_score": 0,
+                        "confidence": 0,
+                        "verdict": "UNKNOWN",
+                        "recommended_action": "ALLOW",
+                        "applied_action": "ALLOW",
+                        "mode": "DRY_RUN",
+                        "reason": "SCREENING_DISABLED",
+                    }
+                # Process with timeout
+                timeout_ms = int(getattr(self.cfg, "screening_timeout_ms", 1500))
+                start = time.time()
+                try:
+                    # Create INCOMING_CALL event
+                    from ..events.models import Event
+                    from ..utils import iso_now
+                    ev = Event(
+                        event_id=request_id,
+                        event_type="INCOMING_CALL",
+                        timestamp=req.get("timestamp") or iso_now(),
+                        source="android_call_screening",
+                        number=str(number),
+                        payload={"bridge_protocol": protocol, "request_id": request_id},
+                    )
+                    # Process synchronously with timeout handling
+                    # Use a thread with timeout to enforce screening_timeout_ms
+                    result_holder = {}
+                    exc_holder = {}
+                    def _do_process():
+                        try:
+                            result_holder["result"] = self.processor.process(ev)
+                        except Exception as e:
+                            exc_holder["exc"] = e
+                    t = threading.Thread(target=_do_process, daemon=True)
+                    t.start()
+                    t.join(timeout=timeout_ms/1000.0)
+                    if t.is_alive():
+                        # Timeout
+                        self.health.inc_screening_timeout()
+                        return {
+                            "protocol": "callshield/1",
+                            "request_id": request_id,
+                            "risk_score": 0,
+                            "confidence": 0,
+                            "verdict": "UNKNOWN",
+                            "recommended_action": "ALLOW",
+                            "applied_action": "ALLOW",
+                            "mode": "DRY_RUN",
+                            "reason": "SCREENING_TIMEOUT",
+                        }
+                    if "exc" in exc_holder:
+                        raise exc_holder["exc"]
+                    result = result_holder.get("result")
+                    if not result or result.get("status") != "processed":
+                        raise RuntimeError(result.get("error") if result else "Unknown error")
+                    det = result.get("detection") or {}
+                    screening = result.get("screening") or {}
+                    # Update health screening metrics
+                    try:
+                        self.health.inc_screening()
+                        self.health.inc_screening_processed()
+                        self.health.inc_received()
+                        self.health.inc_processed(verdict=det.get("verdict"), action=det.get("recommended_action"))
+                    except Exception:
+                        pass
+                    return {
+                        "protocol": "callshield/1",
+                        "request_id": request_id,
+                        "risk_score": det.get("risk_score", 0),
+                        "confidence": det.get("confidence", 0),
+                        "verdict": det.get("verdict", "UNKNOWN"),
+                        "recommended_action": det.get("recommended_action", "ALLOW"),
+                        "applied_action": screening.get("applied_action", "ALLOW"),
+                        "mode": screening.get("mode", "DRY_RUN"),
+                        "reason": det.get("reason", ""),
+                        "number_masked": __import__("callshield.utils", fromlist=["mask_number"]).mask_number(str(number)) if number else None,
+                    }
+                except Exception as exc:
+                    self.health.inc_bridge_error()
+                    return {
+                        "protocol": "callshield/1",
+                        "request_id": request_id,
+                        "risk_score": 0,
+                        "confidence": 0,
+                        "verdict": "UNKNOWN",
+                        "recommended_action": "ALLOW",
+                        "applied_action": "ALLOW",
+                        "mode": "DRY_RUN",
+                        "reason": f"BRIDGE_ERROR: {exc}",
+                    }
+            elif cmd == "screening_status":
+                # Return bridge status
+                state, pid = __import__("callshield.daemon.process", fromlist=["status"]).status(self.cfg)  # type: ignore
+                screening = {
+                    "bridge": "CONNECTED" if state == "RUNNING" else "NOT CONNECTED",
+                    "android_service": "AVAILABLE" if state == "RUNNING" else "NOT CONNECTED",
+                    "daemon": state,
+                    "mode": getattr(self.cfg, "screening_mode", "DRY_RUN"),
+                    "timeout_ms": getattr(self.cfg, "screening_timeout_ms", 1500),
+                    "live_calls": "READY" if state == "RUNNING" and getattr(self.cfg, "screening_enabled", True) else "NOT READY",
+                    "auto_reject": "DISABLED",
+                }
+                return {"status": "ok", "data": screening}
+            elif cmd == "bridge_status":
+                return self._handle_ipc_command({"command": "screening_status"})
             elif cmd == "stop":
                 # Request graceful shutdown
                 # Run in background to allow response

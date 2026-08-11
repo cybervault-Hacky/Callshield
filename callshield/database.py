@@ -9,6 +9,7 @@ Schema is migrated automatically from Phase 1 -> Phase 2 on first open.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -21,7 +22,7 @@ from . import DATA_DIR
 from .utils import DatabaseError, ensure_parent
 
 DEFAULT_DB_PATH = DATA_DIR / "callshield.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 # ----- Schema --------------------------------------------------------------
@@ -78,6 +79,27 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS screening_events (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp          TEXT NOT NULL,
+    number             TEXT NOT NULL,
+    number_masked      TEXT,
+    number_hash        TEXT,
+    risk_score         INTEGER NOT NULL,
+    confidence         INTEGER NOT NULL DEFAULT 0,
+    verdict            TEXT NOT NULL,
+    recommended_action TEXT NOT NULL,
+    applied_action     TEXT NOT NULL,
+    result_reason      TEXT,
+    latency_ms         INTEGER,
+    source             TEXT,
+    event_id           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_screening_timestamp ON screening_events(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_screening_number    ON screening_events(number);
+
 """
 
 
@@ -161,6 +183,8 @@ class Database:
         try:
             if current_version <= 1:
                 self._migrate_v1_to_v2()
+            if current_version <= 2:
+                self._migrate_v2_to_v3()
         except sqlite3.Error as exc:
             raise DatabaseError(f"Database migration to v{SCHEMA_VERSION} failed: {exc}") from exc
 
@@ -274,6 +298,36 @@ class Database:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_events_number_ts ON events(number, timestamp DESC)"
+            )
+
+    def _migrate_v2_to_v3(self) -> None:
+        # Add screening_events table for Phase 4
+        with self._conn:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS screening_events (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp          TEXT NOT NULL,
+                    number             TEXT NOT NULL,
+                    number_masked      TEXT,
+                    number_hash        TEXT,
+                    risk_score         INTEGER NOT NULL,
+                    confidence         INTEGER NOT NULL DEFAULT 0,
+                    verdict            TEXT NOT NULL,
+                    recommended_action TEXT NOT NULL,
+                    applied_action     TEXT NOT NULL,
+                    result_reason      TEXT,
+                    latency_ms         INTEGER,
+                    source             TEXT,
+                    event_id           TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_timestamp ON screening_events(timestamp DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_screening_number ON screening_events(number)"
             )
 
     def close(self) -> None:
@@ -511,6 +565,74 @@ class Database:
             (number, limit),
         )
         return [dict(r) for r in cur.fetchall()]
+
+    # ----- screening events (Phase 4) ---------------------------------------
+    def add_screening_event(
+        self,
+        timestamp: str,
+        number: str,
+        risk_score: int,
+        confidence: int,
+        verdict: str,
+        recommended_action: str,
+        applied_action: str,
+        result_reason: Optional[str] = None,
+        latency_ms: Optional[int] = None,
+        source: Optional[str] = None,
+        event_id: Optional[str] = None,
+    ) -> int:
+        # Mask and hash for privacy
+        try:
+            from .utils import mask_number
+            masked = mask_number(number)
+        except Exception:
+            masked = number[:4] + "***" + number[-4:] if len(number) > 8 else "***"
+        try:
+            h = hashlib.sha256(number.encode()).hexdigest()[:16]
+        except Exception:
+            h = None
+        with self.transaction():
+            cur = self._conn.execute(
+                """
+                INSERT INTO screening_events
+                    (timestamp, number, number_masked, number_hash, risk_score, confidence, verdict, recommended_action, applied_action, result_reason, latency_ms, source, event_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (timestamp, number, masked, h, int(risk_score), int(confidence), verdict, recommended_action, applied_action, result_reason, latency_ms, source, event_id),
+            )
+            return int(cur.lastrowid)
+
+    def recent_screening_events(self, limit: int = 50) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 1000))
+        cur = self._conn.execute(
+            "SELECT * FROM screening_events ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def count_screening_events(self) -> int:
+        cur = self._conn.execute("SELECT COUNT(*) FROM screening_events")
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def screening_metrics(self) -> Dict[str, Any]:
+        cur = self._conn.execute("SELECT COUNT(*) as total FROM screening_events")
+        total = int(cur.fetchone()[0] or 0)
+        cur = self._conn.execute("SELECT COUNT(*) FROM screening_events WHERE verdict IN ('HIGH_RISK','MALICIOUS','CRITICAL')")
+        high = int(cur.fetchone()[0] or 0)
+        cur = self._conn.execute("SELECT COUNT(*) FROM screening_events WHERE recommended_action='BLOCK'")
+        block_rec = int(cur.fetchone()[0] or 0)
+        cur = self._conn.execute("SELECT COUNT(*) FROM screening_events WHERE applied_action='BLOCK'")
+        actually_rejected = int(cur.fetchone()[0] or 0)
+        cur = self._conn.execute("SELECT COUNT(*) FROM screening_events WHERE result_reason='SCREENING_TIMEOUT'")
+        timeouts = int(cur.fetchone()[0] or 0)
+        return {
+            "total": total,
+            "high_risk": high,
+            "block_recommended": block_rec,
+            "actually_rejected": actually_rejected,
+            "timeouts": timeouts,
+        }
 
     # ----- settings -------------------------------------------------------
     def get_setting(self, key: str) -> Optional[str]:

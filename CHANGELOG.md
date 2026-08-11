@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.0 — Phase 4: Android Screening Bridge
+
+### Added
+- Android CallScreeningService bridge (`android/`): `CallShieldScreeningService.kt` (extends CallScreeningService, handles incoming calls, extracts number, normalizes, sends to daemon with timeout, logs, returns dry-run ALLOW), `BridgeClient.kt` (Unix socket LocalSocket, fallback paths, 1500ms timeout, size-limited 16KB/64KB, no eval/exec, validates protocol/request_id/number), `Protocol.kt` (versioned callshield/1, request/response, size limits, timeout/error handling), `ScreeningResult.kt` (dry-run never blocks), `BridgeSetupActivity.kt` (minimal no-UI)
+- Real incoming-call screening event `INCOMING_CALL` (Phase 3 had no fake, Phase 4 extends `events/types.py` with `INCOMING_CALL` + `SOURCE_ANDROID`, extensible)
+- Versioned bridge protocol (JSON, `protocol: callshield/1`, `request_id` uuid, `number`, `timestamp` → response `risk_score`, `confidence`, `verdict`, `recommended_action`, `applied_action`, `mode: DRY_RUN`, validated)
+- Screening timeout handling (default 1500ms, configurable `screening_timeout_ms` 200–5000, on timeout returns `UNKNOWN`/`ALLOW`/`SCREENING_TIMEOUT`, fail-safe)
+- Dry-run mode (`screening_mode=DRY_RUN` default, `screening_enabled` toggle, `callshield screening enable/disable/mode/status/health/metrics`, Phase 4 always `applied_action=ALLOW` even if `recommended BLOCK`)
+- Daemon availability handling (if STOPPED/UNAVAILABLE/CRASHED/TIMEOUT → UNKNOWN/ALLOW, never pretends screened)
+- Android bridge health: `callshield screening status` (Bridge CONNECTED/AVAILABLE, Daemon RUNNING, Mode DRY_RUN, Timeout 1500ms, Live Calls READY, Auto Reject DISABLED), extends `callshield status` (Android Bridge, Screening Mode/Events, Timeouts, Bridge Errors) and `callshield metrics` (Incoming Calls, Screened, Timeouts, Bridge Errors, High Risk, Block Recommendations, Actually Rejected 0)
+- Event persistence: `screening_events` table (id, timestamp, number, number_masked, number_hash, risk_score, confidence, verdict, recommended_action, applied_action, result_reason, latency_ms, source, event_id) with hash/masked privacy, `add_screening_event`/`screening_metrics`/`recent_screening_events`
+- Screening log: `CALLSHIELD SCREENING EVENT` (Time, Number masked, Risk, Confidence, Verdict, Recommended BLOCK / Applied ALLOW, Mode DRY_RUN, Reason Phase 4 disabled)
+- Minimal Android permissions (no CAMERA/MIC/LOCATION/SMS/CONTACTS/STORAGE/root, only BIND_SCREENING_SERVICE via system dialog, documented RoleManager)
+- Termux-first: `callshield screening status` is authoritative, Android has no UI
+- Android unit tests: `ProtocolTest` (9 tests: valid/invalid, response parsing, timeout, request ID, size), `ScreeningResultTest` (5 tests: dry-run, unknown, high-risk, safe, timeout), `BridgeClientTest` (4 tests: daemon unavailable, invalid number, dry-run enforcement, request ID)
+
+### Security
+- Local-only Unix socket (700, no TCP), IPC validation, request-size limits, timeout enforcement, response validation, minimal permissions, no automatic rejection (Phase 4 dry-run enforced in both Python `processor.py` and Kotlin `CallShieldScreeningService`), safe failure
+
+### Improved
+- Daemon IPC now handles `incoming_call`/`screening` synchronously with timeout via thread, updates health screening metrics, persists screening_events
+- HealthMonitor now tracks `screening_received/processed/timeouts/bridge_errors/last_screening`
+- CLI `metrics` and `status` extended with screening fields, `config show` includes screening config
+- Database migration v2→v3 adds `screening_events` with indexes, preserves data, backup
+
+### Notes
+- Android SDK/Gradle not available in this environment — build not executed, reported as limitation, Python/Termux components fully validated (137 tests OK)
+- Bridge fallback: if Termux socket inaccessible due to Android sandbox, tries `/data/local/tmp/callshield.sock`, otherwise fails safe to UNKNOWN/ALLOW, documented in `android/README.md` and `callshield/daemon/service.py`
+
 ## 0.3.0 — Phase 3: Background Engine
 
 ### Added

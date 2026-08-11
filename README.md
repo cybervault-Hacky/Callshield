@@ -1,12 +1,14 @@
 # CALLSHIELD
 
-> **Local fraud-number analysis and protection foundation — now with persistent background engine.**
+> **Local fraud-number analysis and protection with Android screening bridge (dry-run).**
 >
 > Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls.
 >
 > Phase 2 — Advanced Intelligence builds on Phase 1.
 >
-> Phase 3 — Background Engine adds a real Termux daemon, event queue, and IPC. **It does not yet receive or reject real Android phone calls.**
+> Phase 3 — Background Engine adds a real Termux daemon, event queue, and IPC.
+>
+> Phase 4 — Android Screening Bridge receives real incoming-call events via CallScreeningService, analyzes with the Termux daemon, but **does not automatically reject calls (dry-run).**
 >
 > **CALLSHIELD does NOT yet intercept or reject live phone calls.**
 > It runs locally on Android/Termux (or any Linux system), keeps its database
@@ -44,7 +46,8 @@ Use `callshield --help` for commands.
 - **Event logging** — every analysis recorded; masked by default (`--full` reveals).
 - **JSON output** — `callshield scan <number> --json`; `QUIET` mode.
 - **Persistent background daemon (Phase 3)** — real Linux process, PID + socket, `start`/`stop`/`status`, graceful shutdown, stale-PID recovery, never kills unrelated PIDs.
-- **Event pipeline** — bounded thread-safe queue (default 256), `NUMBER_SCAN`/`USER_REPORT`/`BLOCK_ACTION`/`ALLOW_ACTION`/`SYSTEM`/`HEARTBEAT` (extensible, no fake `INCOMING_CALL`).
+- **Event pipeline** — bounded thread-safe queue (default 256), `NUMBER_SCAN`/`USER_REPORT`/`BLOCK_ACTION`/`ALLOW_ACTION`/`SYSTEM`/`HEARTBEAT`/`INCOMING_CALL` (Phase 4, extensible).
+- **Android CallScreeningService bridge (Phase 4)** — minimal Kotlin `CallShieldScreeningService` (no GUI, no CAMERA/MIC/LOCATION/SMS/CONTACTS/STORAGE/root), versioned `callshield/1` protocol, 1500ms timeout, dry-run `ALLOW` always, local IPC only.
 - **Event processor** — validates, normalizes, calls `analyze_number()`, persists, logs, updates metrics; per-event exception isolated.
 - **Local IPC** — Unix domain socket `~/.callshield/run/callshield.sock` (700), JSON, size-limited (16KB req/64KB resp), timeout, no `eval`/`exec`, no TCP/network listener.
 - **Health monitoring** — uptime, PID, queue size/peak, processed/failed/received/dropped, last event/heartbeat, DB status, memory.
@@ -55,7 +58,7 @@ Use `callshield --help` for commands.
 - **Crash recovery** — single malformed event never kills daemon; fatal init exits cleanly.
 - **Offline-first, privacy-preserving** — zero network, no analytics, masked logs.
 - **Termux-friendly** — pure stdlib, no root, no GUI/APK, PID/socket in `~/.callshield/run`.
-- **Well tested** — 128 unit tests covering every subsystem.
+- **Well tested** — 137 unit tests covering every subsystem.
 
 ---
 
@@ -101,9 +104,16 @@ callshield/
 │       ├── __init__.py
 │       ├── engine.py
 │       └── defaults.py
+├── android/                  # Phase 4 — minimal CallScreeningService bridge (Kotlin, no GUI)
+│   ├── app/src/main/java/com/callshield/bridge/
+│   │   ├── CallShieldScreeningService.kt
+│   │   ├── BridgeClient.kt
+│   │   ├── Protocol.kt
+│   │   └── ScreeningResult.kt
+│   └── README.md
 ├── data/                     # Git-kept seed only; runtime is ~/.callshield/data
 ├── logs/                     # Git-kept .gitkeep; runtime is ~/.callshield/logs
-├── tests/                    # 128 tests (Phase1/2/3)
+├── tests/                    # 137 tests (Phase1/2/3/4)
 ├── scripts/
 │   ├── install.sh
 │   └── uninstall.sh
@@ -215,6 +225,9 @@ callshield status                       # Daemon RUNNING, Uptime, Queue 0/256, E
 callshield status --watch               # live refresh (Ctrl+C to exit watch, daemon stays)
 callshield metrics                      # uptime, received/processed/failed/dropped, high-risk, queue peak
 callshield event test +919876543210     # TEST NUMBER_SCAN via daemon queue (not a phone call)
+callshield screening status             # Bridge CONNECTED, Mode DRY_RUN, Timeout 1500ms
+callshield screening enable/disable     # toggle bridge
+callshield screening mode               # show/set DRY_RUN
 callshield daemon info                  # daemon info via IPC
 callshield daemon health                # health check
 callshield daemon restart               # stop + start
@@ -228,7 +241,7 @@ callshield stop                         # graceful shutdown (drains queue, flush
 | Command | Description |
 |---|---|
 | `callshield` | Banner (READY/LOCAL/ONLINE/STANDBY) + disclaimer |
-| `callshield --help`, `--version`, `version` | Help / `0.3.0 Phase 3 — Background Engine` |
+| `callshield --help`, `--version`, `version` | Help / `0.4.0 Phase 4 — Android Screening Bridge` |
 | `callshield status` | Full daemon status (IPC when running, PID fallback otherwise) |
 | `callshield status --watch [--interval N]` | Live watch (default 2s, Ctrl+C exits watch only) |
 | `callshield scan <number> [--json] [--quiet] [--no-log]` | Analyze |
@@ -242,6 +255,10 @@ callshield stop                         # graceful shutdown (drains queue, flush
 | `callshield daemon start/stop/restart/status/info/health` | Explicit daemon management |
 | `callshield metrics` | Real daemon metrics (IPC, fallback to DB when stopped) |
 | `callshield event test <number> [--reason]` | TEST event via daemon pipeline (labels TEST, not a call) |
+| `callshield screening status`           | Bridge status (CONNECTED, Mode, Timeout)       |
+| `callshield screening enable/disable`   | Enable/disable bridge                        |
+| `callshield screening mode [DRY_RUN]`   | Show/set mode (Phase 4 dry-run)              |
+| `callshield screening health/metrics`   | Screening health/metrics                     |
 
 All Phase 1/2 commands preserved.
 
@@ -345,7 +362,8 @@ Nothing beyond promised.
 
 ## Limitations
 
-- **Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls.** `start` is `STANDBY`, `Call Screening: NOT CONNECTED`, `event test` is labeled `TEST EVENT` not a call.
+- **Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls.**
+- **Phase 4 receives and analyzes real Android call-screening events but does not automatically reject calls. Automatic rejection is intentionally disabled until Phase 5.** `CallShieldScreeningService` always returns `ALLOW` (`recommended BLOCK → applied ALLOW, reason DRY_RUN`), timeout → `UNKNOWN/ALLOW/SCREENING_TIMEOUT`, daemon unavailable → `UNKNOWN/ALLOW`.
 - Normalizer curated country table; weak pattern signals never alone cause BLOCK.
 - No network/ML/cloud/GUI/APK; offline; `INCOMING_CALL` not implemented (extensible types only).
 - Daemon is not auto-restarted internally; watchdog foundation only (alive/heartbeat/queue/DB checks).
@@ -364,4 +382,4 @@ MIT — see `LICENSE`.
 
 ---
 
-**Remember:** CALLSHIELD Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls. Future phases will connect the daemon to Android’s privileged call-screening layer.
+**Remember:** CALLSHIELD Phase 4 receives and analyzes real Android call-screening events but does not automatically reject calls. Automatic rejection is intentionally disabled until Phase 5. Future phases will enable controlled rejection.

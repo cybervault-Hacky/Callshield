@@ -62,6 +62,10 @@ class EventProcessor:
             self._log_event(event, result)
             return result
 
+        # Detect if this is a screening event (INCOMING_CALL) vs regular scan
+        is_screening = event.event_type == "INCOMING_CALL"
+        start_ts = __import__("time").time()
+
         # Events that require a number
         number = event.number
         if not number:
@@ -81,7 +85,31 @@ class EventProcessor:
         except InvalidNumberError as exc:
             result["status"] = "failed"
             result["error"] = str(exc.message) if hasattr(exc, 'message') else str(exc)
-            result["detection"] = {"verdict": "INVALID", "action": "ALLOW"}
+            if is_screening:
+                result["detection"] = {"verdict": "UNKNOWN", "recommended_action": "ALLOW", "applied_action": "ALLOW", "mode": "DRY_RUN", "reason": "Invalid number", "risk_score": 0, "confidence": 0}
+                result["screening"] = {"recommended_action": "ALLOW", "applied_action": "ALLOW", "mode": "DRY_RUN", "latency_ms": int((__import__("time").time() - start_ts) * 1000)}
+                try:
+                    db2 = self._get_db()
+                    try:
+                        db2.add_screening_event(
+                            timestamp=event.timestamp,
+                            number=str(number) or "unknown",
+                            risk_score=0,
+                            confidence=0,
+                            verdict="UNKNOWN",
+                            recommended_action="ALLOW",
+                            applied_action="ALLOW",
+                            result_reason="INVALID_NUMBER",
+                            latency_ms=result["screening"]["latency_ms"],
+                            source=event.source,
+                            event_id=event.event_id,
+                        )
+                    finally:
+                        db2.close()
+                except Exception:
+                    pass
+            else:
+                result["detection"] = {"verdict": "INVALID", "action": "ALLOW"}
             self._log_event(event, result)
             return result
         except Exception as exc:
@@ -108,11 +136,96 @@ class EventProcessor:
                 "reason": analysis.reason,
                 "signals": analysis.signals,
             }
-            # Update metrics-like fields in result
             result["status"] = "processed"
+            # For screening events, apply dry-run logic and persist screening_event
+            if is_screening:
+                import time as _t
+                latency_ms = int((_t.time() - start_ts) * 1000)
+                recommended = analysis.recommended_action
+                # Phase 4 dry-run: applied always ALLOW, even if recommended BLOCK
+                mode = getattr(self.cfg, "screening_mode", "DRY_RUN")
+                applied = "ALLOW"  # Phase 4 always ALLOW
+                if mode != "DRY_RUN":
+                    # Future Phase 5 would allow BLOCK, but Phase 4 forces DRY_RUN
+                    applied = "ALLOW"
+                result["screening"] = {
+                    "recommended_action": recommended,
+                    "applied_action": applied,
+                    "mode": "DRY_RUN",
+                    "latency_ms": latency_ms,
+                }
+                result["detection"]["applied_action"] = applied
+                result["detection"]["mode"] = "DRY_RUN"
+                # Persist screening event
+                try:
+                    db2 = self._get_db()
+                    try:
+                        db2.add_screening_event(
+                            timestamp=event.timestamp,
+                            number=normalized,
+                            risk_score=analysis.risk_score,
+                            confidence=analysis.confidence,
+                            verdict=analysis.verdict,
+                            recommended_action=recommended,
+                            applied_action=applied,
+                            result_reason="DRY_RUN" if recommended == "BLOCK" else analysis.reason,
+                            latency_ms=latency_ms,
+                            source=event.source,
+                            event_id=event.event_id,
+                        )
+                    finally:
+                        db2.close()
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(f"Failed to persist screening event: {e}")
+                # Also log screening event nicely
+                if self.logger:
+                    try:
+                        self.logger.info(
+                            f"SCREENING event={event.event_id} number={mask_number(normalized)} risk={analysis.risk_score} verdict={analysis.verdict} rec={recommended} applied={applied} mode=DRY_RUN latency={latency_ms}ms"
+                        )
+                    except Exception:
+                        pass
         except InvalidNumberError as exc:
             result["status"] = "failed"
             result["error"] = str(exc.message) if hasattr(exc, 'message') else str(exc)
+            if is_screening:
+                # For screening, even invalid numbers should return ALLOW with UNKNOWN
+                result["detection"] = {
+                    "risk_score": 0,
+                    "confidence": 0,
+                    "verdict": "UNKNOWN",
+                    "recommended_action": "ALLOW",
+                    "applied_action": "ALLOW",
+                    "mode": "DRY_RUN",
+                    "reason": "Invalid number",
+                }
+                result["screening"] = {
+                    "recommended_action": "ALLOW",
+                    "applied_action": "ALLOW",
+                    "mode": "DRY_RUN",
+                    "latency_ms": int((__import__("time").time() - start_ts) * 1000),
+                }
+                try:
+                    db2 = self._get_db()
+                    try:
+                        db2.add_screening_event(
+                            timestamp=event.timestamp,
+                            number=number or "unknown",
+                            risk_score=0,
+                            confidence=0,
+                            verdict="UNKNOWN",
+                            recommended_action="ALLOW",
+                            applied_action="ALLOW",
+                            result_reason="INVALID_NUMBER",
+                            latency_ms=result["screening"]["latency_ms"],
+                            source=event.source,
+                            event_id=event.event_id,
+                        )
+                    finally:
+                        db2.close()
+                except Exception:
+                    pass
         except Exception as exc:
             result["status"] = "failed"
             result["error"] = f"Detection failed: {exc}"

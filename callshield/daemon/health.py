@@ -34,6 +34,12 @@ class HealthMonitor:
         self.high_risk_count: int = 0
         self.blocked_recommendations: int = 0
         self.analysis_count: int = 0
+        # Phase 4 screening metrics
+        self.screening_received: int = 0
+        self.screening_processed: int = 0
+        self.screening_timeouts: int = 0
+        self.bridge_errors: int = 0
+        self.last_screening: Optional[str] = None
         self.last_event: Optional[str] = None
         self.last_heartbeat: Optional[float] = None
         self.last_error: Optional[str] = None
@@ -74,6 +80,23 @@ class HealthMonitor:
     def inc_dropped(self) -> None:
         with self._lock:
             self.dropped += 1
+
+    def inc_screening(self) -> None:
+        with self._lock:
+            self.screening_received += 1
+            self.last_screening = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def inc_screening_processed(self) -> None:
+        with self._lock:
+            self.screening_processed += 1
+
+    def inc_screening_timeout(self) -> None:
+        with self._lock:
+            self.screening_timeouts += 1
+
+    def inc_bridge_error(self) -> None:
+        with self._lock:
+            self.bridge_errors += 1
 
     def set_heartbeat(self) -> None:
         with self._lock:
@@ -132,8 +155,13 @@ class HealthMonitor:
                 "received": self.received,
                 "dropped": self.dropped,
                 "analysis_count": self.analysis_count,
-                "high_risk_count": self.high_risk_count,
+                                "high_risk_count": self.high_risk_count,
                 "blocked_recommendations": self.blocked_recommendations,
+                "screening_received": self.screening_received,
+                "screening_processed": self.screening_processed,
+                "screening_timeouts": self.screening_timeouts,
+                "bridge_errors": self.bridge_errors,
+                "last_screening": self.last_screening,
                 "last_event": self.last_event,
                 "last_heartbeat": self.last_heartbeat,
                 "last_heartbeat_human": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.last_heartbeat)) if self.last_heartbeat else None,

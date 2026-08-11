@@ -58,7 +58,7 @@ from .utils import (
 
 _BANNER = "CALLSHIELD"
 _TAGLINE = "Fraud Protection Engine"
-_PHASE = "Phase 3 — Background Engine"
+_PHASE = "Phase 4 — Android Screening Bridge"
 _PHASE_COMPAT = "Phase 1 — Foundation"
 
 
@@ -206,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
             Phase 2 analyzes phone-number risk locally. It does NOT yet
             intercept or reject live phone calls.
             Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls.
+            Phase 4 receives and analyzes real Android call-screening events but does not automatically reject calls. Automatic rejection is intentionally disabled until Phase 5.
             """
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -332,6 +333,17 @@ def build_parser() -> argparse.ArgumentParser:
     s_evt_test.add_argument("number", help="Phone number for test event.")
     s_evt_test.add_argument("--reason", default=None, help="Optional reason payload.")
 
+    # Phase 4 screening bridge
+    s_screening = sub.add_parser("screening", help="Android screening bridge.")
+    s_screening_sub = s_screening.add_subparsers(dest="screening_cmd")
+    s_screening_sub.add_parser("status", help="Show screening bridge status.")
+    s_screening_sub.add_parser("enable", help="Enable screening.")
+    s_screening_sub.add_parser("disable", help="Disable screening.")
+    s_mode = s_screening_sub.add_parser("mode", help="Show or set screening mode (DRY_RUN).")
+    s_mode.add_argument("mode", nargs="?", choices=["dry_run", "dry-run", "DRY_RUN", "active", "ACTIVE"], help="Mode (DRY_RUN). Phase 4 only supports DRY_RUN.")
+    s_screening_sub.add_parser("health", help="Show screening health.")
+    s_screening_sub.add_parser("metrics", help="Show screening metrics.")
+
     return p
 
 
@@ -392,7 +404,7 @@ def _do_status_once(ui: _UI, cfg: Config) -> int:
             ipc_data = resp["data"]
 
     if ipc_data:
-        # Use IPC data for detailed status per Phase 3 spec
+        # Use IPC data for detailed status per Phase 3+4 spec
         print(f"Daemon          {color_for('RUNNING')}RUNNING{ui.reset}")
         print(f"PID             {ipc_data.get('pid') or pid}")
         uptime_h = ipc_data.get("uptime_human") or _format_uptime(int(ipc_data.get("uptime_seconds", 0)))
@@ -415,7 +427,38 @@ def _do_status_once(ui: _UI, cfg: Config) -> int:
             import time as _t
             print(f"Last Heartbeat  {_t.strftime('%Y-%m-%dT%H:%M:%SZ', _t.gmtime(ipc_data.get('last_heartbeat')))}")
         print()
-        print(f"Call Screening  {ui.dim}NOT CONNECTED{ui.reset}")
+        # Phase 4 bridge health
+        # Try to get bridge status via screening_status IPC
+        bridge_data = None
+        try:
+            br = _ipc_request(cfg, {"command": "screening_status"})
+            if br and br.get("status") == "ok":
+                bridge_data = br.get("data", {})
+        except Exception:
+            pass
+        if bridge_data:
+            print(f"Android Bridge     {bridge_data.get('bridge', 'CONNECTED')}")
+            print(f"Screening Mode     {bridge_data.get('mode', getattr(cfg, 'screening_mode', 'DRY_RUN'))}")
+            # Also show screening metrics if available
+            try:
+                print(f"Screening Events   {ipc_data.get('screening_processed', ipc_data.get('screening_received', 0))}")
+                print(f"Timeouts           {ipc_data.get('screening_timeouts', 0)}")
+                print(f"Bridge Errors      {ipc_data.get('bridge_errors', 0)}")
+            except Exception:
+                pass
+        else:
+            # Fallback: show from config and health
+            screening = "CONNECTED" if cfg.ipc_enabled and cfg.screening_enabled else "NOT CONNECTED"
+            print(f"Android Bridge     {screening}")
+            print(f"Screening Mode     {getattr(cfg, 'screening_mode', 'DRY_RUN')}")
+            # Try to get from health snapshot
+            try:
+                print(f"Screening Events   {ipc_data.get('screening_processed', 0)}")
+                print(f"Timeouts           {ipc_data.get('screening_timeouts', 0)}")
+                print(f"Bridge Errors      {ipc_data.get('bridge_errors', 0)}")
+            except Exception:
+                pass
+        print(f"Call Screening  {ui.dim}NOT CONNECTED{ui.reset}  {ui.dim}(Phase 4 dry-run — no auto-reject){ui.reset}")
         print(f"Profile         {cfg.protection_mode}")
     else:
         # Fallback to legacy status (PID file)
@@ -1028,6 +1071,11 @@ def _cmd_start(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
         + "Phase 3 provides the background processing infrastructure. It does not yet receive or reject real Android phone calls."
         + ui.reset
     )
+    print(
+        ui.dim
+        + "Phase 4 receives and analyzes real Android call-screening events but does not automatically reject calls. Automatic rejection is intentionally disabled until Phase 5."
+        + ui.reset
+    )
     print(ui.dim + "Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls." + ui.reset)
     return EXIT_OK
 
@@ -1083,6 +1131,15 @@ def _cmd_metrics(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
         print(f"High Risk           {d.get('high_risk_count', 0)}")
         print(f"Block Recommendations {d.get('blocked_recommendations', 0)}")
         print()
+        # Phase 4 screening metrics extended
+        print(f"Incoming Calls       {d.get('screening_total', d.get('screening_received', 0))}")
+        print(f"Screened             {d.get('screening_total', d.get('screening_processed', 0))}")
+        print(f"Timeouts             {d.get('screening_timeouts', d.get('timeouts', 0))}")
+        print(f"Bridge Errors        {d.get('bridge_errors', 0)}")
+        print(f"High Risk            {d.get('high_risk_count', 0)}")
+        print(f"Block Recommendations {d.get('blocked_recommendations', 0)}")
+        print(f"Actually Rejected    0  {ui.dim}(Phase 4 dry-run){ui.reset}")
+        print()
         print(f"Queue Peak          {d.get('queue_peak', 0)} / {d.get('queue_max', cfg.event_queue_size)}")
         print(f"Queue Size          {d.get('queue_size', 0)} / {d.get('queue_max', cfg.event_queue_size)}")
         if d.get("memory_kb"):
@@ -1094,13 +1151,24 @@ def _cmd_metrics(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     db = open_database(cfg)
     try:
         total = len(db.recent_events(limit=10000))
-        # Estimate from DB
+        try:
+            sm = db.screening_metrics()
+        except Exception:
+            sm = {"total": 0, "high_risk": 0, "block_recommended": 0, "actually_rejected": 0, "timeouts": 0}
         print(f"Uptime              {ui.dim}daemon not running{ui.reset}")
         print()
         print(f"Events Received     {total}")
         print(f"Processed           {total}")
         print(f"Failed              0")
         print(f"Dropped             0")
+        print()
+        print(f"Incoming Calls       {sm['total']}")
+        print(f"Screened             {sm['total']}")
+        print(f"Timeouts             {sm['timeouts']}")
+        print(f"Bridge Errors        0")
+        print(f"High Risk            {sm['high_risk']}")
+        print(f"Block Recommendations {sm['block_recommended']}")
+        print(f"Actually Rejected    0  {ui.dim}(Phase 4 dry-run){ui.reset}")
         print()
         print(f"Queue Peak          0 / {cfg.event_queue_size}")
         print(f"Queue Size          0 / {cfg.event_queue_size}")
@@ -1231,6 +1299,131 @@ def _cmd_event(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
     return EXIT_USAGE
 
 
+def _cmd_screening(ui, args, cfg):
+    cmd = getattr(args, "screening_cmd", None)
+    if cmd in (None, "status"):
+        return _cmd_screening_status(ui, args, cfg)
+    if cmd == "enable":
+        cfg.screening_enabled = True
+        save_config(cfg)
+        _header(ui, "SCREENING")
+        print(f"Screening       {ui.green}ENABLED{ui.reset}")
+        print(f"Mode            {cfg.screening_mode}")
+        return EXIT_OK
+    if cmd == "disable":
+        cfg.screening_enabled = False
+        save_config(cfg)
+        _header(ui, "SCREENING")
+        print(f"Screening       {ui.yellow}DISABLED{ui.reset}")
+        return EXIT_OK
+    if cmd == "mode":
+        mode_arg = getattr(args, "mode", None)
+        if mode_arg is None:
+            _header(ui, "SCREENING MODE")
+            print(f"Mode            {cfg.screening_mode}")
+            print(f"Timeout         {cfg.screening_timeout_ms}ms")
+            print(f"Auto Reject     DISABLED (Phase 4 dry-run)")
+            return EXIT_OK
+        m = mode_arg.upper().replace("-", "_")
+        if m not in ("DRY_RUN", "ACTIVE"):
+            _print_error(ui, "Invalid mode. Use DRY_RUN (Phase 4 only supports DRY_RUN).")
+            return EXIT_USAGE
+        if m == "ACTIVE":
+            _print_error(ui, "Phase 4 only supports DRY_RUN. Automatic rejection is disabled until Phase 5.")
+            return EXIT_USAGE
+        cfg.screening_mode = m
+        save_config(cfg)
+        _header(ui, "SCREENING MODE")
+        print(f"Mode set to    {m}")
+        return EXIT_OK
+    if cmd == "health":
+        return _cmd_screening_health(ui, args, cfg)
+    if cmd == "metrics":
+        return _cmd_screening_metrics(ui, args, cfg)
+    _print_error(ui, "Unknown screening subcommand")
+    return EXIT_USAGE
+
+def _cmd_screening_status(ui, args, cfg):
+    _header(ui, "CALLSHIELD SCREENING")
+    state, pid = daemon_status(cfg)
+    ipc_resp = _ipc_request(cfg, {"command": "screening_status"}) if state == "RUNNING" else None
+    if ipc_resp and ipc_resp.get("status") == "ok" and isinstance(ipc_resp.get("data"), dict):
+        d = ipc_resp["data"]
+        print(f"Bridge             {d.get('bridge')}")
+        print(f"Android Service    {d.get('android_service')}")
+        print(f"Daemon             {d.get('daemon')}")
+        print(f"Mode               {d.get('mode')}")
+        print(f"Timeout            {d.get('timeout_ms')}ms")
+        print(f"Live Calls         {d.get('live_calls')}")
+        print(f"Auto Reject        {d.get('auto_reject')}")
+    else:
+        bridge = "CONNECTED" if state == "RUNNING" and cfg.ipc_enabled else "NOT CONNECTED"
+        if state == "RUNNING" and not cfg.ipc_enabled:
+            bridge = "NOT CONNECTED (IPC disabled)"
+        print(f"Bridge             {bridge}")
+        android = "AVAILABLE" if state == "RUNNING" and cfg.screening_enabled else "NOT CONNECTED"
+        if state == "RUNNING" and cfg.screening_enabled and cfg.ipc_enabled:
+            android = "AVAILABLE"
+        else:
+            android = "NOT CONNECTED"
+        print(f"Android Service    {android}")
+        print(f"Daemon             {state}")
+        print(f"Mode               {getattr(cfg, 'screening_mode', 'DRY_RUN')}")
+        print(f"Timeout            {getattr(cfg, 'screening_timeout_ms', 1500)}ms")
+        live = "READY" if state == "RUNNING" and getattr(cfg, 'screening_enabled', True) else "NOT READY"
+        print(f"Live Calls         {live}")
+        print(f"Auto Reject        DISABLED")
+    print()
+    print(f"Call Screening  {ui.dim}NOT CONNECTED (Phase 4 dry-run){ui.reset}" if state != "RUNNING" else f"Call Screening  {ui.green}READY (dry-run){ui.reset}")
+    return EXIT_OK
+
+def _cmd_screening_health(ui, args, cfg):
+    _header(ui, "SCREENING HEALTH")
+    state, pid = daemon_status(cfg)
+    if state != "RUNNING":
+        print(f"Daemon             {state}")
+        print(f"Bridge             NOT CONNECTED")
+        print(f"Screening Events   0")
+        return EXIT_OK
+    resp = _ipc_request(cfg, {"command": "metrics"})
+    if resp and resp.get("status") == "ok":
+        d = resp.get("data", {})
+        print(f"Bridge             CONNECTED")
+        print(f"Mode               {d.get('screening_mode', getattr(cfg, 'screening_mode', 'DRY_RUN'))}")
+        print(f"Screening Events   {d.get('screening_processed', d.get('screening_received', 0))}")
+        print(f"Timeouts           {d.get('screening_timeouts', 0)}")
+        print(f"Bridge Errors      {d.get('bridge_errors', 0)}")
+        print(f"High Risk          {d.get('high_risk_count', 0)}")
+        print(f"Block Recommended  {d.get('blocked_recommendations', 0)}")
+        print(f"Actually Rejected  0  {ui.dim}(Phase 4 dry-run){ui.reset}")
+    else:
+        print("Bridge             NOT CONNECTED (IPC failed)")
+    return EXIT_OK
+
+def _cmd_screening_metrics(ui, args, cfg):
+    _header(ui, "SCREENING METRICS")
+    state, pid = daemon_status(cfg)
+    try:
+        db = open_database(cfg)
+        m = db.screening_metrics()
+        db.close()
+    except Exception:
+        m = {"total": 0, "high_risk": 0, "block_recommended": 0, "actually_rejected": 0, "timeouts": 0}
+    ipc_resp = _ipc_request(cfg, {"command": "metrics"}) if state == "RUNNING" else None
+    if ipc_resp and ipc_resp.get("status") == "ok":
+        d = ipc_resp["data"]
+        m["total"] = d.get("screening_processed", m["total"])
+        m["timeouts"] = d.get("screening_timeouts", m["timeouts"])
+    print(f"Incoming Calls       {m['total']}")
+    print(f"Screened             {m['total']}")
+    print(f"Timeouts             {m['timeouts']}")
+    print(f"Bridge Errors        {m.get('bridge_errors', 0) if 'bridge_errors' in m else 0}")
+    print(f"High Risk            {m['high_risk']}")
+    print(f"Block Recommendations {m['block_recommended']}")
+    print(f"Actually Rejected    0  {ui.dim}(Phase 4 dry-run, always 0){ui.reset}")
+    return EXIT_OK
+
+
 _COMMANDS = {
     "version": _cmd_version,
     "status": _cmd_status,
@@ -1252,6 +1445,7 @@ _COMMANDS = {
     "metrics": _cmd_metrics,
     "daemon": _cmd_daemon,
     "event": _cmd_event,
+    "screening": _cmd_screening,
     "_run-fg": _cmd_run_fg,
 }
 

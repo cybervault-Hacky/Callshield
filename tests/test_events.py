@@ -19,7 +19,7 @@ class TestEventModel(unittest.TestCase):
 
     def test_invalid_type(self):
         with self.assertRaises(ValueError):
-            create_event("INCOMING_CALL", number="+919876543210")
+            create_event("FAKE_EVENT", number="+919876543210")
 
     def test_from_dict(self):
         data = {

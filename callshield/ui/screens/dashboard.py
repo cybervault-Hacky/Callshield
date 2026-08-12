@@ -25,6 +25,7 @@ QUICK_ACTIONS: Tuple[Tuple[str, str], ...] = (
     ("policy", "menu.policy"),
     ("reputation", "menu.reputation"),
     ("intelligence", "menu.intelligence"),
+    ("number_intel", "menu.number_intel"),
     ("blocks", "menu.blocks"),
     ("reports", "menu.reports"),
     ("history", "menu.history"),

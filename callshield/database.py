@@ -203,6 +203,16 @@ CREATE INDEX IF NOT EXISTS idx_intelligence_observation_type
 CREATE INDEX IF NOT EXISTS idx_intelligence_profile_updated
     ON intelligence_profiles(updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS local_contacts (
+    number_hash    TEXT PRIMARY KEY,
+    number_masked  TEXT NOT NULL,
+    display_name   TEXT NOT NULL,
+    imported_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_contacts_imported
+    ON local_contacts(imported_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_reputation_updated
     ON reputation_profiles(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reputation_risk
@@ -643,6 +653,7 @@ class Database:
             "trusted_numbers",
             "intelligence_observations",
             "intelligence_profiles",
+            "local_contacts",
         }
         tables = {
             str(row[0])
@@ -784,9 +795,23 @@ class Database:
             "idx_intelligence_observation_event",
             "idx_intelligence_observation_type",
             "idx_intelligence_profile_updated",
+            "idx_local_contacts_imported",
         }
         if reputation_indexes - all_indexes:
             raise DatabaseError("Database reputation/intelligence indexes are incomplete")
+        contact_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(local_contacts)"
+            ).fetchall()
+        }
+        if {
+            "number_hash",
+            "number_masked",
+            "display_name",
+            "imported_at",
+        } - contact_columns:
+            raise DatabaseError("Database local contact schema is incomplete")
         foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()
         if not foreign_keys or int(foreign_keys[0]) != 1:
             raise DatabaseError("SQLite foreign_keys is not enabled")

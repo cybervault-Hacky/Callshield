@@ -636,6 +636,63 @@ class Backend:
         return self._run_cli(["untrust", str(number)])
 
     # ----------------------------------------------------------- diagnostics
+    def number_profile(self, number: str) -> Result:
+        """Universal local profile. Delegates to UniversalNumberEngine."""
+
+        from ...universal import UniversalNumberEngine
+
+        try:
+            with self._database() as database:
+                profile = UniversalNumberEngine(database, self.cfg).profile(
+                    str(number), persist=False
+                )
+                return Result(profile.to_public_dict(), source="engine")
+        except Exception as exc:  # noqa: BLE001
+            return Result(error=_error_text(exc), source="engine")
+
+    def contact_status(self) -> Result:
+        from ...universal import ContactStore
+
+        def query(database: Any) -> Any:
+            store = ContactStore(database, self.cfg)
+            return {"count": store.count()}
+
+        return self._query(query)
+
+    def contact_list(self, limit: int = 200) -> Result:
+        from ...universal import ContactStore
+
+        bounded = _bounded(limit, MAX_PROFILES, 200)
+
+        def query(database: Any) -> Any:
+            return [
+                row.to_public_dict()
+                for row in ContactStore(database, self.cfg).list_contacts(limit=bounded)
+            ]
+
+        return self._query(query)
+
+    def contact_scan(self) -> Result:
+        from ...universal import UniversalNumberEngine
+
+        try:
+            with self._database() as database:
+                return Result(
+                    UniversalNumberEngine(database, self.cfg).scan_contacts(),
+                    source="engine",
+                )
+        except Exception as exc:  # noqa: BLE001
+            return Result(error=_error_text(exc), source="engine")
+
+    def import_contacts(self, path: str) -> Result:
+        return self._run_cli(["contacts", "import", str(path)])
+
+    def remove_contact(self, number: str) -> Result:
+        return self._run_cli(["contacts", "remove", str(number)])
+
+    def clear_contacts(self) -> Result:
+        return self._run_cli(["contacts", "clear"])
+
     def doctor(self) -> Result:
         """Read-only diagnostics. The interface never requests repairs."""
 

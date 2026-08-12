@@ -1,7 +1,7 @@
 # CALLSHIELD Phase 6 Security Audit
 
 Date: 2026-08-11
-Scope: repository implementation through version 0.8.0
+Scope: repository implementation through version 0.8.0 (including the Phase 8.5 terminal interface)
 
 ## Results
 
@@ -30,6 +30,13 @@ Scope: repository implementation through version 0.8.0
 | Phase 8 adaptive privacy | PASS | Adaptive package has no network imports and derived tables use hashes/masks without unsupported telemetry fields |
 | Adaptive policy safety | PASS | Intelligence unavailable applies ALLOW; trend/pattern context cannot raise detector risk or bypass existing gates |
 | Intelligence retention | PASS | Derived observations/profiles have count/age bounds and cleanup does not delete core Phase 1–7 evidence |
+| Phase 8.5 interface network isolation | PASS | AST scan of all 39 `callshield/ui/` modules found no networking import, no hardcoded URL/host, and no non-stdlib dependency; the only transport remains the pre-existing local `AF_UNIX` IPC |
+| Interface execution safety | PASS | No `eval`, `exec`, `compile`, `os.system`, `subprocess`, `shell=True`, `pickle` or `AF_INET` in the interface; CLI actions dispatch through the `cli._COMMANDS` function table with no shell |
+| Interface privilege boundary | PASS | The interface writes no security configuration; `save_config`, `set_value`, `set_profile`, `enable_emergency_off` and `reset_emergency_off` appear nowhere in `callshield/ui/` |
+| ACTIVE confirmation preservation | PASS | The interface hands the real terminal to the existing CLI handler for ACTIVE mode; `screening enable` from the interface stays DRY_RUN with `active_mode_confirmed=false` |
+| Policy simulation isolation | PASS | Simulated decisions are wrapped in a read-only view flagged `simulation=True`; configuration bytes are asserted unchanged after simulation |
+| Interface preference isolation | PASS | Reset rewrites only `ui_state.json`; config contents, database size, list entries and report counts are asserted unchanged |
+| Interface number masking | PASS | Every rendered screen is asserted to contain no plaintext number; display uses `mask_number` throughout |
 
 ## Not tested
 
@@ -39,6 +46,7 @@ Scope: repository implementation through version 0.8.0
 | Physical Android device | NOT TESTED | No emulator/device or granted screening role available |
 | Android/Termux SELinux integration | NOT TESTED | No physical cross-UID deployment environment available |
 | External penetration test | NOT TESTED | No independent security lab or adversarial device test was performed |
+| Terminal interface on a Termux device | NOT TESTED | Verified under a Linux pseudo-terminal only; no physical Android device running Termux was available |
 
 ## Phase boundary
 

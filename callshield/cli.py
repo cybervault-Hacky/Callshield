@@ -2332,6 +2332,44 @@ def _print_banner_status(ui: _UI, cfg: Config) -> None:
     print(ui.dim + "Phase 1 is a local fraud-number analysis and protection foundation. It does not directly intercept or reject live phone calls." + ui.reset)
 
 
+def _ui_disabled() -> bool:
+    """Allow scripts and CI to opt out of the interactive interface."""
+
+    value = (os.environ.get("CALLSHIELD_NO_UI") or "").strip().lower()
+    return value not in ("", "0", "false", "no")
+
+
+def _launch_ui(ui: _UI, cfg: Config) -> int:
+    """Start the terminal interface for a bare `callshield` invocation.
+
+    Falls back to the classic banner when the interface is disabled, when the
+    terminal is not interactive, or if the interface fails to import or start.
+    The command line always stays usable.
+    """
+
+    if _ui_disabled() or not sys.stdin.isatty() or not sys.stdout.isatty():
+        _print_banner_status(ui, cfg)
+        return EXIT_OK
+
+    try:
+        from .ui import run as run_ui
+    except Exception as exc:  # noqa: BLE001 - never block the CLI on the UI
+        log_error(cfg, f"interface unavailable: {exc!r}")
+        _print_banner_status(ui, cfg)
+        return EXIT_OK
+
+    try:
+        return int(run_ui(cfg))
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return EXIT_OK
+    except Exception as exc:  # noqa: BLE001
+        log_error(cfg, f"interface error: {exc!r}")
+        _print_error(ui, f"Interface error: {exc}")
+        _print_banner_status(ui, cfg)
+        return EXIT_OK
+
+
 # --------------------------------------------------------------------- entry
 
 
@@ -2352,8 +2390,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _cmd_version(ui, args, cfg)
 
     if args.command is None:
-        _print_banner_status(ui, cfg)
-        return EXIT_OK
+        return _launch_ui(ui, cfg)
 
     handler = _COMMANDS.get(args.command)
     if handler is None:

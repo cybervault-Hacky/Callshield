@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.8.0 — Phase 8.5: Professional Terminal Interface
+
+### Added
+- Interactive terminal interface launched by a bare `callshield`, implemented in a new `callshield/ui/` package (`app.py`, `screens/`, `components/`, `navigation/`, `theme/`, `i18n/`, `state/`, `formatters/`) using only the Python standard library and no new dependency.
+- Staged start-up sequence with nine named phases (initialize, security engine, intelligence modules, daemon connect, database check, policy, reputation, adaptive intelligence, prepare interface), a progress indicator and no artificial delay; the daemon is reported `OFFLINE` with a "Start daemon" action when it is not running.
+- Dashboard with SYSTEM, THREAT OVERVIEW, INTELLIGENCE and QUICK ACTIONS sections, all values read from the real backend.
+- Fourteen screens: Dashboard, Scan Center (Basic, Advanced, History, Compare), Live Monitor, Daemon Control, Screening Center, Policy Center, Reputation Center, Intelligence Center, Block Center, Report Center, History, Diagnostics, Settings and About.
+- Advanced Scan with IDENTITY NORMALIZATION, REPUTATION, RISK SIGNALS, CONFIDENCE, BEHAVIOR, TREND, TRUST, POLICY, SCREENING and HISTORY sections rendered from the existing detection, reputation, adaptive and policy engines.
+- Keyboard navigation: arrows, Enter, Esc, number shortcuts, PgUp/PgDn, `r` refresh, `h` dashboard, `q` and Ctrl+C quit. Esc at the root exits rather than trapping the user.
+- Nine languages through translation dictionaries: English (default), Hindi, Hinglish (Roman Hindi), Spanish, French, Japanese, Chinese, Portuguese, Russian, with English fallback for missing keys. Technical command names are never translated.
+- Interface preferences (`ui_state.json`): Language, Appearance (Dark default/Light/System), Animation, Refresh Rate (1s/2s/5s/10s/Manual), Default Scan Mode, Notifications, Data and Reset.
+- Non-interactive fallback: the classic banner is printed when stdin/stdout is not a terminal, when `CALLSHIELD_NO_UI` is set, or if the interface fails to import or start.
+- `CALLSHIELD_UI_ASCII` and `CALLSHIELD_UI_STATE` environment overrides for ASCII-only rendering and a relocated preferences file.
+
+### Safety and privacy
+- The interface is presentation only. All data and every mutation are delegated to the existing CLI handlers, engines and databases through a single `callshield/ui/state/backend.py` adapter.
+- ACTIVE protection still requires the existing CLI confirmation prompt; the interface hands over the real terminal rather than reimplementing or bypassing it.
+- `screening enable` from the interface remains DRY_RUN with `active_mode_confirmed = false`; ACTIVE cannot be reached without the prompt.
+- Policy testing is simulation only and is wrapped so a simulated decision cannot be mistaken for an applied one; the configuration is never written.
+- Emergency-off remains immediately reachable, and destructive actions confirm with an explicit `[y/N]` default of no.
+- Reset only rewrites the interface preferences file: databases, reports, daemon state, trust records, lists, and screening/security configuration are untouched.
+- Phone numbers are masked in every rendered screen; no call duration, caller identity, location, audio analysis, contact data, answered state, carrier or external reputation is displayed or inferred.
+- `Android: NOT VERIFIED` is shown wherever screening state appears. No second daemon, no duplicated intelligence calculation, and no policy bypass.
+- Zero network communication: the interface imports no networking module and opens no socket. The only transport remains the daemon's existing local `AF_UNIX` IPC through `cli._ipc_request`. No `eval`, `exec`, `shell=True`, `os.system`, `subprocess` or `pickle`.
+
+### Presentation
+- No emojis, no ASCII art, no fake hacking effects. Status is never conveyed by colour alone: `READY`, `ONLINE`, `OFFLINE`, `ERROR`, `WARNING`, `NOT VERIFIED`, `DRY RUN`, `ACTIVE` and `DISABLED` are always spelled out.
+- Graceful degradation across colour/no-colour, Unicode/ASCII, and 40–200 column terminals, with a legible message and a working quit key below the minimum width.
+
+### Verification
+- Python suite: 554 passed (396 pre-existing plus 158 new interface tests). No existing test was modified or removed.
+- Verified under a pseudo-terminal at 46/80/90/92/160/200 columns, with `NO_COLOR`, with `CALLSHIELD_UI_ASCII`, and against both a running and a stopped daemon.
+- Android build/device remain NOT VERIFIED. A run on a physical Android device inside Termux was not performed.
+- Phase 9 has not started.
+
 ## 0.8.0 — Phase 8: Adaptive Threat Intelligence & Behavior Engine
 
 ### Added

@@ -6,7 +6,9 @@ CALLSHIELD keeps analysis, trust, history, and persistence on-device. Phase 8
 adds bounded behavioral timelines, adaptive trends, measured patterns, and
 explainable intelligence snapshots without cloud lookups, surveillance,
 telemetry, accounts, advertising, or network reputation services. All Phase 1–7
-safety and call-protection behavior remains.
+safety and call-protection behavior remains. Phase 8.5 adds an interactive
+terminal interface on top of the same engine; every existing command keeps
+working exactly as before.
 
 ## Phase status
 
@@ -18,6 +20,7 @@ safety and call-protection behavior remains.
 - Phase 6 — Hardening & Reliability: **COMPLETE**
 - Phase 7 — Reputation & Explainable Intelligence: **COMPLETE**
 - Phase 8 — Adaptive Threat Intelligence & Behavior Engine: **COMPLETE**
+- Phase 8.5 — Professional Terminal Interface: **COMPLETE**
 - Phase 9 — **NOT STARTED**
 
 ## Safety invariants
@@ -370,9 +373,102 @@ recommendation, applied action, reason, and confirmation status. When captured
 at decision time it also shows reputation score, confidence, trend, and measured
 reasons. Plaintext numbers are not selected or displayed.
 
+## Terminal interface (Phase 8.5)
+
+Running `callshield` with no arguments starts an interactive, keyboard-driven
+console. Every subcommand continues to work unchanged, and the interface is a
+presentation layer only: it reads through the existing CLI handlers, engines and
+databases and implements no detection, scoring, policy or persistence logic of
+its own.
+
+```bash
+callshield              # interactive interface
+callshield scan +919876543210   # unchanged, non-interactive
+```
+
+The banner is printed instead of the interface when stdin/stdout is not a
+terminal, when `CALLSHIELD_NO_UI=1` is set, or if the interface cannot start.
+A pipe, a script or CI therefore behaves exactly as it did before.
+
+### Screens
+
+```text
+Dashboard        SYSTEM / THREAT OVERVIEW / INTELLIGENCE / QUICK ACTIONS
+Scan Center      Basic Scan, Advanced Scan, Scan History, Compare Results
+Live Monitor     real event and screening stream, non-blocking
+Daemon Control   Status, Start, Stop, Restart, Health, Metrics
+Screening Center Status, Health, Metrics, Mode, Enable, Disable
+Policy Center    Current, Test (simulation), RELAXED/BALANCED/STRICT, Emergency
+Reputation       Look Up, Recent Profiles, History, Trust
+Intelligence     Search, Behavior, Timeline, Trends, Patterns, Snapshots, Retention
+Block Center     Blacklist, Whitelist, add/remove, Recent Decisions, Inspect
+Report Center    Report a Number, Recent Reports, per-number reports
+History          Events, Screening, per-number, bounded with PgUp/PgDn
+Diagnostics      read-only `callshield doctor` output
+Settings         Language, Appearance, Animation, Refresh, Scan Mode, Data, Reset
+About            product, author, platform, licence, architecture
+```
+
+Advanced Scan renders ten sections: IDENTITY NORMALIZATION, REPUTATION, RISK
+SIGNALS, CONFIDENCE, BEHAVIOR, TREND, TRUST, POLICY, SCREENING and HISTORY.
+
+### Keyboard
+
+```text
+Up / Down     move            Enter    select
+1-9           jump to entry   Esc      back (exits at the root)
+PgUp / PgDn   page            r        refresh
+h             dashboard       q        quit
+Ctrl+C        quit
+```
+
+### Languages
+
+English (default), Hindi, Hinglish (Roman Hindi), Spanish, French, Japanese,
+Chinese, Portuguese and Russian, selectable in Settings. Strings live in
+translation dictionaries under `callshield/ui/i18n/`. Technical command names
+(`callshield`, `scan`, `daemon`, `policy`, …) are never translated.
+
+### Interface preferences
+
+Preferences are stored in `ui_state.json` beside the database, entirely separate
+from the security configuration:
+
+```text
+Language, Appearance (Dark/Light/System), Animation, Refresh Rate
+(1s/2s/5s/10s/Manual), Default Scan Mode, Notifications
+```
+
+`Reset UI Settings` prompts `Reset UI settings? [y/N]` and rewrites that single
+JSON file. It never touches databases, reports, daemon state, trust records,
+blacklist/whitelist or the screening and security configuration.
+
+### Interface safety
+
+The interface cannot widen protection behaviour:
+
+- ACTIVE mode is still requested through the CLI handler, which owns the
+  explicit confirmation prompt; the interface never reimplements it.
+- Policy testing is simulation only and writes nothing.
+- Emergency-off stays one keystroke away on the Policy Center.
+- Destructive actions confirm with an explicit `[y/N]` default of no.
+- Phone numbers are masked everywhere (`+919*****0058`).
+- `Android: NOT VERIFIED` is shown wherever screening is displayed.
+- No new network communication, no shell execution, no `eval`/`exec`, and no
+  second daemon.
+
+### Graceful degradation
+
+Colour, Unicode, width, height and interactivity are probed at start-up. The
+interface renders without colour, without box-drawing characters (`LANG=C` or
+`CALLSHIELD_UI_ASCII=1`), from 40 to 200 columns, and never relies on colour
+alone: status is always spelled out (`READY`, `OFFLINE`, `ERROR`,
+`NOT VERIFIED`, `DRY RUN`, `ACTIVE`, `DISABLED`).
+
 ## Main CLI
 
 ```bash
+callshield                      # interactive interface
 callshield version
 callshield status
 callshield metrics
@@ -436,14 +532,21 @@ is added. Physical integration remains deployment-specific and unverified.
 ## Tests
 
 ```bash
-pytest -q
-# 396 passed
+python -m unittest discover -s tests -t . -q
+# 554 passed
 ```
 
-All 332 Phase 1–7 tests remain. Sixty-four Phase 8 tests cover behavioral
+All 396 Phase 1–8 tests remain. Sixty-four Phase 8 tests cover behavioral
 timeline, all adaptive trends, volatility, risk/confidence deltas, measured
 patterns, snapshots, explanations, CLI/JSON, doctor, retention, schema migration,
 5/10-way concurrency, privacy, fail-open behavior, and policy safety.
+
+158 Phase 8.5 tests cover the start-up sequence, navigation and shortcuts,
+settings persistence and reset scope, all nine languages and translation
+fallback, screen content against the real backend, the About page, daemon and
+database outages, live events, resize, narrow terminals, the non-interactive
+fallback, corrupted UI state, invalid input, Ctrl+C, Esc, and static audits
+proving the interface opens no socket and uses no dangerous execution API.
 
 See `SECURITY_AUDIT.md` for Phase 6–8 PASS versus NOT TESTED results.
 
@@ -513,6 +616,15 @@ END-TO-END ANDROID PERFORMANCE = NOT VERIFIED
 
 No APK, physical rejection, cross-UID socket success, or Android benchmark is
 claimed.
+
+The terminal interface was verified on Linux under a pseudo-terminal at 46, 80,
+90, 92, 160 and 200 columns, with and without colour, and with and without
+Unicode. It targets Termux and uses only the Python standard library, but no
+run on a physical Android device inside Termux was performed:
+
+```text
+TERMUX DEVICE RUN = NOT VERIFIED
+```
 
 ## Phase boundary
 

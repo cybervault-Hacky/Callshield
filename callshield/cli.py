@@ -499,6 +499,22 @@ def build_parser() -> argparse.ArgumentParser:
     s_blocks_inspect = s_blocks_sub.add_parser("inspect", help="Inspect one block by ID.")
     s_blocks_inspect.add_argument("id", type=int)
 
+    s_number = sub.add_parser("number", help="Universal local number intelligence.")
+    s_number.add_argument("number", help="Phone number to analyze.")
+    s_number.add_argument("--json", action="store_true", help="Emit JSON output.")
+
+    s_contacts = sub.add_parser("contacts", help="Explicit local contact import.")
+    s_contacts_sub = s_contacts.add_subparsers(dest="contacts_cmd")
+    s_contacts_sub.add_parser("status", help="Show imported contact counts.")
+    s_contacts_sub.add_parser("list", help="List imported contacts (masked).")
+    s_c_import = s_contacts_sub.add_parser("import", help="Import a local CSV or JSON file.")
+    s_c_import.add_argument("file", help="Path to CSV or JSON file.")
+    s_c_remove = s_contacts_sub.add_parser("remove", help="Remove one imported contact.")
+    s_c_remove.add_argument("number", help="Number to remove from local contacts.")
+    s_contacts_sub.add_parser("clear", help="Remove all imported contacts.")
+    s_c_scan = s_contacts_sub.add_parser("scan", help="Scan imported contacts locally.")
+    s_c_scan.add_argument("--json", action="store_true")
+
     return p
 
 
@@ -2255,6 +2271,186 @@ def _cmd_blocks(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
                 pass
 
 
+def _field_text(field: Any) -> str:
+    if field is None:
+        return "NOT AVAILABLE"
+    if isinstance(field, dict):
+        value = field.get("value")
+        availability = field.get("availability")
+        if value in (None, ""):
+            return str(availability or "NOT AVAILABLE")
+        if isinstance(value, list):
+            return ", ".join(str(item) for item in value) if value else str(availability)
+        return str(value)
+    value = getattr(field, "value", field)
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "NOT AVAILABLE"
+    if value in (None, ""):
+        return str(getattr(field, "availability", "NOT AVAILABLE"))
+    return str(value)
+
+
+def _cmd_number(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    from .universal import UniversalNumberEngine
+
+    as_json = bool(getattr(args, "json", False))
+    try:
+        normalize(args.number, default_country=cfg.default_country)
+    except InvalidNumberError as exc:
+        _print_error(
+            ui if not as_json else None,
+            f"{exc.message}\nUse: callshield number <number>",
+        )
+        return EXIT_INVALID_NUMBER
+    database = None
+    try:
+        database = open_database(cfg)
+        profile = UniversalNumberEngine(database, cfg).profile(args.number)
+    except Exception as exc:
+        _print_error(ui, f"Number intelligence unavailable: {exc}")
+        return EXIT_DATABASE
+    finally:
+        if database is not None:
+            database.close()
+
+    public = profile.to_public_dict()
+    if as_json:
+        _print_json(public)
+        return EXIT_OK
+
+    _header(ui, "NUMBER INTELLIGENCE")
+    print(f"NUMBER")
+    print(f"  {_field_text(public['masked_number'])}")
+    print()
+    print("IDENTITY")
+    print(f"  Contact        {_field_text(public['local_contact_status'])}")
+    print(f"  Name           {_field_text(public['contact_name'])}")
+    print(f"  Age            {_field_text(public['age'])}")
+    print(f"  Identity       {_field_text(public['owner_identity'])}")
+    if public["contact_source"]["availability"] == "AVAILABLE":
+        print(f"  Source         {_field_text(public['contact_source'])}")
+    print()
+    print("THREAT")
+    print(f"  Risk           {_field_text(public['reputation_score'])}/100")
+    print(f"  Confidence     {_field_text(public['reputation_confidence'])}%")
+    print(f"  Level          {_field_text(public['risk_level'])}")
+    print(f"  Verdict        {_field_text(public['verdict'])}")
+    print(f"  Action         {_field_text(public['recommendation'])}")
+    print()
+    print("REPUTATION")
+    print(f"  Reports        {_field_text(public['reports'])}")
+    print(f"  Calls Seen     {_field_text(public['calls_observed'])}")
+    print(f"  Trend          {_field_text(public['behavioral_trend'])}")
+    print(f"  Trusted        {_field_text(public['trust_state'])}")
+    print()
+    print("EVIDENCE")
+    evidence = public["measured_evidence"]["value"]
+    if public["measured_evidence"]["availability"] == "AVAILABLE" and evidence:
+        for item in evidence:
+            print(f"  • {item}")
+    else:
+        print("  • NOT AVAILABLE")
+    print()
+    print("PRIVACY")
+    print(f"  Data Source    LOCAL ONLY")
+    print(f"  Network        NONE")
+    print(f"  Identity       {_field_text(public['owner_identity'])}")
+    print(f"  Country        {_field_text(public['country'])}")
+    print(f"  Region         {_field_text(public['region'])}")
+    return EXIT_OK
+
+
+def _cmd_contacts(ui: _UI, args: argparse.Namespace, cfg: Config) -> int:
+    from pathlib import Path as _Path
+
+    from .universal import ContactImportError, ContactStore, UniversalNumberEngine, parse_contact_file
+
+    command = getattr(args, "contacts_cmd", None)
+    database = None
+    try:
+        database = open_database(cfg)
+        store = ContactStore(database, cfg)
+        if command in (None, "status"):
+            _header(ui, "LOCAL CONTACTS")
+            print(f"Imported:        {store.count()}")
+            print("Source:          explicit user import only")
+            print("Android access:  NONE")
+            print("Network:         NONE")
+            return EXIT_OK
+        if command == "list":
+            rows = store.list_contacts(limit=200)
+            _header(ui, "LOCAL CONTACTS")
+            if not rows:
+                print("(no imported contacts)")
+                return EXIT_OK
+            print(f"{'NUMBER':<20} NAME")
+            for row in rows:
+                print(f"{row.number_masked:<20} {row.display_name}")
+            print()
+            print("Source: Local Contacts")
+            return EXIT_OK
+        if command == "import":
+            path = _Path(args.file)
+            try:
+                pairs = parse_contact_file(path)
+                summary = store.import_pairs(pairs, cfg.default_country)
+            except ContactImportError as exc:
+                _print_error(ui, str(exc))
+                return EXIT_USAGE
+            _header(ui, "CONTACT IMPORT")
+            print(f"File:            {path.name}")
+            print(f"Accepted:        {summary['accepted']}")
+            print(f"Inserted:        {summary['inserted']}")
+            print(f"Updated:         {summary['updated']}")
+            print(f"Invalid:         {summary['invalid']}")
+            print(f"Skipped:         {summary['skipped']}")
+            print("Source:          Local Contacts (user import)")
+            return EXIT_OK
+        if command == "remove":
+            n = _normalize_or_error(
+                ui, args.number, cfg, usage_hint="callshield contacts remove <number>"
+            )
+            if n is None:
+                return EXIT_INVALID_NUMBER
+            removed = store.remove(n.normalized)
+            _header(ui, "LOCAL CONTACTS")
+            print(f"Number:          {mask_number(n.normalized)}")
+            print(f"Removed:         {'YES' if removed else 'NO'}")
+            return EXIT_OK
+        if command == "clear":
+            count = store.clear()
+            _header(ui, "LOCAL CONTACTS")
+            print(f"Cleared:         {count}")
+            return EXIT_OK
+        if command == "scan":
+            summary = UniversalNumberEngine(database, cfg).scan_contacts()
+            if getattr(args, "json", False):
+                _print_json(summary)
+                return EXIT_OK
+            _header(ui, "CONTACT SCAN")
+            print(f"Total Numbers    {summary['total']}")
+            print(f"Valid Numbers    {summary['valid']}")
+            print(f"Invalid Numbers  {summary['invalid']}")
+            print(f"Known Contacts   {summary['known_contacts']}")
+            print(f"Unknown Numbers  {summary['unknown_numbers']}")
+            print(f"High Risk        {summary['high_risk']}")
+            print(f"Medium Risk      {summary['medium_risk']}")
+            print(f"Low Risk         {summary['low_risk']}")
+            print(f"Unknown          {summary['unknown']}")
+            print(f"Trusted          {summary['trusted']}")
+            print()
+            print("Numbers are masked. Identity is NOT VERIFIED.")
+            return EXIT_OK
+        _print_error(ui, "Unknown contacts subcommand.")
+        return EXIT_USAGE
+    except Exception as exc:
+        _print_error(ui, f"Contacts unavailable: {exc}")
+        return EXIT_DATABASE
+    finally:
+        if database is not None:
+            database.close()
+
+
 _COMMANDS = {
     "version": _cmd_version,
     "status": _cmd_status,
@@ -2285,6 +2481,8 @@ _COMMANDS = {
     "policy": _cmd_policy,
     "doctor": _cmd_doctor,
     "blocks": _cmd_blocks,
+    "number": _cmd_number,
+    "contacts": _cmd_contacts,
     "_run-fg": _cmd_run_fg,
 }
 

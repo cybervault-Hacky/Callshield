@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.0 — Phase 8.5.2: Universal Number Intelligence
+
+### Added
+- Local-only Universal Number Intelligence: `callshield number <number>` and `--json`, composing the existing normalizer, ReputationEngine, BehaviorEngine and Policy data into a `UniversalNumberProfile`.
+- Explicit contact import (`callshield contacts import|status|list|remove|clear|scan`) for user-provided CSV/JSON. No Android contact access, no remote lookup.
+- Privacy-preserving `local_contacts` storage (hash + masked number + display name only).
+- NUMBER INTELLIGENCE TUI with Number Scan, Saved Contacts, Imported Numbers, Scan History, Compare Numbers and Export Report.
+- Identity fields never invent age, address, occupation or ownership. Missing data is `NOT AVAILABLE` / `NOT VERIFIED`.
+
+### Safety
+- No HTTP/TCP/DNS, no remote reputation, no scraping, no telemetry.
+- Existing `callshield scan` remains unchanged. Schema version stays 7; contact table is additive.
+- Fail-open: invalid or unavailable analysis still recommends ALLOW.
+
 ## 0.8.0 — Phase 8.5.1: Professional TUI Visual Redesign
 
 ### Presentation

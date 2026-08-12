@@ -21,6 +21,7 @@ working exactly as before.
 - Phase 7 — Reputation & Explainable Intelligence: **COMPLETE**
 - Phase 8 — Adaptive Threat Intelligence & Behavior Engine: **COMPLETE**
 - Phase 8.5 — Professional Terminal Interface: **COMPLETE**
+- Phase 8.5.2 — Universal Number Intelligence: **COMPLETE**
 - Phase 9 — **NOT STARTED**
 
 ## Safety invariants
@@ -533,7 +534,7 @@ is added. Physical integration remains deployment-specific and unverified.
 
 ```bash
 python -m unittest discover -s tests -t . -q
-# 554 passed
+# 608 passed
 ```
 
 All 396 Phase 1–8 tests remain. Sixty-four Phase 8 tests cover behavioral

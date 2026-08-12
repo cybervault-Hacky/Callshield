@@ -40,6 +40,7 @@ REGISTRY: Dict[str, Tuple[str, str]] = {
     "policy": ("policy", "PolicyScreen"),
     "reputation": ("reputation", "ReputationScreen"),
     "intelligence": ("intelligence", "IntelligenceScreen"),
+    "number_intel": ("number_intel", "NumberIntelligenceScreen"),
     "blocks": ("blocks", "BlockScreen"),
     "reports": ("reports", "ReportScreen"),
     "history": ("history", "HistoryScreen"),

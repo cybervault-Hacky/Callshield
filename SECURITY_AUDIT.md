@@ -37,6 +37,10 @@ Scope: repository implementation through version 0.8.0 (including the Phase 8.5 
 | Policy simulation isolation | PASS | Simulated decisions are wrapped in a read-only view flagged `simulation=True`; configuration bytes are asserted unchanged after simulation |
 | Interface preference isolation | PASS | Reset rewrites only `ui_state.json`; config contents, database size, list entries and report counts are asserted unchanged |
 | Interface number masking | PASS | Every rendered screen is asserted to contain no plaintext number; display uses `mask_number` throughout |
+| Phase 8.5.2 contact privacy | PASS | `local_contacts` stores SHA-256 hash, masked number and display name only; no plaintext number column |
+| Phase 8.5.2 identity policy | PASS | Age is always NOT AVAILABLE; owner identity is always NOT VERIFIED; names appear only from explicit user import |
+| Phase 8.5.2 network isolation | PASS | `callshield/universal/` has no socket/http/urllib imports; no remote reputation or scraping |
+| Phase 8.5.2 import bounds | PASS | 1 MiB file cap, 5000-row cap, CSV/JSON only, no pickle, no code execution |
 
 ## Not tested
 

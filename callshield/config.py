@@ -120,6 +120,7 @@ class Config:
     intelligence_observation_limit: int = 200
     intelligence_profile_limit: int = 5000
     intelligence_history_days: int = 90
+    contact_record_limit: int = 5000
     max_log_size: int = 2 * 1024 * 1024
     max_log_files: int = 3
     ipc_enabled: bool = True
@@ -459,6 +460,7 @@ def set_value(cfg: Config, key: str, value: str) -> Config:
         "intelligence_observation_limit",
         "intelligence_profile_limit",
         "intelligence_history_days",
+        "contact_record_limit",
         "screening_timeout_ms",
         "relaxed_active_block_threshold",
         "relaxed_confidence_threshold",

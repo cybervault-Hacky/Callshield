@@ -16,16 +16,22 @@ def header(
     version: str = "",
     width: Optional[int] = None,
 ) -> List[str]:
-    """Product header. Two lines on normal terminals, one when narrow."""
+    """Product header. Two lines on normal terminals, one when narrow.
+
+    ``CALLSHIELD`` sits on the left with the version right-aligned; the
+    subtitle follows on its own quiet line. A single subtle rule closes the
+    header — the rest of the layout leans on spacing, not rules.
+    """
 
     width = surface.width if width is None else width
     left = surface.style(fmt.truncate(title, max(8, width - 12)), "brand")
-    right = surface.style(version, "muted") if version else ""
+    right = surface.style(fmt.truncate(version, max(4, width - 8)), "muted") \
+        if version else ""
     gap = max(1, width - fmt.display_width(left) - fmt.display_width(right))
     out = [left + " " * gap + right]
     if subtitle and not surface.narrow:
         out.append(surface.style(fmt.truncate(subtitle, width), "muted"))
-    out.append(rule(surface, width))
+    out.append(rule(surface, width, role="border"))
     return out
 
 
@@ -45,7 +51,7 @@ def status_bar(
     """A compact ``LABEL VALUE`` strip; wraps onto extra lines when needed."""
 
     width = surface.width if width is None else width
-    separator = "  {0}  ".format(surface.glyph("v"))
+    separator = "   "
     chunks: List[str] = []
     for label, value in fields:
         word = fmt.status_word(value)

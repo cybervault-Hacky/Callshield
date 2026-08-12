@@ -12,13 +12,13 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .. import formatters as fmt
 from ..components import (
-    Column,
-    Surface,
+    card,
+    kv,
     kv_block,
     notice,
     paragraph,
     section_title,
-    table,
+    Surface,
 )
 from .base import Action, MenuItem, MenuScreen, Screen, push, stay
 
@@ -128,45 +128,42 @@ class PolicyScreen(MenuScreen):
     def intro(self, surface: Surface) -> List[str]:
         t = self.t
         current = str(self.snapshot.get("current") or "BALANCED")
-        lines = [section_title(surface, t("policy.current"))]
+        lines: List[str] = []
         lines.extend(
             kv_block(
                 surface,
                 [
-                    (t("common.policy"), current),
+                    (t("policy.current"), current),
                     (t("common.mode"), self.snapshot.get("mode")),
                     (t("screening.status"),
                      "ENABLED" if self.snapshot.get("enabled") else "DISABLED"),
                     (t("policy.emergency"),
                      "ENGAGED" if self.emergency else "CLEAR"),
                 ],
-                status_keys=(t("common.policy"), t("common.mode"),
+                status_keys=(t("policy.current"), t("common.mode"),
                              t("screening.status"), t("policy.emergency")),
             )
         )
-        lines.append("")
-        columns = (
-            Column(t("common.policy"), min_width=8, priority=3),
-            Column(t("policy.block_threshold"), align="right", min_width=3,
-                   priority=3),
-            Column(t("policy.confidence_threshold"), align="right", min_width=3,
-                   priority=2),
-            Column(t("common.status"), min_width=7, priority=1),
-        )
+
         policies = self.snapshot.get("policies") or {}
-        rows = []
+        card_width = max(20, min(surface.width, 64))
+        inner_width = max(8, card_width - 4)
         for name in POLICY_NAMES:
             entry = policies.get(name) or {}
-            rows.append(
-                (
-                    name,
-                    fmt.integer(entry.get("active_block")),
-                    fmt.integer(entry.get("confidence")),
-                    "ACTIVE" if name == current else "",
-                )
-            )
-        lines.extend(table(surface, columns, rows,
-                           empty_message=t("common.empty")))
+            lines.append("")
+            title = name
+            if name == current:
+                title = "{0}  [{1}]".format(name, t("policy.current_marker"))
+            card_lines = [
+                kv(surface, t("policy.active_threshold"),
+                   fmt.integer(entry.get("active_block")), width=inner_width,
+                   label_width=16),
+                kv(surface, t("common.confidence"),
+                   fmt.integer(entry.get("confidence")), width=inner_width,
+                   label_width=16),
+            ]
+            lines.extend(card(surface, card_lines, title=title,
+                                   width=card_width))
         lines.append("")
         if self.emergency:
             lines.extend(notice(surface, t("policy.emergency_engaged"), "warn"))

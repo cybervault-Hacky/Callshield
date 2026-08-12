@@ -127,6 +127,12 @@ def detect(
         color = False
     else:
         color = bool(supports_color(no_color=False)) and interactive
+        if color and (os.environ.get("TERM") or "").strip().lower() in (
+            "dumb", "unknown"
+        ):
+            # A dumb terminal declares it cannot interpret escape sequences;
+            # fall back to a clean monochrome render.
+            color = False
 
     return Capabilities(
         width=columns,

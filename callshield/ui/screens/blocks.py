@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence
 
 from .. import formatters as fmt
-from ..components import Column, kv_block, paragraph, Surface, table
+from ..components import Column, kv_block, paragraph, Surface
 from .base import (
     Action,
     ListScreen,
@@ -225,7 +225,7 @@ class BlockScreen(MenuScreen):
 
     def intro(self, surface: Surface) -> List[str]:
         t = self.t
-        lines = [section_title(surface, t("blocks.title"))]
+        lines: List[str] = []
         lines.extend(
             kv_block(
                 surface,

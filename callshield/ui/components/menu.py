@@ -112,18 +112,25 @@ class Menu:
 
 
 def render_menu(surface: Surface, menu: Menu, width: Optional[int] = None,
-                numbered: bool = True) -> List[str]:
-    """Draw the menu. Selection is shown by a cursor glyph *and* inverse video."""
+                numbered: bool = False) -> List[str]:
+    """Draw the menu.
+
+    Selection is a single cursor glyph plus an accent-coloured label — never a
+    full line of inverse video. ``numbered`` is retained for callers that want
+    a hint of the 1-9 shortcuts, but the default is the quiet, unnumbered look.
+    """
 
     width = surface.width if width is None else width
     out: List[str] = []
     cursor = surface.glyph("cursor")
+    cursor_width = fmt.display_width(cursor)
 
     for position, item in enumerate(menu.items):
-        marker = cursor if position == menu.index else " " * fmt.display_width(cursor)
-        number = "{0}.".format(position + 1) if numbered and position < 9 else "  "
+        marker = cursor if position == menu.index else " " * cursor_width
+        number = "{0}.".format(position + 1) if numbered and position < 9 else ""
         label = item.label
-        body = "{0} {1} {2}".format(marker, number, label)
+        prefix = "{0} {1} ".format(marker, number).rstrip() if number else marker
+        body = "{0} {1}".format(prefix, label).rstrip()
         room = width - fmt.display_width(body)
 
         trailing = item.status or item.hint
@@ -135,11 +142,16 @@ def render_menu(surface: Surface, menu: Menu, width: Optional[int] = None,
                 body = body + " " * gap + surface.style(trailing, "muted")
 
         if not item.enabled:
-            out.append(surface.style(fmt.truncate(fmt.strip_ansi(body), width), "muted"))
+            out.append(surface.style(fmt.truncate(fmt.strip_ansi(body), width),
+                                     "muted"))
         elif position == menu.index:
+            # The marker and the label take the accent colour; foreground-only
+            # styling means padding stays invisible, so the row reads as a
+            # clean highlight rather than a block of inverse video.
             plain = fmt.strip_ansi(body)
-            out.append(surface.style(fmt.pad(fmt.truncate(plain, width), width),
-                                     "selected"))
+            rest = fmt.truncate(plain[cursor_width:], max(1, width - cursor_width))
+            out.append(surface.style(marker, "selected")
+                       + surface.style(rest, "selected"))
         else:
             out.append(body)
     return out

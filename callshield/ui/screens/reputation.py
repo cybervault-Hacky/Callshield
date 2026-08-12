@@ -10,7 +10,17 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence
 
 from .. import formatters as fmt
-from ..components import bullet_list, Column, kv_block, paragraph, score_meter, Surface, table
+from ..components import (
+    bullet_list,
+    card,
+    Column,
+    kv,
+    kv_block,
+    paragraph,
+    score_meter,
+    Surface,
+    table,
+)
 from .base import (
     Action,
     ListScreen,
@@ -63,24 +73,33 @@ class ReputationDetailScreen(Screen):
         if not profile.get("available", True):
             return list(empty_state(surface, t("common.unavailable")))
 
-        lines = [section_title(surface, t("reputation.title"))]
-        lines.extend(
-            kv_block(
-                surface,
-                [
-                    (t("common.number"), profile.get("number_masked")),
-                    (t("common.risk"), profile.get("risk")),
-                    (t("common.trend"), profile.get("trend")),
-                    (t("reputation.trust_state"),
-                     "TRUSTED" if profile.get("trusted") else "UNTRUSTED"),
-                    (t("reputation.trust_until"), profile.get("trusted_until")),
-                    (t("scan.field.recommendation"), profile.get("recommendation")),
-                ],
-                status_keys=(t("common.risk"), t("common.trend"),
-                             t("reputation.trust_state"),
-                             t("scan.field.recommendation")),
-            )
-        )
+        lines: List[str] = []
+
+        history = profile.get("history") or {}
+        card_width = max(20, min(surface.width, 64))
+        inner_width = max(8, card_width - 4)
+
+        def row(label: str, value: Any, status: bool = False) -> str:
+            return kv(surface, label, value, width=inner_width, label_width=16,
+                      status=status)
+
+        trust = "TRUSTED" if profile.get("trusted") else "UNTRUSTED"
+        inner = [
+            surface.style(fmt.text_or_placeholder(profile.get("number_masked")),
+                          "bold"),
+            "",
+            row(t("common.risk"), profile.get("risk"), status=True),
+            row(t("common.confidence"), fmt.percent(profile.get("confidence"))),
+            row(t("common.trend"), profile.get("trend"), status=True),
+            row(t("reputation.trust_state"), trust, status=True),
+            row(t("scan.field.first_seen"),
+               fmt.timestamp(history.get("first_seen"), short=True)),
+            row(t("scan.field.last_seen"),
+               fmt.timestamp(history.get("last_seen"), short=True)),
+        ]
+        lines.extend(card(surface, inner, title=t("reputation.profile"),
+                          width=card_width))
+
         lines.append("")
         lines.append(
             score_meter(surface, profile.get("score"), label=t("common.score"),
@@ -90,17 +109,6 @@ class ReputationDetailScreen(Screen):
             score_meter(surface, profile.get("confidence"),
                         label=t("common.confidence"))
         )
-
-        history = profile.get("history") or {}
-        if history:
-            lines.append("")
-            lines.append(section_title(surface, t("reputation.history")))
-            lines.extend(
-                kv_block(
-                    surface,
-                    [(key, history.get(key)) for key in sorted(history)],
-                )
-            )
 
         signals = profile.get("signals") or []
         lines.append("")
@@ -129,6 +137,17 @@ class ReputationDetailScreen(Screen):
             )
         else:
             lines.extend(empty_state(surface, t("scan.no_signals")))
+
+        if history:
+            lines.append("")
+            lines.append(section_title(surface, t("reputation.history")))
+            history_rows = [
+                (t("scan.field.events"), history.get("calls_seen")),
+                (t("blocks.rejected"), history.get("calls_rejected")),
+                (t("main.field.blocks"), history.get("block_recommendations")),
+                (t("reports.count"), history.get("user_reports")),
+            ]
+            lines.extend(kv_block(surface, history_rows))
 
         reasons = profile.get("reasons") or []
         if reasons:
@@ -253,7 +272,7 @@ class ReputationScreen(MenuScreen):
 
     def intro(self, surface: Surface) -> List[str]:
         t = self.t
-        lines = [section_title(surface, t("reputation.title"))]
+        lines: List[str] = []
         lines.extend(
             kv_block(
                 surface,

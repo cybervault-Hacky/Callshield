@@ -12,8 +12,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .. import formatters as fmt
-from ..components import Column, kv_block, paragraph, section_title, status_bar, Surface, table
-from .base import Action, Screen, empty_state, stay
+from ..components import kv_block, paragraph, section_title, status_bar, Surface
+from .base import Action, Screen, stay
 
 MAX_ROWS = 12
 
@@ -79,72 +79,63 @@ class LiveMonitorScreen(Screen):
             ],
         )
 
-    def _event_table(self, surface: Surface) -> List[str]:
+    @staticmethod
+    def _clock(value: Any) -> str:
+        """Format a stored timestamp as ``HH:MM:SS`` without inventing data."""
+
+        text = fmt.timestamp(value)
+        if text == fmt.PLACEHOLDER:
+            return text
+        for separator in ("T", " "):
+            if separator in text:
+                text = text.split(separator, 1)[1]
+                break
+        text = text.split("+", 1)[0].split(".", 1)[0]
+        if len(text) >= 8:
+            return text[:8]
+        return fmt.timestamp(value, short=True)
+
+    def _stream_rows(self, surface: Surface, rows: Sequence[Dict[str, Any]],
+                     kind: str = "event") -> List[str]:
+        """One compact ``TIME  EVENT  MASKED  SCORE`` line per record.
+
+        Only fields the local database actually records are shown; nothing is
+        synthesised. Events carry ``verdict`` and ``action``, screening rows
+        carry ``recommended_action`` / ``applied_action``.
+        """
+
         t = self.t
-        out = [section_title(surface, t("monitor.stream"))]
-        if not self.events:
-            out.extend(empty_state(surface, t("monitor.waiting")))
-            return out
-        rows = [
-            [
-                fmt.timestamp(row.get("timestamp"), short=True),
-                fmt.masked(row.get("number")),
-                str(row.get("event_type") or ""),
-                fmt.integer(row.get("risk_score")),
-                fmt.status_word(row.get("action")),
-                str(row.get("source") or ""),
-            ]
-            for row in self.events
-        ]
-        out.extend(
-            table(
-                surface,
-                [
-                    Column(t("common.time"), min_width=8, priority=3),
-                    Column(t("common.number"), min_width=8, priority=3),
-                    Column(t("common.action"), min_width=6, priority=2),
-                    Column(t("common.score"), align="right", min_width=3, priority=2),
-                    Column(t("common.verdict"), min_width=5, priority=1),
-                    Column(t("monitor.source"), min_width=4, priority=1),
-                ],
-                rows,
-                empty_message=t("monitor.waiting"),
-            )
-        )
+        out: List[str] = []
+        for row in rows:
+            stamp = self._clock(row.get("timestamp"))
+            event = str(row.get("verdict")
+                        or row.get("recommended_action")
+                        or row.get("action") or "--")
+            number = fmt.masked(row.get("number"))
+            score = fmt.integer(row.get("risk_score"))
+            action = fmt.status_word(row.get("action")
+                                     or row.get("applied_action") or "")
+            line = "{0}  {1:<12} {2}".format(
+                stamp, fmt.truncate(event, 12), number)
+            if score != fmt.PLACEHOLDER:
+                line += "  {0:>3}".format(score)
+            if action:
+                line += "  " + surface.status(action)
+            out.append(fmt.truncate(line, surface.width))
+        if not out:
+            out.append(surface.style(t("monitor.waiting"), "muted"))
         return out
 
-    def _screening_table(self, surface: Surface) -> List[str]:
+    def _event_stream(self, surface: Surface) -> List[str]:
+        t = self.t
+        out = [section_title(surface, t("monitor.stream"))]
+        out.extend(self._stream_rows(surface, self.events))
+        return out
+
+    def _screening_stream(self, surface: Surface) -> List[str]:
         t = self.t
         out = [section_title(surface, t("monitor.screening_stream"))]
-        if not self.screening:
-            out.extend(empty_state(surface, t("monitor.waiting")))
-            return out
-        rows = [
-            [
-                fmt.timestamp(row.get("timestamp"), short=True),
-                fmt.masked(row.get("number")),
-                fmt.integer(row.get("risk_score")),
-                fmt.status_word(row.get("recommended_action")),
-                fmt.status_word(row.get("applied_action")),
-                fmt.yes_no(row.get("actually_rejected")),
-            ]
-            for row in self.screening
-        ]
-        out.extend(
-            table(
-                surface,
-                [
-                    Column(t("common.time"), min_width=8, priority=3),
-                    Column(t("common.number"), min_width=8, priority=3),
-                    Column(t("common.score"), align="right", min_width=3, priority=2),
-                    Column(t("blocks.recommended"), min_width=6, priority=2),
-                    Column(t("blocks.applied"), min_width=6, priority=1),
-                    Column(t("blocks.rejected"), min_width=3, priority=1),
-                ],
-                rows,
-                empty_message=t("monitor.waiting"),
-            )
-        )
+        out.extend(self._stream_rows(surface, self.screening))
         return out
 
     # --------------------------------------------------------------- render
@@ -153,8 +144,8 @@ class LiveMonitorScreen(Screen):
         lines = status_bar(
             surface,
             [
+                (t("common.status"), "CONNECTED" if self.connected else "OFFLINE"),
                 (t("main.field.daemon"), self.daemon_state),
-                (t("common.status"), "ONLINE" if self.connected else "OFFLINE"),
             ],
         )
         if not self.connected:
@@ -162,9 +153,9 @@ class LiveMonitorScreen(Screen):
         lines.append("")
         lines.extend(self._counters(surface))
         lines.append("")
-        lines.extend(self._event_table(surface))
+        lines.extend(self._event_stream(surface))
         lines.append("")
-        lines.extend(self._screening_table(surface))
+        lines.extend(self._screening_stream(surface))
         lines.append("")
         if self.last_refresh is not None:
             lines.append(

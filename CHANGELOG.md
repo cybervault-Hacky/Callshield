@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.8.0 — Phase 8.5.1: Professional TUI Visual Redesign
+
+### Presentation
+- Restyled the terminal interface around a quiet, instrument-panel aesthetic (Apple/Linear/Vercel-inspired hierarchy): a clean two-line header (`CALLSHIELD` wordmark, right-aligned version, `Local Threat Analysis` subtitle and a single subtle rule), plain uppercase section headings instead of dash-filled rules, and spacing-driven layout.
+- Dashboard rebuilt as a vertical, focused posture report: SYSTEM (Daemon, Engine, Database, IPC, Policy), THREAT OVERVIEW (Events, High Risk, Recommended, Rejected), INTELLIGENCE (Profiles, Observations, Trend), QUICK ACTIONS and a compact `Daemon/Policy/Screening` status strip.
+- Menus are now unnumbered with a minimal highlight — a single cursor glyph plus accent-coloured label; full-line inverse video was removed while keeping 1-9 shortcuts.
+- Startup sequence restyled as a restrained staged initialisation: each of the nine real probes ends with a right-aligned `[OK]`, no rotating-bar spinner, skippable in non-interactive mode and cancellable with `q`/Ctrl+C between stages.
+- Scan Center results are now a compact `SCAN RESULT` card (masked number, Risk `n / 100`, Confidence, Risk Level, Trend, Recommendation, Applied Action, Mode), followed by a labelled Reason block.
+- Reputation Center shows a `PROFILE` card (Number, Risk, Confidence, Trend, Trust, First/Last Seen) above Signals, History and Reasons sections.
+- Intelligence Center reorganised into CURRENT / BASELINE / DELTA / TREND / PATTERNS / EVIDENCE sections.
+- Screening Center keeps its safety state obvious: Status / Mode / Policy, then Android `NOT VERIFIED` and Auto Reject, with ACTIVE still requiring the CLI confirmation prompt.
+- Policy Center renders RELAXED / BALANCED / STRICT as cards with active thresholds and confidence; the current policy is marked `[current]`; simulation remains read-only.
+- Daemon Control now shows STATUS, PID, UPTIME, ENGINE, QUEUE, IPC and HEARTBEAT plus lifecycle actions.
+- Live Monitor became a compact console-style stream (`HH:MM:SS  VERDICT  MASKED  SCORE  ACTION`) over the real event log, with `Waiting for events...` when empty.
+- Settings grouped under GENERAL / SCAN / DATA with each value shown on the right; reset still rewrites only `ui_state.json`.
+- About screen reduced to a professional minimal presentation (product, developer, channels, platform, architecture, Android Bridge `NOT VERIFIED`).
+- Subtle semantic palette (muted green/yellow/red/cyan, bold white headings, no neon, no inverse video); Dark default with Light/System retained; monochrome terminals render the same words with no escape codes; `TERM=dumb` now falls back to the classic banner.
+- Verified responsive across 20/40/60/80/100/120/200 columns with no horizontal overflow; CJK and Devanagari label alignment preserved via display-width aware padding.
+
+### Verification
+- Full suite: 582 passed (554 pre-existing plus 28 new redesign tests). No existing test was modified or removed; the redesign is covered by `tests/test_ui_redesign.py` (dashboard structure, selection highlight, status badges, responsive widths, masking, settings groups, startup `[OK]` frames, cancellation, terminal restoration, no-emoji, no direct engine imports).
+- Rendered and driven interactively under a real PTY at 60/100/200 columns with a running daemon, a stopped daemon, `TERM=dumb`, and no-colour caps.
+- Security audit unchanged: no `eval`/`exec`, no `shell=True`, no `os.system`, no `AF_INET`, no HTTP/TCP/`requests`/`urllib`, no cloud APIs, no telemetry, no new network access; the UI remains presentation-only with all mutations delegated to the existing CLI handlers.
+
 ## 0.8.0 — Phase 8.5: Professional Terminal Interface
 
 ### Added

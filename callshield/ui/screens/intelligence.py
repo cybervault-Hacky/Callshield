@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence
 
 from .. import formatters as fmt
-from ..components import bullet_list, Column, kv_block, paragraph, score_meter, Surface, table
+from ..components import bullet_list, Column, kv_block, paragraph, Surface, table
 from .base import (
     Action,
     ListScreen,
@@ -80,7 +80,6 @@ class IntelligenceDetailScreen(Screen):
                 [
                     (t("common.number"), snapshot.get("number_masked")),
                     (t("scan.field.decision"), snapshot.get("decision")),
-                    (t("common.trend"), snapshot.get("behavioral_trend")),
                     (t("reputation.trust_state"), snapshot.get("trust_state")),
                     (t("reputation.trust_until"), snapshot.get("trust_expiry")),
                     (t("blocks.recommended"), snapshot.get("recommended")),
@@ -88,39 +87,64 @@ class IntelligenceDetailScreen(Screen):
                     (t("blocks.confirmed_at"),
                      fmt.yes_no(snapshot.get("confirmed"))),
                 ],
-                status_keys=(t("scan.field.decision"), t("common.trend"),
+                status_keys=(t("scan.field.decision"),
                              t("reputation.trust_state"), t("blocks.recommended"),
                              t("blocks.applied")),
             )
         )
+
         lines.append("")
-        lines.append(
-            score_meter(surface, snapshot.get("current_score"),
-                        label=t("scan.field.current"))
+        lines.append(section_title(surface, t("intelligence.current")))
+        lines.extend(
+            kv_block(
+                surface,
+                [
+                    (t("scan.field.current"), snapshot.get("current_score")),
+                    (t("common.confidence"),
+                     fmt.percent(snapshot.get("reputation_confidence"))),
+                ],
+            )
         )
-        lines.append(
-            score_meter(surface, snapshot.get("reputation_confidence"),
-                        label=t("common.confidence"))
-        )
+
         lines.append("")
-        lines.append(section_title(surface, t("intelligence.trends")))
+        lines.append(section_title(surface, t("intelligence.baseline")))
         lines.extend(
             kv_block(
                 surface,
                 [
                     (t("scan.field.baseline"), snapshot.get("baseline_score")),
-                    (t("scan.field.current"), snapshot.get("current_score")),
-                    (t("scan.field.delta"), fmt.signed(snapshot.get("risk_delta"))),
-                    (t("common.confidence"),
-                     fmt.signed(snapshot.get("confidence_delta"))),
-                    ("OBSERVATIONS", snapshot.get("recent_observation_count")),
-                    ("HIGH RISK", snapshot.get("recent_high_risk_count")),
-                    (t("blocks.recommended"),
-                     snapshot.get("recent_block_recommendations")),
-                    (t("reports.count"), snapshot.get("recent_user_reports")),
                 ],
             )
         )
+
+        lines.append("")
+        lines.append(section_title(surface, t("intelligence.delta")))
+        lines.extend(
+            kv_block(
+                surface,
+                [
+                    (t("scan.field.delta"), fmt.signed(snapshot.get("risk_delta"))),
+                    (t("common.confidence"),
+                     fmt.signed(snapshot.get("confidence_delta"))),
+                ],
+            )
+        )
+
+        lines.append("")
+        lines.append(section_title(surface, t("common.trend")))
+        lines.extend(
+            kv_block(
+                surface,
+                [
+                    ("BEHAVIORAL", snapshot.get("behavioral_trend")),
+                    (t("main.field.blocks"),
+                     snapshot.get("recent_block_recommendations")),
+                    (t("reports.count"), snapshot.get("recent_user_reports")),
+                ],
+                status_keys=("BEHAVIORAL",),
+            )
+        )
+
         lines.append("")
         lines.append(section_title(surface, t("intelligence.patterns")))
         patterns = snapshot.get("patterns") or []
@@ -137,6 +161,18 @@ class IntelligenceDetailScreen(Screen):
                 ],
                 _pattern_rows(patterns),
                 empty_message=t("scan.no_patterns"),
+            )
+        )
+
+        lines.append("")
+        lines.append(section_title(surface, t("intelligence.evidence")))
+        lines.extend(
+            kv_block(
+                surface,
+                [
+                    ("OBSERVATIONS", snapshot.get("recent_observation_count")),
+                    ("HIGH RISK", snapshot.get("recent_high_risk_count")),
+                ],
             )
         )
         explanations = snapshot.get("explanations") or []
@@ -292,7 +328,7 @@ class IntelligenceScreen(MenuScreen):
 
     def intro(self, surface: Surface) -> List[str]:
         t = self.t
-        lines = [section_title(surface, t("intelligence.title"))]
+        lines: List[str] = []
         lines.extend(
             kv_block(
                 surface,

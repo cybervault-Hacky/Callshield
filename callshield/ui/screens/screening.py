@@ -160,29 +160,44 @@ class ScreeningScreen(MenuScreen):
     # --------------------------------------------------------------- render
     def intro(self, surface: Surface) -> List[str]:
         t = self.t
-        lines = [section_title(surface, t("screening.status"))]
-        rows = [
+        lines: List[str] = []
+        core = [
             (t("screening.status"), "ENABLED" if self.enabled else "DISABLED"),
             (t("common.mode"), self.mode),
             (t("common.policy"), self.snapshot.get("current")),
-            (t("policy.emergency"), "ENGAGED" if self.emergency else "CLEAR"),
-            (t("main.field.daemon"), self.daemon_state),
-            ("IPC", "CONNECTED" if self.connected else "OFFLINE"),
-            ("Auto Reject", "ARMED" if self.auto_reject else "DISABLED"),
-            ("Android", "NOT VERIFIED"),
+        ]
+        core.extend(
+            [
+                (t("policy.emergency"), "ENGAGED" if self.emergency else "CLEAR"),
+                (t("main.field.daemon"), self.daemon_state),
+                (t("main.field.ipc"), "CONNECTED" if self.connected else "OFFLINE"),
+            ]
+        )
+        lines.extend(
+            kv_block(
+                surface,
+                core,
+                status_keys=(t("screening.status"), t("common.mode"),
+                             t("common.policy"), t("policy.emergency"),
+                             t("main.field.daemon"), t("main.field.ipc")),
+            )
+        )
+        lines.append("")
+        safety = [
+            (t("screening.android"), "NOT VERIFIED"),
+            (t("screening.auto_reject"),
+             "ARMED" if self.auto_reject else "DISABLED"),
         ]
         lines.extend(
             kv_block(
                 surface,
-                rows,
-                status_keys=(t("screening.status"), t("common.mode"),
-                             t("policy.emergency"), t("main.field.daemon"),
-                             "IPC", "Auto Reject", "Android"),
+                safety,
+                status_keys=(t("screening.android"), t("screening.auto_reject")),
             )
         )
         lines.append("")
         counters = [
-            (t("screening.status"), self.metrics.get("screened")),
+            (t("main.field.screened"), self.metrics.get("screened")),
             (t("blocks.recommended"), self.metrics.get("block_recommendations")),
             (t("blocks.applied"), self.metrics.get("applied_blocks")),
             (t("blocks.rejected"), self.metrics.get("actually_rejected")),

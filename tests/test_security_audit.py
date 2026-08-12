@@ -77,8 +77,8 @@ class TestSecurityAudit(unittest.TestCase):
         ):
             self.assertNotIn(permission, manifest)
 
-    def test_security_audit_document_exists(self):
-        self.assertTrue((ROOT / "SECURITY_AUDIT.md").is_file())
+    def test_readme_is_the_project_documentation(self):
+        self.assertTrue((ROOT / "README.md").is_file())
 
 
 if __name__ == "__main__":

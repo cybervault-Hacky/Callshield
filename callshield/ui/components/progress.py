@@ -82,23 +82,34 @@ def staged_lines(
     spinner: Optional[Spinner] = None,
     width: Optional[int] = None,
 ) -> List[str]:
-    """Startup checklist: done stages keep a marker, the current one spins."""
+    """Startup checklist: done stages get a right-aligned ``[OK]``.
+
+    The stage currently being probed is shown plainly (no spinner character),
+    pending stages are muted. The animation is the *progression* of ``[OK]``
+    markers — restrained, readable and truthful: a stage is only marked OK
+    after its probe has run.
+    """
 
     width = surface.width if width is None else width
     out: List[str] = []
-    done_mark = surface.glyph("bullet")
+    marker = "[OK]"
+    marker_w = fmt.display_width(marker)
+    label_max = max((fmt.display_width(stage) for stage in stages), default=0)
+    gutter = min(label_max, max(8, width - marker_w - 3))
+    # The marker column sits just past the longest label, so ``[OK]`` stack
+    # reads as a column without stretching across the whole terminal.
+    marker_col = min(label_max, max(8, width - marker_w - 2)) + 3
+    if marker_col + marker_w > width:
+        marker_col = max(1, width - marker_w)
     for index, stage in enumerate(stages):
+        label = fmt.truncate(stage, gutter)
         if index < completed:
-            mark = surface.style(done_mark, "ok")
-            text = surface.style(stage, "muted")
+            text = surface.style(fmt.pad(label, marker_col), "muted")
+            out.append(text + surface.style(marker, "ok"))
         elif index == completed:
-            frame = spinner.frame(surface) if spinner else done_mark
-            mark = surface.style(frame, "accent")
-            text = surface.style(stage, "value")
+            out.append(surface.style(fmt.pad(label, marker_col), "value"))
         else:
-            mark = " "
-            text = surface.style(stage, "muted")
-        out.append(fmt.truncate("{0} {1}".format(mark, text), width))
+            out.append(surface.style(fmt.pad(label, marker_col), "muted"))
     return out
 
 

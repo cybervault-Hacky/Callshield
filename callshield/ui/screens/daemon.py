@@ -186,6 +186,7 @@ class DaemonScreen(MenuScreen):
         self.pid: Optional[int] = None
         self.info: Dict[str, Any] = {}
         self.metrics: Dict[str, Any] = {}
+        self.health: Dict[str, Any] = {}
         self.connected = False
 
     # ------------------------------------------------------------ data load
@@ -196,30 +197,47 @@ class DaemonScreen(MenuScreen):
         self.info = info.data if info.ok else {}
         metrics = self.backend.daemon_metrics()
         self.metrics = metrics.data if metrics.ok else {}
+        health = self.backend.daemon_health()
+        self.health = health.data if health.ok else {}
 
     def intro(self, surface: Surface) -> List[str]:
         t = self.t
-        lines = [section_title(surface, t("daemon.status"))]
+        lines: List[str] = []
         enabled = bool(getattr(self.ctx.cfg, "daemon_enabled", True))
+        ipc_enabled = bool(getattr(self.ctx.cfg, "ipc_enabled", True))
+        ipc_word = "DISABLED"
+        if self.state == "RUNNING":
+            ipc_word = "CONNECTED" if ipc_enabled else "DISABLED"
+        elif ipc_enabled:
+            ipc_word = "OFFLINE"
+        heartbeat = self.health.get("last_heartbeat_human")
+        if self.state == "RUNNING":
+            if self.health.get("heartbeat_stale"):
+                heartbeat = "STALE"
+            elif not heartbeat:
+                heartbeat = "--"
+        else:
+            heartbeat = "--"
         rows = [
             (t("common.status"), self.state),
             (t("main.field.pid"), self.pid),
             (t("main.field.uptime"), self.metrics.get("uptime_human")),
-            ("IPC", "ENABLED" if getattr(self.ctx.cfg, "ipc_enabled", True)
-             else "DISABLED"),
-            (t("common.enabled"), "ENABLED" if enabled else "DISABLED"),
+            (t("main.field.engine"), self.info.get("engine")),
             (t("main.field.queue"), "{0}/{1}".format(
                 fmt.integer(self.metrics.get("queue_size")),
                 fmt.integer(self.metrics.get("queue_max")))),
-            (t("main.field.screening"), self.info.get("call_screening")),
-            ("Android", "NOT VERIFIED"),
+            (t("main.field.ipc"), ipc_word),
+            (t("main.field.heartbeat"), heartbeat),
+            (t("screening.android"), "NOT VERIFIED"),
         ]
+        # HEARTBEAT carries a timestamp (not a status word), so it is left out
+        # of status_keys: "STALE" still reads as a word on its own.
         lines.extend(
             kv_block(
                 surface,
                 rows,
-                status_keys=(t("common.status"), "IPC", t("common.enabled"),
-                             t("main.field.screening"), "Android"),
+                status_keys=(t("common.status"), t("main.field.engine"),
+                             t("main.field.ipc"), t("screening.android")),
             )
         )
         if not enabled:

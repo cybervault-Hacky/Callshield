@@ -148,7 +148,7 @@ class Screen:
 class MenuScreen(Screen):
     """A screen whose primary content is a selectable menu."""
 
-    numbered = True
+    numbered = False
     #: Heading printed above the menu.
     menu_title_key = "nav.menu"
 

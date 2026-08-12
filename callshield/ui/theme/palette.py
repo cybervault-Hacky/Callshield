@@ -15,36 +15,40 @@ from typing import Dict
 RESET = "\033[0m"
 
 # Semantic roles -> SGR sequences, per appearance.
+#
+# The palette is intentionally restrained — an instrument panel rather than a
+# neon dashboard. Colours are muted, selection never uses full-line inverse
+# video, and every state keeps its word so monochrome terminals stay readable.
 _DARK: Dict[str, str] = {
-    "title": "\033[1;37m",
-    "brand": "\033[1;36m",
-    "label": "\033[38;5;250m",
+    "title": "\033[1;97m",
+    "brand": "\033[1;97m",
+    "label": "\033[38;5;246m",
     "value": "\033[97m",
     "muted": "\033[2;37m",
-    "border": "\033[38;5;240m",
-    "accent": "\033[36m",
-    "ok": "\033[32m",
-    "warn": "\033[33m",
-    "err": "\033[31m",
-    "info": "\033[34m",
-    "selected": "\033[7m",
+    "border": "\033[38;5;238m",
+    "accent": "\033[38;5;45m",
+    "ok": "\033[38;5;114m",
+    "warn": "\033[38;5;215m",
+    "err": "\033[38;5;203m",
+    "info": "\033[38;5;111m",
+    "selected": "\033[1;38;5;45m",
     "bold": "\033[1m",
     "dim": "\033[2m",
 }
 
 _LIGHT: Dict[str, str] = {
     "title": "\033[1;30m",
-    "brand": "\033[1;34m",
-    "label": "\033[38;5;238m",
+    "brand": "\033[1;30m",
+    "label": "\033[38;5;240m",
     "value": "\033[30m",
     "muted": "\033[2;30m",
-    "border": "\033[38;5;245m",
+    "border": "\033[38;5;250m",
     "accent": "\033[34m",
     "ok": "\033[32m",
     "warn": "\033[33m",
     "err": "\033[31m",
     "info": "\033[34m",
-    "selected": "\033[7m",
+    "selected": "\033[1;34m",
     "bold": "\033[1m",
     "dim": "\033[2m",
 }
@@ -127,8 +131,13 @@ class Theme:
 
         if not word:
             return ""
-        role = STATUS_ROLE.get(str(word).strip().upper(), "value")
-        return self.style(str(word), role)
+        text = str(word).strip()
+        if text in ("--", "-"):
+            # The unknown-value placeholder must survive verbatim; canonical
+            # status casing would otherwise turn "--" into "__".
+            return self.style(text, "muted")
+        role = STATUS_ROLE.get(text.upper(), "value")
+        return self.style(text, role)
 
     def risk(self, level: str) -> str:
         return self.status(level)

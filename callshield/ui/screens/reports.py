@@ -124,7 +124,7 @@ class ReportScreen(MenuScreen):
 
     def intro(self, surface: Surface) -> List[str]:
         t = self.t
-        lines = [section_title(surface, t("reports.title"))]
+        lines: List[str] = []
         lines.extend(
             kv_block(
                 surface,

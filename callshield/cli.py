@@ -2339,15 +2339,22 @@ def _ui_disabled() -> bool:
     return value not in ("", "0", "false", "no")
 
 
+def _term_is_dumb() -> bool:
+    """True when TERM declares it cannot drive a full-screen interface."""
+
+    return (os.environ.get("TERM") or "").strip().lower() in ("dumb", "unknown")
+
+
 def _launch_ui(ui: _UI, cfg: Config) -> int:
     """Start the terminal interface for a bare `callshield` invocation.
 
     Falls back to the classic banner when the interface is disabled, when the
-    terminal is not interactive, or if the interface fails to import or start.
-    The command line always stays usable.
+    terminal is not interactive (including ``TERM=dumb``), or if the interface
+    fails to import or start. The command line always stays usable.
     """
 
-    if _ui_disabled() or not sys.stdin.isatty() or not sys.stdout.isatty():
+    if (_ui_disabled() or _term_is_dumb()
+            or not sys.stdin.isatty() or not sys.stdout.isatty()):
         _print_banner_status(ui, cfg)
         return EXIT_OK
 

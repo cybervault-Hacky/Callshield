@@ -17,6 +17,7 @@ from .chrome import (
 from .menu import Menu, MenuItem, render_menu
 from .panel import (
     bullet_list,
+    card,
     empty_state,
     kv,
     kv_block,
@@ -37,6 +38,7 @@ __all__ = [
     "blank",
     "breadcrumb",
     "bullet_list",
+    "card",
     "confirm_line",
     "empty_state",
     "fit_columns",

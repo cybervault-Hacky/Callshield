@@ -14,10 +14,19 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence
 
 from .. import formatters as fmt
-from ..components import bullet_list, Column, kv_block, paragraph, score_meter, Surface, table
+from ..components import (
+    bullet_list,
+    card,
+    Column,
+    kv,
+    kv_block,
+    paragraph,
+    score_meter,
+    Surface,
+    table,
+)
 from .base import (
     Action,
-    DetailScreen,
     ListScreen,
     MenuItem,
     MenuScreen,
@@ -36,40 +45,55 @@ def _thresholds(cfg: Any) -> str:
     )
 
 
-def basic_sections(ctx: Any, surface: Surface, analysis: Any) -> List[str]:
-    """The compact result block shared by Basic Scan and the advanced header."""
+def basic_sections(
+    ctx: Any,
+    surface: Surface,
+    analysis: Any,
+    trend: Any = None,
+    applied: Any = None,
+    mode: Any = None,
+) -> List[str]:
+    """The compact result card for a basic scan.
+
+    One focused card: the masked number, the headline metrics, the verdict and
+    (when the policy simulation succeeded) what would actually be applied. The
+    card never shows a raw number and never claims an action was applied in
+    ACTIVE mode.
+    """
 
     t = ctx.t
-    lines: List[str] = []
-    lines.append(section_title(surface, t("scan.section.identity")))
-    lines.extend(
-        kv_block(
-            surface,
-            [
-                (t("scan.field.masked"), fmt.masked(analysis.normalized_number)),
-                (t("scan.field.risk_level"), analysis.risk_level),
-                (t("common.verdict"), analysis.verdict),
-                (t("scan.field.recommendation"), analysis.recommended_action),
-            ],
-            status_keys=(
-                t("scan.field.risk_level"),
-                t("common.verdict"),
-                t("scan.field.recommendation"),
-            ),
-        )
-    )
-    lines.append("")
-    lines.append(
-        score_meter(surface, analysis.risk_score, label=t("common.score"),
-                    level=analysis.risk_level)
-    )
-    lines.append(
-        score_meter(surface, analysis.confidence, label=t("common.confidence"))
-    )
+    subject = surface.style(fmt.masked(analysis.normalized_number), "bold")
+    risk = "{0} / 100".format(fmt.score(analysis.risk_score))
+    # The card is capped so a result stays a compact card even on very wide
+    # terminals; rows align to the card's inner width.
+    card_width = max(20, min(surface.width, 64))
+    inner_width = max(8, card_width - 4)
+
+    def row(label: str, value: Any, status: bool = False) -> str:
+        return kv(surface, label, value, width=inner_width, label_width=16,
+                  status=status)
+
+    inner = [
+        subject,
+        "",
+        row(t("common.risk"), risk, status=True),
+        row(t("common.confidence"), fmt.percent(analysis.confidence)),
+        row(t("scan.field.risk_level"), analysis.risk_level, status=True),
+        row(t("common.trend"), trend, status=True),
+        "",
+        row(t("scan.field.recommendation"), analysis.recommended_action,
+            status=True),
+        row(t("blocks.applied"), applied, status=True),
+        row(t("common.mode"), mode),
+    ]
+    lines = card(surface, inner, title=t("scan.section.result"), width=card_width)
     if analysis.reason:
         lines.append("")
-        lines.append(surface.style(fmt.truncate(analysis.reason, surface.width),
-                                   "value"))
+        lines.append(surface.style(t("common.reason"), "title"))
+        lines.extend(
+            paragraph(surface, fmt.truncate(analysis.reason, surface.width),
+                      role="value")
+        )
     return lines
 
 
@@ -85,6 +109,9 @@ class ScanResultScreen(Screen):
         self.error = ""
         self.history_count: Optional[int] = None
         self.list_status = ""
+        self.trend: Any = None
+        self.applied: Any = None
+        self.mode: Any = None
 
     def title(self) -> str:
         return self.t("scan.basic")
@@ -106,6 +133,21 @@ class ScanResultScreen(Screen):
         count = self.backend.number_history_count(normalized)
         self.history_count = count.data if count.ok else None
         self.list_status = self._list_status(normalized)
+        # The card's lower half is fed by the local reputation profile and a
+        # read-only policy simulation — both existing, non-mutating APIs.
+        reputation = self.backend.reputation(normalized)
+        self.trend = reputation.data.get("trend") if reputation.ok else None
+        decision = self.backend.policy_simulate(
+            int(getattr(self.analysis, "risk_score", 0) or 0),
+            int(getattr(self.analysis, "confidence", 0) or 0),
+            mode=getattr(self.ctx.cfg, "screening_mode", "DRY_RUN"),
+        )
+        if decision.ok:
+            self.applied = getattr(decision.data, "applied_action", None)
+            self.mode = getattr(decision.data, "mode", None)
+        else:
+            self.applied = None
+            self.mode = getattr(self.ctx.cfg, "screening_mode", "DRY_RUN")
 
     def _list_status(self, normalized: str) -> str:
         for name, word in (("blacklist", "BLACKLISTED"), ("whitelist", "WHITELISTED")):
@@ -124,7 +166,9 @@ class ScanResultScreen(Screen):
         if self.analysis is None:
             return [surface.style(self.error or t("error.generic"), "err")]
 
-        lines = basic_sections(self.ctx, surface, self.analysis)
+        lines = basic_sections(self.ctx, surface, self.analysis,
+                               trend=self.trend, applied=self.applied,
+                               mode=self.mode)
         lines.append("")
         lines.append(section_title(surface, t("scan.section.signals")))
         signals = list(getattr(self.analysis, "signals", None) or [])

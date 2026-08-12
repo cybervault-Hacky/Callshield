@@ -1,9 +1,11 @@
 """Main dashboard.
 
-Four sections — SYSTEM, THREAT OVERVIEW, INTELLIGENCE, QUICK ACTIONS — laid out
-side by side on wide terminals and stacked on narrow ones. Every value comes
-from the backend adapter; nothing here is invented, and a value that cannot be
-read is shown as ``--`` rather than as a zero.
+Three stacked status sections — SYSTEM, THREAT OVERVIEW, INTELLIGENCE — followed
+by the QUICK ACTIONS menu and a compact status strip. The layout is deliberately
+vertical and quiet: hierarchy comes from spacing and aligned key/value rows,
+not from ruling lines. Every value comes from the backend adapter; nothing here
+is invented, and a value that cannot be read is shown as ``--`` rather than as
+a zero.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from .. import formatters as fmt
 from ..components import Surface, kv_block, paragraph, section_title, status_bar
-from .base import Action, MenuItem, MenuScreen, home, push, quit_app, stay
+from .base import MenuItem, MenuScreen, home, push, quit_app, stay
 
 #: Menu key -> screen factory attribute on the registry.
 QUICK_ACTIONS: Tuple[Tuple[str, str], ...] = (
@@ -31,29 +33,6 @@ QUICK_ACTIONS: Tuple[Tuple[str, str], ...] = (
     ("about", "menu.about"),
     ("exit", "menu.exit"),
 )
-
-
-def _pair_columns(surface: Surface, left: Sequence[str],
-                  right: Sequence[str]) -> List[str]:
-    """Place two blocks side by side, or stack them when there is no room."""
-
-    if surface.width < 78:
-        out = list(left)
-        if right:
-            out.append("")
-            out.extend(right)
-        return out
-
-    gap = 3
-    half = (surface.width - gap) // 2
-    rows = max(len(left), len(right))
-    out = []
-    for index in range(rows):
-        a = left[index] if index < len(left) else ""
-        b = right[index] if index < len(right) else ""
-        plain = fmt.display_width(fmt.strip_ansi(a))
-        out.append(a + " " * max(1, half + gap - plain) + b)
-    return out
 
 
 class DashboardScreen(MenuScreen):
@@ -89,8 +68,6 @@ class DashboardScreen(MenuScreen):
         screening = backend.screening_metrics()
         screening_data = screening.data if screening.ok else {}
 
-        blacklist = backend.list_numbers("blacklist", limit=500)
-        whitelist = backend.list_numbers("whitelist", limit=500)
         profiles = backend.recent_reputation_profiles(200)
         snapshots = backend.recent_intelligence_profiles(200)
 
@@ -101,27 +78,23 @@ class DashboardScreen(MenuScreen):
             screening_word = str(policy.get("mode") or "DRY_RUN")
 
         self.system = {
-            "version": self.ctx.version,
             "daemon": state,
+            "engine": "READY",
+            "database": "READY" if events.ok else "ERROR",
+            "ipc": "READY" if state == "RUNNING" else "OFFLINE",
+            "policy": policy.get("current"),
             "pid": pid,
             "uptime": data.get("uptime_human") or data.get("uptime_seconds"),
-            "database": "READY" if events.ok else "ERROR",
-            "engine": "READY",
-            "policy": policy.get("current"),
-            "profile": policy.get("protection_mode"),
-            "screening": screening_word,
             "queue": self._queue_text(data),
+            "screening": screening_word,
         }
 
         self.threat = {
             "events": event_data.get("total"),
             "high_risk": event_data.get("high_risk"),
-            "blocks": event_data.get("block_recommendations"),
-            "screened": screening_data.get("screened"),
             "recommended": screening_data.get("screening_block_recommended"),
             "rejected": screening_data.get("actually_rejected"),
-            "blacklist": len(blacklist.data or []) if blacklist.ok else None,
-            "whitelist": len(whitelist.data or []) if whitelist.ok else None,
+            "blocks": event_data.get("block_recommendations"),
         }
 
         profile_rows = profiles.data if profiles.ok else []
@@ -171,78 +144,71 @@ class DashboardScreen(MenuScreen):
         return max(counts.items(), key=lambda item: item[1])[0]
 
     # -------------------------------------------------------------- render
-    def _system_block(self, surface: Surface, width: int) -> List[str]:
-        t = self.t
-        rows = [
-            (t("main.field.version"), self.system.get("version")),
-            (t("main.field.daemon"), fmt.status_word(self.system.get("daemon"))),
-            (t("main.field.pid"), self.system.get("pid")),
-            (t("main.field.uptime"), self.system.get("uptime")),
-            (t("main.field.database"), self.system.get("database")),
-            (t("main.field.engine"), self.system.get("engine")),
-            (t("main.field.policy"), self.system.get("policy")),
-            (t("main.field.profile"), self.system.get("profile")),
-            (t("main.field.screening"), self.system.get("screening")),
-            (t("main.field.queue"), self.system.get("queue")),
-        ]
-        status_keys = (
-            t("main.field.daemon"),
-            t("main.field.database"),
-            t("main.field.engine"),
-            t("main.field.screening"),
-        )
-        out = [section_title(surface, t("main.section.system"), width)]
-        out.extend(kv_block(surface, rows, width=width, status_keys=status_keys))
-        return out
-
-    def _threat_block(self, surface: Surface, width: int) -> List[str]:
-        t = self.t
-        rows = [
-            (t("main.field.events"), self.threat.get("events")),
-            (t("main.field.high_risk"), self.threat.get("high_risk")),
-            (t("main.field.blocks"), self.threat.get("blocks")),
-            (t("main.field.screened"), self.threat.get("screened")),
-            (t("main.field.recommended"), self.threat.get("recommended")),
-            (t("main.field.rejected"), self.threat.get("rejected")),
-            (t("main.field.blacklist"), self.threat.get("blacklist")),
-            (t("main.field.whitelist"), self.threat.get("whitelist")),
-        ]
-        out = [section_title(surface, t("main.section.threat"), width)]
-        out.extend(kv_block(surface, rows, width=width))
-        return out
-
-    def _intel_block(self, surface: Surface, width: int) -> List[str]:
-        t = self.t
-        rows = [
-            (t("main.field.profiles"), self.intel.get("profiles")),
-            (t("main.field.observations"), self.intel.get("observations")),
-            (t("main.field.tracked"), self.intel.get("tracked")),
-            (t("main.field.trusted"), self.intel.get("trusted")),
-            (t("common.trend"), self.intel.get("trend")),
-        ]
-        out = [section_title(surface, t("main.section.intelligence"), width)]
-        out.extend(kv_block(surface, rows, width=width))
-        return out
-
     def intro(self, surface: Surface) -> List[str]:
-        wide = surface.width >= 78
-        column = (surface.width - 3) // 2 if wide else surface.width
-        lines = _pair_columns(
-            surface,
-            self._system_block(surface, column),
-            self._threat_block(surface, column),
+        t = self.t
+        lines: List[str] = []
+
+        lines.append(section_title(surface, t("main.section.system")))
+        lines.extend(
+            kv_block(
+                surface,
+                [
+                    (t("main.field.daemon"), self.system.get("daemon")),
+                    (t("main.field.engine"), self.system.get("engine")),
+                    (t("main.field.database"), self.system.get("database")),
+                    (t("main.field.ipc"), self.system.get("ipc")),
+                    (t("main.field.policy"), self.system.get("policy")),
+                ],
+                status_keys=(
+                    t("main.field.daemon"),
+                    t("main.field.engine"),
+                    t("main.field.database"),
+                    t("main.field.ipc"),
+                    t("main.field.policy"),
+                ),
+            )
         )
+
         lines.append("")
-        lines.extend(self._intel_block(surface, surface.width))
+        lines.append(section_title(surface, t("main.section.threat")))
+        lines.extend(
+            kv_block(
+                surface,
+                [
+                    (t("main.field.events"), self.threat.get("events")),
+                    (t("main.field.high_risk"), self.threat.get("high_risk")),
+                    (t("main.field.recommended"), self.threat.get("recommended")),
+                    (t("main.field.rejected"), self.threat.get("rejected")),
+                ],
+            )
+        )
+
+        lines.append("")
+        lines.append(section_title(surface, t("main.section.intelligence")))
+        lines.extend(
+            kv_block(
+                surface,
+                [
+                    (t("main.field.profiles"), self.intel.get("profiles")),
+                    (t("main.field.observations"), self.intel.get("observations")),
+                    (t("common.trend"), self.intel.get("trend")),
+                ],
+                status_keys=(t("common.trend"),),
+            )
+        )
 
         if self.daemon_state != "RUNNING":
             lines.append("")
-            lines.extend(paragraph(surface, self.t("main.daemon_offline_hint"),
-                                   role="warn"))
+            lines.extend(
+                paragraph(surface, self.t("main.daemon_offline_hint"), role="warn")
+            )
         if self.metrics_source == "offline":
-            lines.extend(paragraph(surface, self.t("error.daemon_unavailable"),
-                                   role="muted"))
-        lines.extend(paragraph(surface, self.t("main.no_android"), role="muted"))
+            lines.extend(
+                paragraph(surface, self.t("error.daemon_unavailable"), role="muted")
+            )
+        lines.extend(
+            paragraph(surface, self.t("main.no_android"), role="muted")
+        )
         return lines
 
     def outro(self, surface: Surface) -> List[str]:

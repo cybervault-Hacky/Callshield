@@ -286,7 +286,7 @@ class Application:
             return head
 
         trail = self.stack.trail()
-        if trail:
+        if len(trail) > 1:
             head.append(breadcrumb(surface, trail))
         head.append("")
 

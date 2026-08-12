@@ -11,11 +11,13 @@ The sequence never claims that Android call screening is operational.
 
 from __future__ import annotations
 
+import os
+import select
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .. import formatters as fmt
-from ..components import Spinner, Surface, header, rule, staged_lines, status_bar
+from ..components import Spinner, Surface, header, staged_lines, status_bar
 
 #: Maximum wall-clock time the whole sequence may occupy (seconds).
 MAX_DURATION = 2.0
@@ -152,21 +154,43 @@ def render_frame(
     )
     lines.append("")
     lines.extend(staged_lines(surface, stages, completed, spinner))
-    lines.append("")
-    lines.append(rule(surface))
     done = min(completed, len(stages))
-    lines.append(
-        surface.style(
-            "{0} {1}/{2}".format(
-                translator("app.loading") if done < len(stages)
-                else translator("startup.ready"),
-                done,
-                len(stages),
-            ),
-            "muted",
-        )
-    )
+    if done >= len(stages):
+        lines.append("")
+        lines.append(surface.style(translator("startup.ready"), "ok"))
     return lines
+
+
+def _should_cancel(ctx: Any) -> bool:
+    """True when the user pressed ``q`` or Ctrl+C during startup.
+
+    Only consulted while the terminal is interactive; a probe is never
+    interrupted mid-flight, only the pause between stages is shortened. The
+    check is strictly best-effort: streams without a file descriptor are
+    skipped so scripted contexts keep working.
+    """
+
+    caps = getattr(ctx, "caps", None)
+    if caps is None or not caps.interactive:
+        return False
+    stream = getattr(ctx, "stdin", None)
+    if stream is None:
+        return False
+    try:
+        fileno = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return False
+    try:
+        ready, _, _ = select.select([stream], [], [], 0.0)
+    except (OSError, ValueError):
+        return False
+    if not ready:
+        return False
+    try:
+        data = os.read(fileno, 8)
+    except (OSError, ValueError):
+        return False
+    return any(byte in (0x03, ord("q"), ord("Q")) for byte in data)
 
 
 def run_startup(ctx: Any, animate: bool = True) -> StartupReport:
@@ -193,7 +217,7 @@ def run_startup(ctx: Any, animate: bool = True) -> StartupReport:
             remaining = MAX_DURATION - (time.monotonic() - started)
             budget = remaining / float(max(1, len(probes) - index))
             pause = max(0.0, min(FRAME_INTERVAL, budget))
-            if pause:
+            if pause and not _should_cancel(ctx):
                 time.sleep(pause)
 
     if animate and ctx.caps.interactive:

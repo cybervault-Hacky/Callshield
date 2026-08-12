@@ -9,7 +9,6 @@ and nothing else.
 
 from __future__ import annotations
 
-import os
 from typing import Any, List, Optional, Sequence, Tuple
 
 from .. import formatters as fmt
@@ -191,6 +190,8 @@ class SettingsScreen(MenuScreen):
         t = self.t
         prefs = self.ctx.prefs
         lines = [section_title(surface, t("settings.title"))]
+        lines.append("")
+        lines.append(section_title(surface, t("settings.group.general")))
         lines.extend(
             kv_block(
                 surface,
@@ -204,6 +205,15 @@ class SettingsScreen(MenuScreen):
                         else t("settings.animation.off"),
                     ),
                     (t("settings.refresh"), _refresh_label(t, prefs.refresh_seconds)),
+                ],
+            )
+        )
+        lines.append("")
+        lines.append(section_title(surface, t("settings.group.scan")))
+        lines.extend(
+            kv_block(
+                surface,
+                [
                     (
                         t("settings.scan_mode"),
                         _scan_mode_label(t, prefs.default_scan_mode),
@@ -217,26 +227,19 @@ class SettingsScreen(MenuScreen):
                 ],
             )
         )
+        lines.append("")
+        lines.append(section_title(surface, t("settings.group.data")))
         return lines
 
     def build_items(self) -> Sequence[MenuItem]:
         t = self.t
-        prefs = self.ctx.prefs
         return [
-            MenuItem("language", t("settings.language"),
-                     status=language_label(prefs.language)),
-            MenuItem("appearance", t("settings.appearance"),
-                     status=_appearance_label(t, prefs.appearance)),
-            MenuItem("animation", t("settings.animation"),
-                     status=t("settings.animation.on") if prefs.animation
-                     else t("settings.animation.off")),
-            MenuItem("refresh", t("settings.refresh"),
-                     status=_refresh_label(t, prefs.refresh_seconds)),
-            MenuItem("scan_mode", t("settings.scan_mode"),
-                     status=_scan_mode_label(t, prefs.default_scan_mode)),
-            MenuItem("notifications", t("settings.notifications"),
-                     status=t("common.enabled") if prefs.notifications
-                     else t("common.disabled")),
+            MenuItem("language", t("settings.language")),
+            MenuItem("appearance", t("settings.appearance")),
+            MenuItem("animation", t("settings.animation")),
+            MenuItem("refresh", t("settings.refresh")),
+            MenuItem("scan_mode", t("settings.scan_mode")),
+            MenuItem("notifications", t("settings.notifications")),
             MenuItem("data", t("settings.data")),
             MenuItem("reset", t("settings.reset")),
         ]

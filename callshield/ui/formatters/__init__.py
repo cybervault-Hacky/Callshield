@@ -217,6 +217,9 @@ def status_word(value: Any, placeholder: str = "UNKNOWN") -> str:
     text = str(value).strip()
     if not text:
         return placeholder
+    if text in ("--", "-"):
+        # The unknown-value placeholder is not a state; never mangle it.
+        return text
     return text.upper().replace("-", "_")
 
 

@@ -44,7 +44,7 @@ LANGUAGES: Tuple[str, ...] = (
 EN: Dict[str, str] = {
     # ---------------------------------------------------------- application
     "app.title": "CALLSHIELD",
-    "app.subtitle": "Local Call Threat Analysis Console",
+    "app.subtitle": "Local Threat Analysis",
     "app.loading": "Loading",
     "app.exit_confirm": "Exit CALLSHIELD? [y/N] ",
     "app.goodbye": "CALLSHIELD interface closed.",
@@ -123,11 +123,13 @@ EN: Dict[str, str] = {
     "main.field.database": "Database",
     "main.field.engine": "Engine",
     "main.field.screening": "Call Screening",
+    "main.field.ipc": "IPC",
+    "main.field.heartbeat": "HEARTBEAT",
     "main.field.policy": "Policy",
     "main.field.profile": "Profile",
     "main.field.uptime": "Uptime",
     "main.field.version": "Version",
-    "main.field.events": "Events Logged",
+    "main.field.events": "Events",
     "main.field.high_risk": "High Risk",
     "main.field.blocks": "Block Recommendations",
     "main.field.blacklist": "Blacklist",
@@ -140,8 +142,8 @@ EN: Dict[str, str] = {
     "main.field.queue": "Queue",
     "main.field.pid": "PID",
     "main.field.screened": "Calls Screened",
-    "main.field.recommended": "Blocks Recommended",
-    "main.field.rejected": "Calls Rejected",
+    "main.field.recommended": "Recommended",
+    "main.field.rejected": "Rejected",
     "main.action.start_daemon": "Start daemon",
     "main.daemon_offline_hint": "Daemon is OFFLINE. Analysis still works; live monitoring does not.",
     "main.no_android": "Android call screening is NOT VERIFIED on this device.",
@@ -177,13 +179,14 @@ EN: Dict[str, str] = {
     "scan.section.policy": "POLICY",
     "scan.section.screening": "SCREENING",
     "scan.section.history": "HISTORY",
+    "scan.section.result": "SCAN RESULT",
     "scan.field.input": "Input",
     "scan.field.normalized": "Normalized",
     "scan.field.country": "Default Country",
     "scan.field.masked": "Masked",
     "scan.field.risk_score": "Risk Score",
     "scan.field.risk_level": "Risk Level",
-    "scan.field.recommendation": "Recommended Action",
+    "scan.field.recommendation": "Recommendation",
     "scan.field.list": "List Status",
     "scan.field.first_seen": "First Seen",
     "scan.field.last_seen": "Last Seen",
@@ -238,6 +241,8 @@ EN: Dict[str, str] = {
     "screening.active_warning": "ACTIVE mode allows policy-qualified calls to be rejected.",
     "screening.dry_run_note": "DRY RUN records decisions without rejecting any call.",
     "screening.not_verified": "No Android device has been verified for call screening.",
+    "screening.auto_reject": "Auto Reject",
+    "screening.android": "Android",
     "screening.emergency_off": "Emergency off is engaged — active rejection is suppressed.",
     # --------------------------------------------------------- policy center
     "policy.title": "POLICY CENTER",
@@ -249,6 +254,8 @@ EN: Dict[str, str] = {
     "policy.emergency": "Emergency State",
     "policy.block_threshold": "Block Threshold",
     "policy.confidence_threshold": "Confidence Threshold",
+    "policy.active_threshold": "Active threshold",
+    "policy.current_marker": "current",
     "policy.simulation_note": "Simulation only. Nothing was written to the configuration.",
     "policy.changed": "Screening policy updated.",
     "policy.prompt_risk": "Risk score (0-100): ",
@@ -261,6 +268,7 @@ EN: Dict[str, str] = {
     "policy.confirm_emergency_reset": "Clear emergency off? [y/N] ",
     # ----------------------------------------------------- reputation center
     "reputation.title": "REPUTATION CENTER",
+    "reputation.profile": "PROFILE",
     "reputation.lookup": "Look Up Number",
     "reputation.recent": "Recent Profiles",
     "reputation.trusted": "Trusted Numbers",
@@ -285,6 +293,10 @@ EN: Dict[str, str] = {
     "intelligence.observation_limit": "Observation Limit",
     "intelligence.profile_limit": "Profile Limit",
     "intelligence.corrupt": "Stored intelligence data could not be read for this number.",
+    "intelligence.current": "CURRENT",
+    "intelligence.baseline": "BASELINE",
+    "intelligence.delta": "DELTA",
+    "intelligence.evidence": "EVIDENCE",
     # ---------------------------------------------------------- block center
     "blocks.title": "BLOCK CENTER",
     "blocks.recent": "Recent Screening Decisions",
@@ -348,6 +360,9 @@ EN: Dict[str, str] = {
     "settings.notifications.on": "In-app notices enabled",
     "settings.notifications.off": "In-app notices disabled",
     "settings.data.title": "DATA",
+    "settings.group.general": "GENERAL",
+    "settings.group.scan": "SCAN",
+    "settings.group.data": "DATA",
     "settings.data.config": "Config File",
     "settings.data.database": "Database",
     "settings.data.logs": "Log File",
@@ -363,6 +378,9 @@ EN: Dict[str, str] = {
     "about.platform": "Platform",
     "about.architecture": "Architecture",
     "about.architecture_text": "Local-first. All analysis, storage and decisions happen on this device. CALLSHIELD performs no network communication.",
+    "about.tagline": "Local-first Threat Analysis Tool",
+    "about.developer": "Developer",
+    "about.android_bridge": "Android Bridge",
     "about.license": "License",
     # ---------------------------------------------------------- diagnostics
     "diagnostics.title": "DIAGNOSTICS",
@@ -378,14 +396,14 @@ EN: Dict[str, str] = {
     "error.corrupt_config": "Interface preferences were unreadable and have been rebuilt with defaults.",
     "error.corrupt_data": "Stored data could not be read. The affected section is unavailable.",
     "error.interrupted": "Input was interrupted.",
-    "error.too_narrow": "Terminal is too narrow. Widen the window to at least {width} columns.",
+    "error.too_narrow": "Terminal too small. Resize your terminal to at least {width} columns to continue.",
     "error.generic": "The operation could not be completed.",
     "error.no_network": "CALLSHIELD does not use the network. Nothing is fetched online.",
     "error.unsupported": "That action is not available here.",
 }
 
 HI: Dict[str, str] = {
-    "app.subtitle": "स्थानीय कॉल खतरा विश्लेषण कंसोल",
+    "app.subtitle": "स्थानीय खतरा विश्लेषण",
     "app.exit_confirm": "CALLSHIELD बंद करें? [y/N] ",
     "app.goodbye": "CALLSHIELD इंटरफ़ेस बंद हो गया।",
     "app.interrupted": "बाधित।",
@@ -657,7 +675,7 @@ HI: Dict[str, str] = {
 }
 
 HINGLISH: Dict[str, str] = {
-    "app.subtitle": "Local Call Threat Analysis Console",
+    "app.subtitle": "Local Threat Analysis",
     "app.exit_confirm": "CALLSHIELD band karein? [y/N] ",
     "app.goodbye": "CALLSHIELD interface band ho gaya.",
     "app.interrupted": "Beech me ruk gaya.",
@@ -925,7 +943,7 @@ HINGLISH: Dict[str, str] = {
 }
 
 ES: Dict[str, str] = {
-    "app.subtitle": "Consola local de análisis de amenazas de llamadas",
+    "app.subtitle": "Análisis local de amenazas",
     "app.exit_confirm": "¿Salir de CALLSHIELD? [y/N] ",
     "app.goodbye": "Interfaz de CALLSHIELD cerrada.",
     "app.interrupted": "Interrumpido.",
@@ -1192,7 +1210,7 @@ ES: Dict[str, str] = {
 }
 
 FR: Dict[str, str] = {
-    "app.subtitle": "Console locale d'analyse des menaces d'appels",
+    "app.subtitle": "Analyse locale des menaces",
     "app.exit_confirm": "Quitter CALLSHIELD ? [y/N] ",
     "app.goodbye": "Interface CALLSHIELD fermée.",
     "app.interrupted": "Interrompu.",
@@ -1459,7 +1477,7 @@ FR: Dict[str, str] = {
 }
 
 JA: Dict[str, str] = {
-    "app.subtitle": "ローカル通話脅威分析コンソール",
+    "app.subtitle": "ローカル脅威分析",
     "app.exit_confirm": "CALLSHIELD を終了しますか? [y/N] ",
     "app.goodbye": "CALLSHIELD インターフェースを終了しました。",
     "app.interrupted": "中断されました。",
@@ -1726,7 +1744,7 @@ JA: Dict[str, str] = {
 }
 
 ZH: Dict[str, str] = {
-    "app.subtitle": "本地来电威胁分析控制台",
+    "app.subtitle": "本地威胁分析",
     "app.exit_confirm": "退出 CALLSHIELD? [y/N] ",
     "app.goodbye": "CALLSHIELD 界面已关闭。",
     "app.interrupted": "已中断。",
@@ -1993,7 +2011,7 @@ ZH: Dict[str, str] = {
 }
 
 PT: Dict[str, str] = {
-    "app.subtitle": "Console local de análise de ameaças em chamadas",
+    "app.subtitle": "Análise local de ameaças",
     "app.exit_confirm": "Sair do CALLSHIELD? [y/N] ",
     "app.goodbye": "Interface do CALLSHIELD encerrada.",
     "app.interrupted": "Interrompido.",
@@ -2260,7 +2278,7 @@ PT: Dict[str, str] = {
 }
 
 RU: Dict[str, str] = {
-    "app.subtitle": "Локальная консоль анализа угроз вызовов",
+    "app.subtitle": "Локальный анализ угроз",
     "app.exit_confirm": "Выйти из CALLSHIELD? [y/N] ",
     "app.goodbye": "Интерфейс CALLSHIELD закрыт.",
     "app.interrupted": "Прервано.",
@@ -3004,4 +3022,22 @@ UNTRANSLATED_KEYS: Tuple[str, ...] = (
     "scan.section.policy",
     "scan.section.screening",
     "scan.section.history",
+    "main.field.ipc",
+    "main.field.heartbeat",
+    "scan.section.result",
+    "policy.active_threshold",
+    "screening.auto_reject",
+    "screening.android",
+    "about.tagline",
+    "about.developer",
+    "about.android_bridge",
+    "intelligence.current",
+    "intelligence.baseline",
+    "intelligence.delta",
+    "intelligence.evidence",
+    "policy.current_marker",
+    "settings.group.general",
+    "settings.group.scan",
+    "settings.group.data",
+    "reputation.profile",
 )

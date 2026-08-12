@@ -14,13 +14,55 @@ def rule(surface: Surface, width: Optional[int] = None, role: str = "border") ->
 
 
 def section_title(surface: Surface, title: str, width: Optional[int] = None) -> str:
-    """A dense section header: ``TITLE ─────────────``."""
+    """A quiet section header: just the uppercase label, no ruling.
+
+    Hierarchy comes from spacing and the label weight, not from a line of
+    dashes after every heading.
+    """
 
     width = surface.width if width is None else width
-    label = fmt.truncate(str(title).upper(), max(4, width - 4))
-    styled = surface.style(label, "title")
-    filler = max(0, width - fmt.display_width(label) - 1)
-    return styled + " " + surface.style(surface.glyph("h") * filler, "border")
+    label = fmt.truncate(str(title).upper(), max(4, width))
+    return surface.style(label, "title")
+
+
+def card(
+    surface: Surface,
+    lines: Sequence[str],
+    title: str = "",
+    width: Optional[int] = None,
+    footer: str = "",
+) -> List[str]:
+    """A bordered card used for focused results (scan, reputation, policy).
+
+    The border is drawn in the subtle border colour and never contains colour
+    itself; content keeps its own semantic styling.
+    """
+
+    width = surface.width if width is None else width
+    width = max(12, min(width, surface.width))
+    g = surface.glyphs
+    inner = width - 4
+    out: List[str] = []
+
+    if title:
+        label = " " + fmt.truncate(str(title), max(1, inner)) + " "
+        bar = g["h"] * max(0, width - 2 - fmt.display_width(label))
+        out.append(surface.style(g["tl"] + label + bar + g["tr"], "border"))
+    else:
+        out.append(surface.style(g["tl"] + g["h"] * (width - 2) + g["tr"], "border"))
+
+    edge = surface.style(g["v"], "border")
+    for line in lines:
+        text = "" if line is None else str(line)
+        out.append(edge + " " + fmt.pad(text, inner) + " " + edge)
+
+    if footer:
+        label = " " + fmt.truncate(str(footer), max(1, inner)) + " "
+        bar = g["h"] * max(0, width - 2 - fmt.display_width(label))
+        out.append(surface.style(g["bl"] + bar + label + g["br"], "border"))
+    else:
+        out.append(surface.style(g["bl"] + g["h"] * (width - 2) + g["br"], "border"))
+    return out
 
 
 def panel(
@@ -130,6 +172,7 @@ def empty_state(surface: Surface, message: str, width: Optional[int] = None) -> 
 
 __all__ = [
     "bullet_list",
+    "card",
     "empty_state",
     "kv",
     "kv_block",
